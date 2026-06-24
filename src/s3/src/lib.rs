@@ -41,6 +41,24 @@ pub fn router(service: S3Service) -> Router {
 }
 
 async fn handle(State(svc): State<S3Service>, req: Request) -> Response {
+    let start = std::time::Instant::now();
+    let method_label = req.method().as_str().to_owned();
+
+    let resp = serve_request(svc, req).await;
+
+    metrics::counter!(
+        "soma_s3_requests_total",
+        "method" => method_label.clone(),
+        "status" => resp.status().as_u16().to_string(),
+    )
+    .increment(1);
+    metrics::histogram!("soma_s3_request_duration_seconds", "method" => method_label)
+        .record(start.elapsed().as_secs_f64());
+
+    resp
+}
+
+async fn serve_request(svc: S3Service, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let method = parts.method;
     let uri = parts.uri;

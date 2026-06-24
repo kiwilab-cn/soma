@@ -1,15 +1,20 @@
-//! Soma server entry point: loads configuration, then assembles the S3 protocol
-//! layer, the metadata store, and the storage backend into a running single-node
-//! S3 endpoint.
+//! Soma server entry point: loads configuration, installs the metrics recorder,
+//! starts the admin server, then assembles the S3 protocol layer, the metadata
+//! store, and the storage backend into a running single-node S3 endpoint.
 
+mod admin;
 mod config;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
+use admin::AdminState;
 use config::Config;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -22,6 +27,9 @@ async fn main() -> Result<(), BoxError> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Install the global Prometheus recorder; its handle renders `/metrics`.
+    let metrics_handle = PrometheusBuilder::new().install_recorder()?;
 
     let cfg = Config::load(config_path().as_deref())?;
 
@@ -50,9 +58,22 @@ async fn main() -> Result<(), BoxError> {
     }
     let service = S3Service::new(meta, backend, creds);
 
+    // Admin (health + metrics) server on its own port.
+    let ready = Arc::new(AtomicBool::new(false));
+    let admin_listener = tokio::net::TcpListener::bind(&cfg.admin_listen).await?;
+    let admin_state = AdminState {
+        metrics: metrics_handle,
+        ready: ready.clone(),
+    };
+    tokio::spawn(async move {
+        let _ = axum::serve(admin_listener, admin::router(admin_state)).await;
+    });
+
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    ready.store(true, Ordering::Relaxed);
     tracing::info!(
         listen = %cfg.listen,
+        admin_listen = %cfg.admin_listen,
         data_dir = %cfg.data_dir,
         credentials = cfg.credentials.len(),
         cache_enabled = cfg.cache.enabled,

@@ -53,6 +53,9 @@ base64 = "0.22"
 percent-encoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Observability
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
 bytesize = "1"
