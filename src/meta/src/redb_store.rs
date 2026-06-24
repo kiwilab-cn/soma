@@ -54,6 +54,76 @@ impl RedbMetaStore {
         w.commit()?;
         Ok(Self { db })
     }
+
+    // --- rebalance controller support (M3b) --------------------------------
+    //
+    // These are inherent (not on the `MetadataStore` trait): only the controller,
+    // which runs in-process with the concrete store, drives migration. Gateways
+    // observe migration purely through `list_pg_table` (the `target` field).
+
+    /// Mark a placement group as migrating to `target` (bumping its generation).
+    /// No-op if the PG is absent (the table is seeded before the controller runs).
+    pub fn begin_migration(&self, pg: u32, target: Vec<String>) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(PG_TABLE)?;
+            let raw = match t.get(pg)? {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(()),
+            };
+            let mut placement: PgPlacement = postcard::from_bytes(&raw)?;
+            placement.target = target;
+            placement.generation += 1;
+            t.insert(pg, postcard::to_allocvec(&placement)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Finalize a migration: the target set becomes the acting set, clearing the
+    /// migration. No-op if the PG is not migrating.
+    pub fn finalize_migration(&self, pg: u32) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(PG_TABLE)?;
+            let raw = match t.get(pg)? {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(()),
+            };
+            let mut placement: PgPlacement = postcard::from_bytes(&raw)?;
+            if !placement.target.is_empty() {
+                placement.node_ids = std::mem::take(&mut placement.target);
+                placement.generation += 1;
+                t.insert(pg, postcard::to_allocvec(&placement)?.as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// One placement group's placement, if present.
+    pub fn pg_placement(&self, pg: u32) -> Result<Option<PgPlacement>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(PG_TABLE)?;
+        match t.get(pg)? {
+            Some(g) => Ok(Some(postcard::from_bytes(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The object ids of every live object (for the mover to enumerate a PG's
+    /// objects: an object belongs to `pg = H(object_id) % pg_count`).
+    pub fn list_object_ids(&self) -> Result<Vec<ObjectId>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(OBJECTS)?;
+        let mut out = Vec::new();
+        for item in t.iter()? {
+            let (_, v) = item?;
+            let m: ObjectMeta = postcard::from_bytes(v.value())?;
+            out.push(m.object_id);
+        }
+        Ok(out)
+    }
 }
 
 impl MetadataStore for RedbMetaStore {

@@ -20,7 +20,9 @@ data:
     replication_factor = {{ .Values.replication.factor }}
     write_quorum = {{ .Values.replication.writeQuorum }}
     # The gateway discovers its storage node set from the cluster membership
-    # table (storage nodes self-register), not from static endpoints.
+    # table (storage nodes self-register), not from static endpoints, and
+    # refreshes placement (membership + PG table) on this interval.
+    placement_refresh_secs = {{ .Values.replication.placementRefreshSecs }}
 
     [cache]
     enabled = {{ .Values.config.cache.enabled }}

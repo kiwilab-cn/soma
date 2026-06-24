@@ -9,3 +9,11 @@ data:
     role = "meta"
     listen = "0.0.0.0:{{ .Values.ports.meta }}"
     data_dir = {{ .Values.config.dataDir | quote }}
+    # The rebalance controller (meta role) uses the replica factor as the PG width.
+    replication_factor = {{ .Values.replication.factor }}
+
+    [rebalance]
+    enabled = {{ .Values.rebalance.enabled }}
+    interval_secs = {{ .Values.rebalance.intervalSecs }}
+    settle_secs = {{ .Values.rebalance.settleSecs }}
+    max_copies_per_pass = {{ .Values.rebalance.maxCopiesPerPass }}

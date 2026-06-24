@@ -141,11 +141,24 @@ pub struct NodeInfo {
 /// computes the *target* mapping (see `docs/M3_DESIGN.md` §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgPlacement {
-    /// The node ids holding this PG's replicas/shards, in placement order.
+    /// The **acting** node ids holding this PG's replicas/shards, in placement
+    /// order. Reads and writes always reach this set; it is the durable home.
     pub node_ids: Vec<String>,
-    /// Bumped on every change to this PG's placement (the linearization point
-    /// for migration in M3b).
+    /// The **target** node ids when this PG is migrating (empty otherwise). During
+    /// migration writes go to `node_ids ∪ target` and reads try `target` then
+    /// `node_ids`; on finalize, `node_ids` becomes `target` and this clears.
+    #[serde(default)]
+    pub target: Vec<String>,
+    /// Bumped on every change to this PG's placement — the linearization point so
+    /// gateways can detect migrations/finalizes when they refresh.
     pub generation: u64,
+}
+
+impl PgPlacement {
+    /// Whether this PG is currently migrating.
+    pub fn is_migrating(&self) -> bool {
+        !self.target.is_empty()
+    }
 }
 
 /// A `ListObjectsV2`-style request.

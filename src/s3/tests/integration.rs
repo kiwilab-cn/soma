@@ -907,6 +907,7 @@ async fn membership_and_pg_table_over_grpc() {
             0u32,
             PgPlacement {
                 node_ids: vec!["node-0".to_string(), "node-1".to_string()],
+                target: Vec::new(),
                 generation: 1,
             },
         )];
@@ -1026,4 +1027,151 @@ async fn membership_driven_gateway_roundtrip_and_failover() {
     settle().await;
     let got = store.get(&key).await.unwrap().bytes().await.unwrap();
     assert_eq!(got.as_ref(), payload.as_slice());
+}
+
+/// Register a set of (node_id, endpoint) pairs with the meta node over gRPC.
+async fn register_nodes(
+    meta: &Arc<soma_cluster::MetaClient>,
+    nodes: &[(String, String)],
+    now: u64,
+) {
+    use soma_meta::MetadataStore;
+    let c = meta.clone();
+    let ns = nodes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        for (id, ep) in &ns {
+            c.register_node(id, ep, now).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Scale-out: a 2-node cluster gains a 3rd node; the controller rebalances ~1/3 of
+/// PGs onto it. Data stays readable throughout and ends up physically on the new
+/// node, while every object remains on at least the replica factor of nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scale_out_rebalances_data_to_new_node() {
+    use soma_cluster::{
+        serve_meta, serve_storage, MetaClient, Placement, RebalanceController, ReplicatedBackend,
+        DEFAULT_PG_COUNT,
+    };
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    // One concrete store shared by serve_meta and the controller.
+    let store = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    store.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let meta_port = free_port();
+    {
+        let s: Arc<dyn MetadataStore> = store.clone();
+        tokio::spawn(async move {
+            let _ = serve_meta(sock(meta_port), s).await;
+        });
+    }
+
+    // Three storage nodes; keep direct backend handles to inspect what's at rest.
+    let mut backends: Vec<Arc<dyn StorageBackend>> = Vec::new();
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        let port = free_port();
+        let sdir = dir.path().join(format!("s{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        backends.push(backend.clone());
+        tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        });
+        nodes.push((format!("node-{i}"), format!("http://127.0.0.1:{port}")));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta_client = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    let now = 1_000_000u64;
+    register_nodes(&meta_client, &nodes[0..2], now).await; // start with 2 nodes
+
+    // Gateway: RF=2, W=1, placement resolved from membership.
+    let placement = Placement::from_membership(meta_client.clone(), 2, DEFAULT_PG_COUNT, now)
+        .await
+        .unwrap();
+    let repl: Arc<dyn StorageBackend> =
+        Arc::new(ReplicatedBackend::from_placement(placement.clone(), 1));
+    let meta_dyn: Arc<dyn MetadataStore> = meta_client.clone();
+    let svc = S3Service::new(meta_dyn, repl, Credentials::single("AK", "SK"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    let api = client(s3_port);
+
+    // Write 24 objects and confirm they read back.
+    let n = 24usize;
+    let body = |i: usize| format!("object-{i}-payload").into_bytes();
+    for i in 0..n {
+        api.put(&OPath::from(format!("obj-{i}")), PutPayload::from(body(i)))
+            .await
+            .unwrap();
+    }
+    for i in 0..n {
+        let got = api
+            .get(&OPath::from(format!("obj-{i}")))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), body(i).as_slice());
+    }
+
+    let object_ids = store.list_object_ids().unwrap();
+    assert_eq!(object_ids.len(), n);
+    let held = |b: &Arc<dyn StorageBackend>| {
+        object_ids
+            .iter()
+            .filter(|&&o| b.get(o, None).is_ok())
+            .count()
+    };
+    assert_eq!(held(&backends[2]), 0); // new node holds nothing yet
+
+    // Scale out: register the 3rd node and drive the controller (throttled, instant
+    // settle for the test), refreshing the gateway each round so it dual-writes.
+    register_nodes(&meta_client, &nodes[2..3], now).await;
+    let controller =
+        RebalanceController::new(store.clone(), 2, DEFAULT_PG_COUNT, Duration::ZERO, 1000);
+    let mut iters = 0;
+    loop {
+        placement.refresh(&meta_client, now).await.unwrap();
+        let report = controller.reconcile_once(now).await.unwrap();
+        iters += 1;
+        if report.migrating == 0 && iters > 1 {
+            break;
+        }
+        assert!(iters < 60, "rebalance did not converge");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    placement.refresh(&meta_client, now).await.unwrap();
+
+    // Everything still readable through the gateway after rebalance.
+    for i in 0..n {
+        let got = api
+            .get(&OPath::from(format!("obj-{i}")))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), body(i).as_slice());
+    }
+    // Data physically migrated to the new node, and nothing is under-replicated.
+    assert!(held(&backends[2]) > 0, "no data migrated to the new node");
+    for &oid in &object_ids {
+        let count = backends.iter().filter(|b| b.get(oid, None).is_ok()).count();
+        assert!(count >= 2, "object {oid} under-replicated ({count} copies)");
+    }
 }

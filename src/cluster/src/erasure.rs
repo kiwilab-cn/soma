@@ -123,7 +123,7 @@ impl ErasureCodedBackend {
     /// The ordered storage clients for an object's `k + m` shards (shard `i` →
     /// position `i`).
     fn placement(&self, object_id: ObjectId) -> Vec<Arc<dyn StorageBackend>> {
-        self.placement.nodes_for(object_id)
+        self.placement.acting_nodes(object_id)
     }
 
     /// Split `data` into `k + m` shards: a length-prefixed, zero-padded payload
