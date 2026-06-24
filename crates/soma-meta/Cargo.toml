@@ -9,7 +9,14 @@ rust-version.workspace = true
 description = "Metadata store: the authority for object name -> location + version (MetadataStore trait + redb impl)."
 
 [dependencies]
-soma-core.workspace = true
+soma-core = { workspace = true, features = ["serde"] }
+redb.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
