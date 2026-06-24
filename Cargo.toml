@@ -4,6 +4,7 @@ members = [
     "src/core",
     "src/meta",
     "src/backend",
+    "src/cluster",
     "src/s3",
     "src/server",
 ]
@@ -32,6 +33,7 @@ panic = "deny"
 soma-core = { path = "src/core" }
 soma-meta = { path = "src/meta" }
 soma-backend = { path = "src/backend" }
+soma-cluster = { path = "src/cluster" }
 soma-s3 = { path = "src/s3" }
 
 # Third-party
@@ -61,6 +63,10 @@ figment = { version = "0.10", features = ["toml", "env"] }
 bytesize = "1"
 # Cache
 foyer = "0.20"
+# Cluster RPC
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
 # Test/utility
 proptest = "1"
 tempfile = "3"

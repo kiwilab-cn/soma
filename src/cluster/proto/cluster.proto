@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package soma.cluster;
+
+// Soma's internal RPC carries postcard-encoded request/reply payloads over a
+// single Call per service. Both ends are soma, so a minimal gRPC surface gives us
+// HTTP/2 multiplexing and tonic's connection management without per-method proto
+// churn. (Typed proto / streaming can come later if a polyglot or zero-copy path
+// is needed.)
+
+message Frame {
+  bytes payload = 1;
+}
+
+service Meta {
+  rpc Call(Frame) returns (Frame);
+}
+
+service Storage {
+  rpc Call(Frame) returns (Frame);
+}

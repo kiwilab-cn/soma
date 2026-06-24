@@ -17,6 +17,7 @@ path = "src/main.rs"
 soma-core.workspace = true
 soma-meta.workspace = true
 soma-backend.workspace = true
+soma-cluster.workspace = true
 soma-s3.workspace = true
 
 tokio.workspace = true

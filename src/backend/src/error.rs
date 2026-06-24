@@ -40,6 +40,34 @@ pub enum Error {
     /// A volume file name could not be parsed into a volume id.
     #[error("malformed volume file name: {0}")]
     BadVolumeName(String),
+
+    /// An error surfaced from a remote storage node over RPC.
+    #[error("remote storage error: {0}")]
+    Remote(String),
+}
+
+impl Error {
+    /// A short, stable kind tag used to reconstruct the error across RPC.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::BadRange { .. } => "bad_range",
+            _ => "internal",
+        }
+    }
+
+    /// Reconstruct an error from a `(kind, message)` pair received over RPC.
+    pub fn from_remote(kind: &str, message: String) -> Self {
+        match kind {
+            // The S3 layer only distinguishes BadRange (-> 416); the offending
+            // numbers are not needed to render the response.
+            "bad_range" => Error::BadRange {
+                offset: 0,
+                len: 0,
+                size: 0,
+            },
+            _ => Error::Remote(message),
+        }
+    }
 }
 
 /// Backend result alias.

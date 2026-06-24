@@ -238,6 +238,106 @@ async fn object_store_roundtrip_through_cache() {
     stop(handle).await;
 }
 
+/// A free local TCP port (bound then released; small race, fine for tests).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Drive the full split topology: a metadata gRPC node + a storage gRPC node +
+/// a gateway (MetaClient/StorageClient) serving S3, exercised by object_store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_topology_object_store_roundtrip() {
+    use soma_cluster::{serve_meta, serve_storage, MetaClient, StorageClient};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let meta_port = free_port();
+    let storage_port = free_port();
+
+    // Metadata node (create the bucket on the shared store before serving).
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    let ms = meta_store.clone();
+    tokio::spawn(async move {
+        let _ = serve_meta(format!("127.0.0.1:{meta_port}").parse().unwrap(), ms).await;
+    });
+
+    // Storage node.
+    let backend: Arc<dyn StorageBackend> =
+        Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+    let sb = backend.clone();
+    tokio::spawn(async move {
+        let _ = serve_storage(format!("127.0.0.1:{storage_port}").parse().unwrap(), sb).await;
+    });
+
+    // Let the gRPC servers bind.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Gateway: remote clients behind the traits.
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        StorageClient::connect(format!("http://127.0.0.1:{storage_port}"))
+            .await
+            .unwrap(),
+    );
+    let svc = S3Service::new(meta, storage, Credentials::single("AK", "SK"));
+    let app = router(svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    let s3_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // PUT / GET / list / range / delete through gateway → gRPC → meta + storage.
+    let store = client(s3_port);
+    let key = OPath::from("split/object.bin");
+    let payload = b"hello through the split cluster over gRPC";
+    store
+        .put(&key, PutPayload::from_static(payload))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+    assert_eq!(
+        store.get_range(&key, 6u64..13).await.unwrap().as_ref(),
+        &payload[6..13]
+    );
+    let keys: Vec<String> = store
+        .list(Some(&OPath::from("split")))
+        .map(|r| r.unwrap().location.to_string())
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(keys, vec!["split/object.bin"]);
+
+    store.delete(&key).await.unwrap();
+    assert!(matches!(
+        store.get(&key).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    s3_handle.abort();
+}
+
 #[tokio::test]
 async fn full_stack_restart_persists_data() {
     let dir = TempDir::new().unwrap();

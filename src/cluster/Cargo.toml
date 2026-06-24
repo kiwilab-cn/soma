@@ -1,0 +1,27 @@
+[package]
+name = "soma-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Cluster RPC: gRPC services + clients connecting the gateway to the metadata and storage roles."
+build = "build.rs"
+
+[dependencies]
+soma-core.workspace = true
+soma-meta.workspace = true
+soma-backend.workspace = true
+
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+postcard.workspace = true
+serde.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[lints]
+workspace = true

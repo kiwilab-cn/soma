@@ -33,6 +33,7 @@ tower.workspace = true
 http-body-util.workspace = true
 object_store.workspace = true
 futures.workspace = true
+soma-cluster.workspace = true
 
 [lints]
 workspace = true

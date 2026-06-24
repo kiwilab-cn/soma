@@ -47,12 +47,19 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// S3 endpoint listen address.
+    /// Process role: `standalone` (default, single process), `gateway`, `meta`,
+    /// or `storage`.
+    pub role: String,
+    /// Listen address — S3 for `gateway`/`standalone`, gRPC for `meta`/`storage`.
     pub listen: String,
-    /// Admin (health + metrics) listen address.
+    /// Admin (health + metrics) listen address (gateway/standalone).
     pub admin_listen: String,
     /// Data directory (volumes + metadata).
     pub data_dir: String,
+    /// Gateway → metadata node endpoint (e.g. `http://meta:9100`).
+    pub meta_endpoint: String,
+    /// Gateway → storage node endpoint (e.g. `http://storage:9200`).
+    pub storage_endpoint: String,
     /// Storage tuning.
     pub storage: StorageConfig,
     /// Read-cache tuning.
@@ -93,9 +100,12 @@ pub struct Credential {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            role: "standalone".to_string(),
             listen: DEFAULT_LISTEN.to_string(),
             admin_listen: DEFAULT_ADMIN_LISTEN.to_string(),
             data_dir: DEFAULT_DATA_DIR.to_string(),
+            meta_endpoint: "http://127.0.0.1:9100".to_string(),
+            storage_endpoint: "http://127.0.0.1:9200".to_string(),
             storage: StorageConfig::default(),
             cache: CacheConfig::default(),
             credentials: vec![Credential {
