@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::id::ObjectId;
+use crate::id::{ObjectId, VolumeId};
 use crate::needle::{ScanOutcome, FLAG_TOMBSTONE};
 
 /// Location of a needle's payload within its volume.
@@ -27,6 +27,33 @@ impl NeedleLoc {
     #[inline]
     pub fn is_tombstone(&self) -> bool {
         self.flags & FLAG_TOMBSTONE != 0
+    }
+}
+
+/// A fully-qualified object location: which volume, and where within it.
+///
+/// This is what the metadata store persists as the authority for "object name →
+/// bytes", and what the storage backend consumes to read/delete. `NeedleLoc`
+/// alone is volume-relative; `ObjectLocation` adds the [`VolumeId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLocation {
+    /// Volume holding the needle.
+    pub volume: VolumeId,
+    /// Location of the needle within that volume.
+    pub needle: NeedleLoc,
+}
+
+impl ObjectLocation {
+    /// Construct from a volume id and a within-volume location.
+    #[inline]
+    pub fn new(volume: VolumeId, needle: NeedleLoc) -> Self {
+        Self { volume, needle }
+    }
+
+    /// Whether this location refers to a tombstone (deleted) needle.
+    #[inline]
+    pub fn is_tombstone(&self) -> bool {
+        self.needle.is_tombstone()
     }
 }
 

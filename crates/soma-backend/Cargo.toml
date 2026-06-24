@@ -10,7 +10,12 @@ description = "Storage backend: durable needle IO over volume files (StorageBack
 
 [dependencies]
 soma-core.workspace = true
-bytes.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

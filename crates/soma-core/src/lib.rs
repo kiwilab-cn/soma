@@ -21,7 +21,7 @@ mod needle;
 
 pub use error::{Error, Result};
 pub use id::{ObjectId, VolumeId};
-pub use index::{HotIndex, IdxEntry, NeedleLoc, IDX_ENTRY_LEN};
+pub use index::{HotIndex, IdxEntry, NeedleLoc, ObjectLocation, IDX_ENTRY_LEN};
 pub use needle::{
     align_up, encode_needle, padded_needle_len, scan, verify_data, NeedleHeader, ScanOutcome,
     ScannedNeedle, FLAG_TOMBSTONE, FORMAT_VERSION, HEADER_LEN, MAGIC, NEEDLE_ALIGN,

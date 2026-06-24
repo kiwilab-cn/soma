@@ -38,7 +38,9 @@ soma-s3 = { path = "crates/soma-s3" }
 crc32c = "0.6"
 thiserror = "2"
 bytes = "1"
+parking_lot = "0.12"
 proptest = "1"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
