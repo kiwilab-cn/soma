@@ -5,7 +5,7 @@
 //! serialized by a single lock in M0 (correctness over concurrency); later
 //! milestones relax this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -119,20 +119,24 @@ struct Inner {
     dir: PathBuf,
     volume_max: u64,
     volumes: BTreeMap<u32, Volume>,
+    /// Global live index: `object_id -> location` across all volumes (the value
+    /// carries the tombstone flag). This is what resolves a get-by-id.
+    objects: HashMap<ObjectId, ObjectLocation>,
     active: u32,
     next_id: u32,
 }
 
 impl Inner {
     /// Append a pre-encoded needle to the active volume, rotating first if it
-    /// would overflow `volume_max`. fsyncs before returning (durability).
+    /// would overflow `volume_max`. fsyncs and updates the indexes before
+    /// returning (durability).
     fn append(
         &mut self,
         object_id: ObjectId,
         needle_bytes: &[u8],
         size: u32,
         flags: u8,
-    ) -> Result<ObjectLocation> {
+    ) -> Result<()> {
         let needle_len = needle_bytes.len() as u64;
 
         // Rotate when the active volume is non-empty and would overflow. (An
@@ -165,7 +169,9 @@ impl Inner {
             flags,
         };
         v.index.insert(object_id, loc);
-        Ok(ObjectLocation::new(VolumeId(active), loc))
+        self.objects
+            .insert(object_id, ObjectLocation::new(VolumeId(active), loc));
+        Ok(())
     }
 
     /// Start a new active volume.
@@ -211,11 +217,23 @@ impl LocalFsBackend {
             }
         };
 
+        // Build the global id index from the per-volume indexes. Volumes are
+        // visited in ascending id order (BTreeMap), and object ids are unique per
+        // needle, so the only collision is an object and its later tombstone —
+        // which lives in an equal-or-higher volume and therefore wins.
+        let mut objects: HashMap<ObjectId, ObjectLocation> = HashMap::new();
+        for (vid, vol) in &volumes {
+            for (oid, loc) in vol.index.iter() {
+                objects.insert(oid, ObjectLocation::new(VolumeId(*vid), loc));
+            }
+        }
+
         Ok(Self {
             inner: Mutex::new(Inner {
                 dir,
                 volume_max: config.volume_max,
                 volumes,
+                objects,
                 active,
                 next_id,
             }),
@@ -224,14 +242,18 @@ impl LocalFsBackend {
 }
 
 impl StorageBackend for LocalFsBackend {
-    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<ObjectLocation> {
+    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
         let needle = encode_needle(object_id, 0, data)?;
         let size = data.len() as u32;
         self.inner.lock().append(object_id, &needle, size, 0)
     }
 
-    fn get(&self, loc: ObjectLocation, range: Option<ByteRange>) -> Result<Vec<u8>> {
+    fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
         let inner = self.inner.lock();
+        let loc = match inner.objects.get(&object_id) {
+            Some(loc) if !loc.is_tombstone() => *loc,
+            _ => return Err(Error::ObjectNotFound(object_id)),
+        };
         let vol_id = loc.volume.get();
         let v = inner
             .volumes
@@ -271,7 +293,7 @@ impl StorageBackend for LocalFsBackend {
         }
     }
 
-    fn delete(&self, object_id: ObjectId) -> Result<ObjectLocation> {
+    fn delete(&self, object_id: ObjectId) -> Result<()> {
         let needle = encode_needle(object_id, FLAG_TOMBSTONE, &[])?;
         self.inner
             .lock()

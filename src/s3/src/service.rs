@@ -13,7 +13,6 @@ use md5::{Digest, Md5};
 use parking_lot::Mutex;
 
 use soma_backend::{ByteRange, StorageBackend};
-use soma_core::ObjectLocation;
 use soma_meta::{
     BucketMeta, BucketOpts, ETag, ListRequest, ListResult, MetadataStore, ObjectPut, PutCondition,
     Version,
@@ -51,7 +50,8 @@ impl Credentials {
 
 /// One in-progress part of a multipart upload (already written to the backend).
 struct PartInfo {
-    location: ObjectLocation,
+    /// Object id of the part's needle.
+    object_id: u64,
     /// Raw 16-byte MD5 of the part (for the final multipart ETag).
     md5: [u8; 16],
 }
@@ -208,13 +208,12 @@ impl S3Service {
 
         let version = block(move || {
             let id = meta.next_object_id()?;
-            let location = backend.put(id, &body)?;
+            backend.put(id, &body)?;
             let version = meta.put_object(
                 &bucket,
                 &key,
                 ObjectPut {
                     object_id: id,
-                    location,
                     size,
                     etag: ETag(etag_stored),
                     created_at: now,
@@ -243,7 +242,7 @@ impl S3Service {
                 .ok_or_else(|| S3Error::no_such_key(&key))?;
             match range_header {
                 None => {
-                    let data = backend.get(m.location, None)?;
+                    let data = backend.get(m.object_id, None)?;
                     Ok(GetObjectOk {
                         data,
                         etag: m.etag.0,
@@ -254,7 +253,7 @@ impl S3Service {
                 }
                 Some(spec) => {
                     let (offset, length) = resolve_range(&spec, m.size)?;
-                    let data = backend.get(m.location, Some(ByteRange { offset, length }))?;
+                    let data = backend.get(m.object_id, Some(ByteRange { offset, length }))?;
                     let content_range =
                         format!("bytes {}-{}/{}", offset, offset + length - 1, m.size);
                     Ok(GetObjectOk {
@@ -338,15 +337,16 @@ impl S3Service {
         let backend = self.backend.clone();
         let md5 = md5_raw(&body);
         let etag = hex::encode(md5);
-        let location = block(move || {
+        let object_id = block(move || {
             let id = meta.next_object_id()?;
-            Ok(backend.put(id, &body)?)
+            backend.put(id, &body)?;
+            Ok(id)
         })
         .await?;
 
         match self.uploads.lock().get_mut(&upload_id) {
             Some(up) => {
-                up.parts.insert(part_number, PartInfo { location, md5 });
+                up.parts.insert(part_number, PartInfo { object_id, md5 });
             }
             None => return Err(S3Error::no_such_upload(&upload_id)),
         }
@@ -366,8 +366,8 @@ impl S3Service {
         if requested.is_empty() {
             return Err(S3Error::invalid_argument("no parts specified"));
         }
-        // Collect the part locations (in requested order) and their MD5 digests.
-        let (locations, digests) = {
+        // Collect the part object ids (in requested order) and their MD5 digests.
+        let (part_ids, digests) = {
             let reg = self.uploads.lock();
             let up = reg
                 .get(&upload_id)
@@ -377,17 +377,17 @@ impl S3Service {
                     "upload id does not match bucket/key",
                 ));
             }
-            let mut locations = Vec::with_capacity(requested.len());
+            let mut part_ids = Vec::with_capacity(requested.len());
             let mut digests = Vec::with_capacity(requested.len() * 16);
             for (pn, _etag) in &requested {
                 let part = up
                     .parts
                     .get(pn)
                     .ok_or_else(|| S3Error::invalid_part(format!("missing part {pn}")))?;
-                locations.push(part.location);
+                part_ids.push(part.object_id);
                 digests.extend_from_slice(&part.md5);
             }
-            (locations, digests)
+            (part_ids, digests)
         };
 
         let final_etag = format!("{}-{}", md5_hex(&digests), requested.len());
@@ -399,18 +399,17 @@ impl S3Service {
         block(move || {
             // Assemble part bytes in order, then write the final object.
             let mut assembled = Vec::new();
-            for loc in &locations {
-                assembled.extend_from_slice(&backend.get(*loc, None)?);
+            for part_id in &part_ids {
+                assembled.extend_from_slice(&backend.get(*part_id, None)?);
             }
             let size = assembled.len() as u64;
             let id = meta.next_object_id()?;
-            let location = backend.put(id, &assembled)?;
+            backend.put(id, &assembled)?;
             meta.put_object(
                 &b,
                 &k,
                 ObjectPut {
                     object_id: id,
-                    location,
                     size,
                     etag: ETag(etag_stored),
                     created_at: now,

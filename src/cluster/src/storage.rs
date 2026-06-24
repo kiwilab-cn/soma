@@ -8,7 +8,7 @@ use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
 use soma_backend::{ByteRange, Error, Result, StorageBackend};
-use soma_core::{ObjectId, ObjectLocation};
+use soma_core::ObjectId;
 
 use crate::bridge::Bridge;
 use crate::pb;
@@ -48,16 +48,16 @@ fn dispatch(
 ) -> std::result::Result<StorageReply, WireError> {
     let reply: Result<StorageReply> = match req {
         StorageRequest::Put { object_id, data } => {
-            backend.put(object_id, &data).map(StorageReply::Location)
+            backend.put(object_id, &data).map(|()| StorageReply::Unit)
         }
-        StorageRequest::Get { location, range } => backend
+        StorageRequest::Get { object_id, range } => backend
             .get(
-                location,
+                object_id,
                 range.map(|(offset, length)| ByteRange { offset, length }),
             )
             .map(StorageReply::Data),
         StorageRequest::Delete { object_id } => {
-            backend.delete(object_id).map(StorageReply::Location)
+            backend.delete(object_id).map(|()| StorageReply::Unit)
         }
         StorageRequest::Sync => backend.sync().map(|()| StorageReply::Unit),
         StorageRequest::Checkpoint => backend.checkpoint().map(|()| StorageReply::Unit),
@@ -127,19 +127,19 @@ fn unexpected() -> Error {
 }
 
 impl StorageBackend for StorageClient {
-    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<ObjectLocation> {
+    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
         match self.call(StorageRequest::Put {
             object_id,
             data: data.to_vec(),
         })? {
-            StorageReply::Location(loc) => Ok(loc),
+            StorageReply::Unit => Ok(()),
             _ => Err(unexpected()),
         }
     }
 
-    fn get(&self, loc: ObjectLocation, range: Option<ByteRange>) -> Result<Vec<u8>> {
+    fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
         match self.call(StorageRequest::Get {
-            location: loc,
+            object_id,
             range: range.map(|r| (r.offset, r.length)),
         })? {
             StorageReply::Data(d) => Ok(d),
@@ -147,9 +147,9 @@ impl StorageBackend for StorageClient {
         }
     }
 
-    fn delete(&self, object_id: ObjectId) -> Result<ObjectLocation> {
+    fn delete(&self, object_id: ObjectId) -> Result<()> {
         match self.call(StorageRequest::Delete { object_id })? {
-            StorageReply::Location(loc) => Ok(loc),
+            StorageReply::Unit => Ok(()),
             _ => Err(unexpected()),
         }
     }

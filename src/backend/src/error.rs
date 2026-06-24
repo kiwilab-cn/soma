@@ -41,6 +41,10 @@ pub enum Error {
     #[error("malformed volume file name: {0}")]
     BadVolumeName(String),
 
+    /// No live object with this id is present on this node.
+    #[error("object {0} not found")]
+    ObjectNotFound(u64),
+
     /// An error surfaced from a remote storage node over RPC.
     #[error("remote storage error: {0}")]
     Remote(String),
