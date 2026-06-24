@@ -179,7 +179,7 @@ rebuild its own index. The hot index is a **derived cache** (per `ARCHITECTURE.m
 | `DeleteObject` | Writes tombstone, removes/links version in metadata. |
 | `ListObjectsV2` | Prefix + delimiter emulation over the flat keyspace; pagination via continuation token. |
 | `CreateBucket` / `DeleteBucket` / `ListBuckets` | Bucket lifecycle. |
-| `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` / `AbortMultipartUpload` | Large objects → multiple needles/chunks, assembled at complete. |
+| `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` / `AbortMultipartUpload` | Each part is written to the backend as a needle on upload; upload state is held in memory (ephemeral). On complete, parts are assembled into one object and the multipart ETag (`md5(concat of part md5s)-N`) is returned. (True chunked objects — no assembly buffering — come with large-object chunking later.) |
 | Auth | **AWS SigV4** request signing verification. |
 
 **ETag**: M0 uses the object's content hash (or, for multipart, the S3-style

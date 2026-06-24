@@ -19,6 +19,65 @@ pub fn escape(s: &str) -> String {
     out
 }
 
+/// Render an `InitiateMultipartUploadResult` document.
+pub fn initiate_multipart_result(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
+         </InitiateMultipartUploadResult>",
+        escape(bucket),
+        escape(key),
+        escape(upload_id)
+    )
+}
+
+/// Render a `CompleteMultipartUploadResult` document.
+pub fn complete_multipart_result(bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key>\
+         <ETag>&quot;{}&quot;</ETag></CompleteMultipartUploadResult>",
+        escape(bucket),
+        escape(key),
+        escape(bucket),
+        escape(key),
+        escape(etag)
+    )
+}
+
+/// Parse the `CompleteMultipartUpload` request body into `(part_number, etag)`
+/// pairs, in document order. The body is small and simply structured, so a tiny
+/// hand parser avoids an XML dependency.
+pub fn parse_complete_parts(body: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<Part>") {
+        let after = &rest[start + "<Part>".len()..];
+        let Some(end) = after.find("</Part>") else {
+            break;
+        };
+        let block = &after[..end];
+        let part_number =
+            extract_tag(block, "PartNumber").and_then(|s| s.trim().parse::<u32>().ok());
+        let etag = extract_tag(block, "ETag").map(|s| s.trim().trim_matches('"').to_string());
+        if let (Some(n), Some(e)) = (part_number, etag) {
+            out.push((n, e));
+        }
+        rest = &after[end + "</Part>".len()..];
+    }
+    out
+}
+
+fn extract_tag(s: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let i = s.find(&open)? + open.len();
+    let j = s[i..].find(&close)? + i;
+    Some(s[i..j].to_string())
+}
+
 /// Render a `ListAllMyBucketsResult` document.
 pub fn list_all_buckets(buckets: &[BucketMeta], created_at: u64) -> String {
     let mut s = String::from(
@@ -171,5 +230,24 @@ mod tests {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00.000Z");
         // 2024-01-01T00:00:00Z = 1704067200
         assert_eq!(iso8601(1_704_067_200), "2024-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn parse_complete_parts_extracts_ordered_pairs() {
+        let body = "<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"abc\"</ETag></Part>\
+            <Part><PartNumber>2</PartNumber><ETag>\"def\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        assert_eq!(
+            parse_complete_parts(body),
+            vec![(1, "abc".to_string()), (2, "def".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_complete_parts_empty() {
+        assert!(
+            parse_complete_parts("<CompleteMultipartUpload></CompleteMultipartUpload>").is_empty()
+        );
     }
 }

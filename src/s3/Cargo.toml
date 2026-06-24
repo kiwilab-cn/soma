@@ -16,6 +16,7 @@ soma-backend.workspace = true
 tokio.workspace = true
 axum.workspace = true
 bytes.workspace = true
+parking_lot.workspace = true
 thiserror.workspace = true
 hmac.workspace = true
 sha2.workspace = true

@@ -124,6 +124,134 @@ fn body_str(b: &Bytes) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// Extract the text inside `<tag>...</tag>` from an XML body.
+fn xml_tag(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let i = xml.find(&open).unwrap() + open.len();
+    let j = xml[i..].find(&close).unwrap() + i;
+    xml[i..j].to_string()
+}
+
+#[tokio::test]
+async fn multipart_upload_roundtrip() {
+    let (app, _dir) = make_app();
+    signed(&app, "PUT", "/b", b"", &[]).await;
+
+    // Initiate.
+    let (status, _, body) = signed(&app, "POST", "/b/big.bin?uploads", b"", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = xml_tag(&body_str(&body), "UploadId");
+    assert!(upload_id.starts_with("soma-"));
+
+    // Upload two parts.
+    let part1 = vec![b'a'; 100];
+    let part2 = vec![b'b'; 50];
+    let (s1, h1, _) = signed(
+        &app,
+        "PUT",
+        &format!("/b/big.bin?partNumber=1&uploadId={upload_id}"),
+        &part1,
+        &[],
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    let etag1 = h1.get("etag").unwrap().to_str().unwrap().to_string();
+    let (s2, h2, _) = signed(
+        &app,
+        "PUT",
+        &format!("/b/big.bin?partNumber=2&uploadId={upload_id}"),
+        &part2,
+        &[],
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let etag2 = h2.get("etag").unwrap().to_str().unwrap().to_string();
+
+    // Complete.
+    let complete_body = format!(
+        "<CompleteMultipartUpload>\
+         <Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+    let (sc, _, cbody) = signed(
+        &app,
+        "POST",
+        &format!("/b/big.bin?uploadId={upload_id}"),
+        complete_body.as_bytes(),
+        &[],
+    )
+    .await;
+    assert_eq!(sc, StatusCode::OK);
+    // Multipart ETag carries the part count as a `-N` suffix (XML-escaped quotes
+    // surround it in the response body).
+    assert!(body_str(&cbody).contains("-2&quot;"));
+
+    // The assembled object reads back as part1 ++ part2.
+    let (sg, _, gbody) = signed(&app, "GET", "/b/big.bin", b"", &[]).await;
+    assert_eq!(sg, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(gbody.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn multipart_abort_then_complete_fails() {
+    let (app, _dir) = make_app();
+    signed(&app, "PUT", "/b", b"", &[]).await;
+    let (_, _, body) = signed(&app, "POST", "/b/k?uploads", b"", &[]).await;
+    let upload_id = xml_tag(&body_str(&body), "UploadId");
+    signed(
+        &app,
+        "PUT",
+        &format!("/b/k?partNumber=1&uploadId={upload_id}"),
+        b"data",
+        &[],
+    )
+    .await;
+
+    // Abort.
+    let (sa, _, _) = signed(
+        &app,
+        "DELETE",
+        &format!("/b/k?uploadId={upload_id}"),
+        b"",
+        &[],
+    )
+    .await;
+    assert_eq!(sa, StatusCode::NO_CONTENT);
+
+    // Completing the aborted upload now fails.
+    let cbody = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part></CompleteMultipartUpload>";
+    let (sc, _, cb) = signed(
+        &app,
+        "POST",
+        &format!("/b/k?uploadId={upload_id}"),
+        cbody.as_bytes(),
+        &[],
+    )
+    .await;
+    assert_eq!(sc, StatusCode::NOT_FOUND);
+    assert!(body_str(&cb).contains("NoSuchUpload"));
+}
+
+#[tokio::test]
+async fn upload_part_to_unknown_upload_fails() {
+    let (app, _dir) = make_app();
+    signed(&app, "PUT", "/b", b"", &[]).await;
+    let (status, _, body) = signed(
+        &app,
+        "PUT",
+        "/b/k?partNumber=1&uploadId=soma-deadbeef",
+        b"data",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body_str(&body).contains("NoSuchUpload"));
+}
+
 #[tokio::test]
 async fn full_object_lifecycle() {
     let (app, _dir) = make_app();
@@ -248,15 +376,6 @@ async fn list_with_delimiter() {
     assert!(xml.contains("<Prefix>docs/</Prefix>") || xml.contains("docs/"));
     assert!(xml.contains("<CommonPrefixes>"));
     assert!(xml.contains("<Key>root</Key>"));
-}
-
-#[tokio::test]
-async fn multipart_is_not_implemented() {
-    let (app, _dir) = make_app();
-    signed(&app, "PUT", "/b", b"", &[]).await;
-    let (status, _, body) = signed(&app, "POST", "/b/big?uploads", b"", &[]).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(body_str(&body).contains("NotImplemented"));
 }
 
 #[tokio::test]

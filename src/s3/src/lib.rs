@@ -82,11 +82,20 @@ async fn dispatch(
 
     // Object level.
     if !key.is_empty() {
-        // Reject multipart sub-resources explicitly.
-        if qhas(&q, "uploads") || qhas(&q, "uploadId") || qhas(&q, "partNumber") {
-            return Err(S3Error::not_implemented(
-                "multipart upload is not yet supported",
-            ));
+        // Multipart sub-resources (distinguished by query parameters).
+        if *method == Method::POST && qhas(&q, "uploads") {
+            return create_multipart(svc, bucket, key).await;
+        }
+        if let Some(upload_id) = qget(&q, "uploadId") {
+            return match *method {
+                Method::PUT => upload_part(svc, upload_id, &q, body).await,
+                Method::POST => complete_multipart(svc, bucket, key, upload_id, body).await,
+                Method::DELETE => {
+                    svc.abort_multipart(upload_id.to_string()).await?;
+                    Ok(StatusCode::NO_CONTENT.into_response())
+                }
+                _ => Err(S3Error::not_implemented("unsupported multipart operation")),
+            };
         }
         return match *method {
             Method::PUT => put_object(svc, bucket, key, headers, body).await,
@@ -199,6 +208,63 @@ async fn put_object(
     let mut h = HeaderMap::new();
     h.insert(header::ETAG, hv(&format!("\"{}\"", ok.etag)));
     Ok((StatusCode::OK, h).into_response())
+}
+
+async fn create_multipart(svc: &S3Service, bucket: &str, key: &str) -> S3Result<Response> {
+    let upload_id = svc
+        .create_multipart(bucket.to_string(), key.to_string())
+        .await?;
+    let body = xml::initiate_multipart_result(bucket, key, &upload_id);
+    Ok(xml_response(StatusCode::OK, body))
+}
+
+async fn upload_part(
+    svc: &S3Service,
+    upload_id: &str,
+    q: &[(String, String)],
+    body: Body,
+) -> S3Result<Response> {
+    let part_number = qget(q, "partNumber")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| S3Error::invalid_argument("invalid partNumber"))?;
+    let bytes = axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
+
+    let etag = svc
+        .upload_part(upload_id.to_string(), part_number, bytes)
+        .await?;
+    let mut h = HeaderMap::new();
+    h.insert(header::ETAG, hv(&format!("\"{etag}\"")));
+    Ok((StatusCode::OK, h).into_response())
+}
+
+async fn complete_multipart(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: Body,
+) -> S3Result<Response> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| S3Error::invalid_argument("body is not valid utf-8"))?;
+    let parts = xml::parse_complete_parts(text);
+
+    let etag = svc
+        .complete_multipart(
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.to_string(),
+            parts,
+            now_secs(),
+        )
+        .await?;
+    let body = xml::complete_multipart_result(bucket, key, &etag);
+    Ok(xml_response(StatusCode::OK, body))
 }
 
 async fn get_object(

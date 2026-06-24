@@ -3,14 +3,17 @@
 //! The stores are synchronous (fsync-bound IO); each operation runs its blocking
 //! work on a `spawn_blocking` thread so the async HTTP layer is never blocked.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::http::{header, HeaderMap};
 use bytes::Bytes;
 use md5::{Digest, Md5};
+use parking_lot::Mutex;
 
 use soma_backend::{ByteRange, StorageBackend};
+use soma_core::ObjectLocation;
 use soma_meta::{
     BucketMeta, BucketOpts, ETag, ListRequest, ListResult, MetadataStore, ObjectPut, PutCondition,
     Version,
@@ -46,12 +49,31 @@ impl Credentials {
     }
 }
 
+/// One in-progress part of a multipart upload (already written to the backend).
+struct PartInfo {
+    location: ObjectLocation,
+    /// Raw 16-byte MD5 of the part (for the final multipart ETag).
+    md5: [u8; 16],
+}
+
+/// In-progress multipart upload state. Held in memory only — incomplete uploads
+/// are ephemeral and do not survive a restart (acceptable for M0).
+struct MultipartUpload {
+    bucket: String,
+    key: String,
+    parts: BTreeMap<u32, PartInfo>,
+}
+
 /// The S3 service: shared metadata store, storage backend, and credentials.
 #[derive(Clone)]
 pub struct S3Service {
     meta: Arc<dyn MetadataStore>,
     backend: Arc<dyn StorageBackend>,
     creds: Arc<Credentials>,
+    /// Active multipart uploads, keyed by upload id.
+    uploads: Arc<Mutex<HashMap<String, MultipartUpload>>>,
+    /// Monotonic source of upload ids (unique within this process).
+    upload_seq: Arc<AtomicU64>,
 }
 
 /// Result of a successful `PutObject`.
@@ -97,6 +119,8 @@ impl S3Service {
             meta,
             backend,
             creds: Arc::new(creds),
+            uploads: Arc::new(Mutex::new(HashMap::new())),
+            upload_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -276,6 +300,137 @@ impl S3Service {
         })
         .await
     }
+
+    /// `CreateMultipartUpload`. Registers an upload and returns its id.
+    pub async fn create_multipart(&self, bucket: String, key: String) -> S3Result<String> {
+        // The bucket must exist.
+        let meta = self.meta.clone();
+        let b = bucket.clone();
+        let exists = block(move || Ok(meta.get_bucket(&b)?.is_some())).await?;
+        if !exists {
+            return Err(S3Error::no_such_bucket(&bucket));
+        }
+        let n = self.upload_seq.fetch_add(1, Ordering::Relaxed);
+        let upload_id = format!("soma-{n:016x}");
+        self.uploads.lock().insert(
+            upload_id.clone(),
+            MultipartUpload {
+                bucket,
+                key,
+                parts: BTreeMap::new(),
+            },
+        );
+        Ok(upload_id)
+    }
+
+    /// `UploadPart`. Writes the part to the backend and records it; returns its
+    /// ETag (hex MD5).
+    pub async fn upload_part(
+        &self,
+        upload_id: String,
+        part_number: u32,
+        body: Bytes,
+    ) -> S3Result<String> {
+        if !self.uploads.lock().contains_key(&upload_id) {
+            return Err(S3Error::no_such_upload(&upload_id));
+        }
+        let meta = self.meta.clone();
+        let backend = self.backend.clone();
+        let md5 = md5_raw(&body);
+        let etag = hex::encode(md5);
+        let location = block(move || {
+            let id = meta.next_object_id()?;
+            Ok(backend.put(id, &body)?)
+        })
+        .await?;
+
+        match self.uploads.lock().get_mut(&upload_id) {
+            Some(up) => {
+                up.parts.insert(part_number, PartInfo { location, md5 });
+            }
+            None => return Err(S3Error::no_such_upload(&upload_id)),
+        }
+        Ok(etag)
+    }
+
+    /// `CompleteMultipartUpload`. Assembles the requested parts into one object
+    /// and returns the multipart ETag (`md5(concat of part md5s)-N`).
+    pub async fn complete_multipart(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+        requested: Vec<(u32, String)>,
+        now: u64,
+    ) -> S3Result<String> {
+        if requested.is_empty() {
+            return Err(S3Error::invalid_argument("no parts specified"));
+        }
+        // Collect the part locations (in requested order) and their MD5 digests.
+        let (locations, digests) = {
+            let reg = self.uploads.lock();
+            let up = reg
+                .get(&upload_id)
+                .ok_or_else(|| S3Error::no_such_upload(&upload_id))?;
+            if up.bucket != bucket || up.key != key {
+                return Err(S3Error::invalid_argument(
+                    "upload id does not match bucket/key",
+                ));
+            }
+            let mut locations = Vec::with_capacity(requested.len());
+            let mut digests = Vec::with_capacity(requested.len() * 16);
+            for (pn, _etag) in &requested {
+                let part = up
+                    .parts
+                    .get(pn)
+                    .ok_or_else(|| S3Error::invalid_part(format!("missing part {pn}")))?;
+                locations.push(part.location);
+                digests.extend_from_slice(&part.md5);
+            }
+            (locations, digests)
+        };
+
+        let final_etag = format!("{}-{}", md5_hex(&digests), requested.len());
+
+        let meta = self.meta.clone();
+        let backend = self.backend.clone();
+        let etag_stored = final_etag.clone();
+        let (b, k) = (bucket.clone(), key.clone());
+        block(move || {
+            // Assemble part bytes in order, then write the final object.
+            let mut assembled = Vec::new();
+            for loc in &locations {
+                assembled.extend_from_slice(&backend.get(*loc, None)?);
+            }
+            let size = assembled.len() as u64;
+            let id = meta.next_object_id()?;
+            let location = backend.put(id, &assembled)?;
+            meta.put_object(
+                &b,
+                &k,
+                ObjectPut {
+                    object_id: id,
+                    location,
+                    size,
+                    etag: ETag(etag_stored),
+                    created_at: now,
+                },
+                PutCondition::None,
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        self.uploads.lock().remove(&upload_id);
+        Ok(final_etag)
+    }
+
+    /// `AbortMultipartUpload`. Discards the upload's state (part needles become
+    /// orphans, reclaimed by later GC).
+    pub async fn abort_multipart(&self, upload_id: String) -> S3Result<()> {
+        self.uploads.lock().remove(&upload_id);
+        Ok(())
+    }
 }
 
 /// Read a header as a `&str`, defaulting to empty.
@@ -298,11 +453,16 @@ where
     }
 }
 
-/// Hex-encoded MD5 of `data` (the S3 single-part ETag).
-fn md5_hex(data: &[u8]) -> String {
+/// Raw 16-byte MD5 of `data`.
+fn md5_raw(data: &[u8]) -> [u8; 16] {
     let mut h = Md5::new();
     h.update(data);
-    hex::encode(h.finalize())
+    h.finalize().into()
+}
+
+/// Hex-encoded MD5 of `data` (the S3 single-part ETag).
+fn md5_hex(data: &[u8]) -> String {
+    hex::encode(md5_raw(data))
 }
 
 /// Resolve an HTTP `Range` header against the object size into `(offset, length)`.
