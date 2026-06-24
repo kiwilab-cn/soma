@@ -55,6 +55,7 @@ impl Error {
     pub fn kind(&self) -> &'static str {
         match self {
             Error::BadRange { .. } => "bad_range",
+            Error::ObjectNotFound(_) => "object_not_found",
             _ => "internal",
         }
     }
@@ -62,13 +63,15 @@ impl Error {
     /// Reconstruct an error from a `(kind, message)` pair received over RPC.
     pub fn from_remote(kind: &str, message: String) -> Self {
         match kind {
-            // The S3 layer only distinguishes BadRange (-> 416); the offending
-            // numbers are not needed to render the response.
+            // The exact numbers/ids are not needed by the caller: the S3 layer
+            // only distinguishes BadRange (-> 416), and the replicated backend
+            // only matches the ObjectNotFound variant (to drive read-repair).
             "bad_range" => Error::BadRange {
                 offset: 0,
                 len: 0,
                 size: 0,
             },
+            "object_not_found" => Error::ObjectNotFound(0),
             _ => Error::Remote(message),
         }
     }

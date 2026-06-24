@@ -476,6 +476,155 @@ async fn write_quorum_fails_when_too_few_replicas() {
         .is_err());
 }
 
+/// A storage backend whose availability can be toggled, simulating a node going
+/// down/up without rebinding its socket. Offline → every op fails as if the node
+/// were unreachable.
+struct ToggleBackend {
+    inner: Arc<dyn StorageBackend>,
+    online: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ToggleBackend {
+    fn offline(&self) -> soma_backend::Result<Vec<u8>> {
+        Err(soma_backend::Error::Remote("node offline".to_string()))
+    }
+}
+
+impl StorageBackend for ToggleBackend {
+    fn put(&self, object_id: u64, data: &[u8]) -> soma_backend::Result<()> {
+        if self.online.load(std::sync::atomic::Ordering::Relaxed) {
+            self.inner.put(object_id, data)
+        } else {
+            self.offline().map(|_| ())
+        }
+    }
+    fn get(
+        &self,
+        object_id: u64,
+        range: Option<soma_backend::ByteRange>,
+    ) -> soma_backend::Result<Vec<u8>> {
+        if self.online.load(std::sync::atomic::Ordering::Relaxed) {
+            self.inner.get(object_id, range)
+        } else {
+            self.offline()
+        }
+    }
+    fn delete(&self, object_id: u64) -> soma_backend::Result<()> {
+        if self.online.load(std::sync::atomic::Ordering::Relaxed) {
+            self.inner.delete(object_id)
+        } else {
+            self.offline().map(|_| ())
+        }
+    }
+    fn sync(&self) -> soma_backend::Result<()> {
+        self.inner.sync()
+    }
+    fn checkpoint(&self) -> soma_backend::Result<()> {
+        self.inner.checkpoint()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_repair_refills_a_node_that_missed_writes() {
+    use soma_cluster::{serve_meta, serve_storage, MetaClient, ReplicatedBackend};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+
+    // Metadata node.
+    let meta_port = free_port();
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    {
+        let ms = meta_store.clone();
+        tokio::spawn(async move {
+            let _ = serve_meta(sock(meta_port), ms).await;
+        });
+    }
+
+    // Three toggleable storage nodes.
+    let mut online = Vec::new();
+    let mut endpoints = Vec::new();
+    for i in 0..3 {
+        let port = free_port();
+        let sdir = dir.path().join(format!("s{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let inner: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        let flag = Arc::new(AtomicBool::new(true));
+        online.push(flag.clone());
+        let backend: Arc<dyn StorageBackend> = Arc::new(ToggleBackend {
+            inner,
+            online: flag,
+        });
+        tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        });
+        endpoints.push(format!("http://127.0.0.1:{port}"));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    // RF=3, W=2, and NO read cache (so reads actually hit the backends).
+    let repl: Arc<dyn StorageBackend> =
+        Arc::new(ReplicatedBackend::connect(endpoints, 3, 2).await.unwrap());
+    let svc = S3Service::new(meta, repl, Credentials::single("AK", "SK"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    let _s3 = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    let store = client(s3_port);
+
+    // Node 0 offline during the write → it misses the object (W=2 from nodes 1,2).
+    online[0].store(false, Ordering::Relaxed);
+    let key = OPath::from("repair.bin");
+    let payload = b"refilled by read-repair";
+    store
+        .put(&key, PutPayload::from_static(payload))
+        .await
+        .unwrap();
+
+    // Node 0 back online; a full GET triggers read-repair to refill it.
+    online[0].store(true, Ordering::Relaxed);
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await; // let the repair put land
+
+    // Prove node 0 now holds the object: take nodes 1 and 2 offline; the read can
+    // only be served from node 0.
+    online[1].store(false, Ordering::Relaxed);
+    online[2].store(false, Ordering::Relaxed);
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+}
+
 #[tokio::test]
 async fn full_stack_restart_persists_data() {
     let dir = TempDir::new().unwrap();

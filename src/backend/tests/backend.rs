@@ -174,6 +174,33 @@ fn torn_tail_is_recovered() {
 }
 
 #[test]
+fn scrub_detects_payload_corruption() {
+    let dir = TempDir::new().unwrap();
+    {
+        let be = open(&dir);
+        be.put(1, b"aaaa").unwrap();
+        be.put(2, b"bbbb").unwrap();
+        be.sync().unwrap();
+    }
+
+    // Corrupt object 2's first payload byte directly in the volume file.
+    // Needle 1: 32B header + 4B data + 4B pad = 40B; needle 2 header at 40, data
+    // begins at 40 + 32 = 72.
+    let vol = dir.path().join("volumes").join("0000000001.vol");
+    let mut bytes = std::fs::read(&vol).unwrap();
+    bytes[72] ^= 0xFF;
+    std::fs::write(&vol, &bytes).unwrap();
+
+    let be = open(&dir);
+    let report = be.scrub().unwrap();
+    assert_eq!(report.checked, 2);
+    assert_eq!(report.corrupt, vec![2u64]);
+    // The corrupted object also fails to read; the intact one is fine.
+    assert!(be.get(2, None).is_err());
+    assert_eq!(be.get(1, None).unwrap(), b"aaaa");
+}
+
+#[test]
 fn newest_write_for_same_id_wins() {
     let dir = TempDir::new().unwrap();
     {

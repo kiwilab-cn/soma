@@ -239,6 +239,50 @@ impl LocalFsBackend {
             }),
         })
     }
+
+    /// Verify every needle's payload CRC across all volumes (bitrot detection).
+    ///
+    /// Reads the `.vol` files directly (read-only, no lock held during the scan),
+    /// so it does not block concurrent serving. Returns the object ids whose
+    /// payload failed its CRC. M0's `verify_data` is the integrity check; this
+    /// just applies it proactively. (Reads each volume fully into memory — fine
+    /// for a periodic background pass.)
+    pub fn scrub(&self) -> Result<ScrubReport> {
+        let vols_dir = {
+            let inner = self.inner.lock();
+            inner.dir.join("volumes")
+        };
+        let mut report = ScrubReport::default();
+        let mut ids = discover_volume_ids(&vols_dir)?;
+        ids.sort_unstable();
+        for id in ids {
+            let buf = std::fs::read(vol_path_from(&vols_dir, VolumeId(id)))?;
+            let out = scan(&buf, 0);
+            for n in &out.needles {
+                report.checked += 1;
+                let start = n.data_offset() as usize;
+                let len = n.header.data_len as usize;
+                let data = &buf[start..start + len];
+                if verify_data(&n.header, data).is_err() {
+                    report.corrupt.push(n.header.object_id);
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// The outcome of a [`LocalFsBackend::scrub`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrubReport {
+    /// Number of needles whose CRC was checked.
+    pub checked: u64,
+    /// Object ids whose payload failed its CRC.
+    pub corrupt: Vec<ObjectId>,
+}
+
+fn vol_path_from(vols_dir: &Path, id: VolumeId) -> PathBuf {
+    vols_dir.join(format!("{id}.vol"))
 }
 
 impl StorageBackend for LocalFsBackend {
