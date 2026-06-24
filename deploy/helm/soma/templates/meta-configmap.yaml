@@ -25,3 +25,4 @@ data:
     settle_secs = {{ .Values.rebalance.settleSecs }}
     max_copies_per_pass = {{ .Values.rebalance.maxCopiesPerPass }}
     down_after_secs = {{ .Values.rebalance.downAfterSecs }}
+    max_garbage_per_pass = {{ .Values.rebalance.maxGarbagePerPass }}

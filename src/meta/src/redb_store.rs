@@ -28,6 +28,9 @@ const SEQ: TableDefinition<&str, u64> = TableDefinition::new("seq");
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_usage");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
 const PG_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("pg_table");
+/// Object ids superseded by an overwrite/delete (or an orphaned multipart part),
+/// awaiting reclamation from storage nodes by the GC. Value is unused.
+const GARBAGE: TableDefinition<u64, u64> = TableDefinition::new("garbage");
 
 /// Counter name for the monotonic object-id sequence.
 const OBJECT_ID_SEQ: &str = "object_id";
@@ -50,6 +53,7 @@ impl RedbMetaStore {
             w.open_table(USAGE)?;
             w.open_table(MEMBERS)?;
             w.open_table(PG_TABLE)?;
+            w.open_table(GARBAGE)?;
         }
         w.commit()?;
         Ok(Self { db })
@@ -95,6 +99,33 @@ impl RedbMetaStore {
                 placement.node_ids = std::mem::take(&mut placement.target);
                 placement.generation += 1;
                 t.insert(pg, postcard::to_allocvec(&placement)?.as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Up to `limit` garbage object ids awaiting reclamation.
+    pub fn list_garbage(&self, limit: usize) -> Result<Vec<ObjectId>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(GARBAGE)?;
+        let mut out = Vec::new();
+        for item in t.iter()? {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(item?.0.value());
+        }
+        Ok(out)
+    }
+
+    /// Remove object ids from the garbage set (once reclaimed from storage nodes).
+    pub fn remove_garbage(&self, object_ids: &[ObjectId]) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(GARBAGE)?;
+            for id in object_ids {
+                t.remove(*id)?;
             }
         }
         w.commit()?;
@@ -235,6 +266,13 @@ impl MetadataStore for RedbMetaStore {
                 write_usage(&mut usage, &put.tenant, u)?;
             }
 
+            // The overwritten version's bytes are now orphaned on storage nodes;
+            // record its id for the GC to reclaim (the new put always has a fresh
+            // id, so this never marks the object being written).
+            if let Some(c) = current.as_ref().filter(|c| c.object_id != put.object_id) {
+                w.open_table(GARBAGE)?.insert(c.object_id, 0u64)?;
+            }
+
             new_version = Version(current.as_ref().map_or(1, |c| c.version.0 + 1));
             let meta = ObjectMeta {
                 object_id: put.object_id,
@@ -279,6 +317,8 @@ impl MetadataStore for RedbMetaStore {
                     u.objects = u.objects.saturating_sub(1);
                     write_usage(&mut usage, &c.tenant, u)?;
                 }
+                // The deleted object's bytes are now orphaned — hand its id to GC.
+                w.open_table(GARBAGE)?.insert(c.object_id, 0u64)?;
                 objects.remove(ck.as_slice())?;
             }
         }
@@ -290,6 +330,18 @@ impl MetadataStore for RedbMetaStore {
         let r = self.db.begin_read()?;
         let usage = r.open_table(USAGE)?;
         read_usage(&usage, tenant)
+    }
+
+    fn mark_garbage(&self, object_ids: &[ObjectId]) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(GARBAGE)?;
+            for id in object_ids {
+                t.insert(*id, 0u64)?;
+            }
+        }
+        w.commit()?;
+        Ok(())
     }
 
     fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()> {

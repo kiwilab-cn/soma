@@ -61,6 +61,12 @@ pub trait MetadataStore: Send + Sync {
     /// The tracked live usage for a tenant (zero if the tenant is unknown).
     fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage>;
 
+    /// Record object ids whose bytes are now orphaned on storage nodes (e.g. the
+    /// parts of a completed/aborted multipart upload), for the GC to reclaim.
+    /// Overwrite/delete orphans are recorded automatically inside `put_object` /
+    /// `delete_object`; this is for orphans the metadata layer can't infer.
+    fn mark_garbage(&self, object_ids: &[ObjectId]) -> Result<()>;
+
     // --- cluster membership + placement (M3) -------------------------------
 
     /// Register (or re-register) a storage node, marking it `Active` and bumping

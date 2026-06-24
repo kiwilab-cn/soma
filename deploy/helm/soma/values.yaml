@@ -43,6 +43,8 @@ rebalance:
   maxCopiesPerPass: 64
   # Seconds without a heartbeat before a node is marked Down (self-heal trigger).
   downAfterSecs: 90
+  # Orphaned object ids the GC reclaims per pass (overwrites/deletes/multipart parts).
+  maxGarbagePerPass: 256
 
 erasure:
   enabled: false

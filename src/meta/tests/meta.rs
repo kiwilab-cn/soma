@@ -619,3 +619,43 @@ fn list_object_ids_returns_committed_objects() {
     ids.sort();
     assert_eq!(ids, vec![10, 20]);
 }
+
+// --- orphan garbage tracking (hardening) -----------------------------------
+
+#[test]
+fn overwrite_and_delete_record_garbage() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b", BucketOpts::default()).unwrap();
+
+    // First write: no prior version → no garbage.
+    m.put_object("b", "k", put(1, 0, 3, "e1"), PutCondition::None)
+        .unwrap();
+    assert!(m.list_garbage(100).unwrap().is_empty());
+
+    // Overwrite: the old id (1) becomes garbage.
+    m.put_object("b", "k", put(2, 0, 3, "e2"), PutCondition::None)
+        .unwrap();
+    assert_eq!(m.list_garbage(100).unwrap(), vec![1]);
+
+    // Delete: the current id (2) becomes garbage too.
+    m.delete_object("b", "k", PutCondition::None).unwrap();
+    let mut g = m.list_garbage(100).unwrap();
+    g.sort();
+    assert_eq!(g, vec![1, 2]);
+
+    // Reclaiming clears them.
+    m.remove_garbage(&[1]).unwrap();
+    assert_eq!(m.list_garbage(100).unwrap(), vec![2]);
+}
+
+#[test]
+fn mark_garbage_and_limit() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.mark_garbage(&[10, 20, 30]).unwrap();
+    assert_eq!(m.list_garbage(2).unwrap().len(), 2); // limited
+    assert_eq!(m.list_garbage(100).unwrap().len(), 3);
+    m.remove_garbage(&[10, 20, 30]).unwrap();
+    assert!(m.list_garbage(100).unwrap().is_empty());
+}

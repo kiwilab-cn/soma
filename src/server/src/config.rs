@@ -126,6 +126,8 @@ pub struct RebalanceConfig {
     /// Seconds without a heartbeat before a node is marked `Down` (triggering
     /// re-replication of its placement groups).
     pub down_after_secs: u64,
+    /// Max orphaned object ids the GC reclaims per reconcile pass (the throttle).
+    pub max_garbage_per_pass: usize,
 }
 
 impl Default for RebalanceConfig {
@@ -136,6 +138,7 @@ impl Default for RebalanceConfig {
             settle_secs: 30,
             max_copies_per_pass: 64,
             down_after_secs: 90,
+            max_garbage_per_pass: 256,
         }
     }
 }

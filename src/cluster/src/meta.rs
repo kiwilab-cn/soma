@@ -75,6 +75,9 @@ fn dispatch(
         }
         MetaRequest::NextObjectId => store.next_object_id().map(MetaReply::ObjectId),
         MetaRequest::TenantUsage { tenant } => store.tenant_usage(&tenant).map(MetaReply::Usage),
+        MetaRequest::MarkGarbage { object_ids } => {
+            store.mark_garbage(&object_ids).map(|()| MetaReply::Unit)
+        }
         MetaRequest::RegisterNode {
             node_id,
             endpoint,
@@ -256,6 +259,15 @@ impl MetadataStore for MetaClient {
             tenant: tenant.to_string(),
         })? {
             MetaReply::Usage(u) => Ok(u),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn mark_garbage(&self, object_ids: &[ObjectId]) -> Result<()> {
+        match self.call(MetaRequest::MarkGarbage {
+            object_ids: object_ids.to_vec(),
+        })? {
+            MetaReply::Unit => Ok(()),
             _ => Err(unexpected()),
         }
     }

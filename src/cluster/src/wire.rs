@@ -43,6 +43,9 @@ pub(crate) enum MetaRequest {
     TenantUsage {
         tenant: String,
     },
+    MarkGarbage {
+        object_ids: Vec<u64>,
+    },
     RegisterNode {
         node_id: String,
         endpoint: String,
