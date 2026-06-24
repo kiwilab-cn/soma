@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+deploy/
+docs/
+*.md
+soma-data/
+**/*.rs.bk

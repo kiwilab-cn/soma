@@ -1,0 +1,20 @@
+soma is deployed.
+
+S3 endpoint (in-cluster):
+  http://{{ include "soma.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.s3 }}
+
+Admin (health + Prometheus metrics):
+  http://{{ include "soma.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.admin }}/metrics
+
+Port-forward to try it locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "soma.fullname" . }} {{ .Values.ports.s3 }}:{{ .Values.ports.s3 }}
+
+Credentials:
+{{- if .Values.credentials.existingSecret }}
+  from the existing Secret {{ .Values.credentials.existingSecret | quote }} (keys SOMA_ACCESS_KEY / SOMA_SECRET_KEY).
+{{- else }}
+  access key: {{ .Values.credentials.accessKey }}
+  secret key: (from Secret {{ include "soma.fullname" . }})
+{{- end }}
+
+Region is `us-east-1`, path-style addressing.

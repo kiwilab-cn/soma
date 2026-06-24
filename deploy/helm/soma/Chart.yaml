@@ -1,0 +1,11 @@
+apiVersion: v2
+name: soma
+description: A fast, secure, AI-native object storage system in Rust (single-node, M1).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/kiwilab-cn/soma
+sources:
+  - https://github.com/kiwilab-cn/soma
+maintainers:
+  - name: Zerry
