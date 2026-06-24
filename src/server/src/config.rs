@@ -68,6 +68,8 @@ pub struct Config {
     pub storage: StorageConfig,
     /// Read-cache tuning.
     pub cache: CacheConfig,
+    /// Encryption-at-rest tuning.
+    pub encryption: EncryptionConfig,
     /// Static access credentials.
     pub credentials: Vec<Credential>,
 }
@@ -80,6 +82,18 @@ pub struct StorageConfig {
     pub volume_max: String,
     /// Bitrot scrub interval in seconds for the storage role (0 disables).
     pub scrub_interval_secs: u64,
+}
+
+/// Encryption-at-rest tuning. Opt-in: when `enabled`, the gateway/standalone
+/// backend is wrapped in envelope encryption under `master_key`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct EncryptionConfig {
+    /// Whether envelope encryption at rest is enabled.
+    pub enabled: bool,
+    /// Base64-encoded 32-byte master key (KEK). Typically injected from a
+    /// Kubernetes Secret via `SOMA_MASTER_KEY`; keep it out of plaintext config.
+    pub master_key: String,
 }
 
 /// Read-cache tuning.
@@ -116,6 +130,7 @@ impl Default for Config {
             write_quorum: 2,
             storage: StorageConfig::default(),
             cache: CacheConfig::default(),
+            encryption: EncryptionConfig::default(),
             credentials: vec![Credential {
                 access_key: "soma".to_string(),
                 secret_key: "soma-secret".to_string(),
@@ -161,6 +176,11 @@ impl Config {
                 access_key: ak,
                 secret_key: sk,
             }];
+        }
+
+        // Convenience master-key override (e.g. mounted from a Kubernetes Secret).
+        if let Ok(mk) = env_var("SOMA_MASTER_KEY") {
+            cfg.encryption.master_key = mk;
         }
 
         // Validate sizes eagerly so a bad value fails fast at startup.

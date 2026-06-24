@@ -14,7 +14,10 @@ use object_store::{MultipartUpload, ObjectStore, PutMode, PutOptions, PutPayload
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
+use soma_backend::{
+    BackendConfig, CachingBackend, EncryptingBackend, LocalFsBackend, StaticKeyProvider,
+    StorageBackend,
+};
 use soma_meta::{BucketOpts, MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -59,6 +62,41 @@ async fn serve_cached(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) 
         let _ = axum::serve(listener, router(svc)).await;
     });
     (port, handle)
+}
+
+/// Like [`serve`], but the storage backend is wrapped in envelope encryption, so
+/// the full S3 stack runs through `EncryptingBackend` and bytes at rest are sealed.
+async fn serve_encrypted(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) {
+    let meta = Arc::new(RedbMetaStore::open(dir.join("meta.redb")).unwrap());
+    if create_bucket {
+        meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    }
+    let fs = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
+    let keys = StaticKeyProvider::new([42u8; 32]);
+    let meta: Arc<dyn MetadataStore> = meta;
+    let backend: Arc<dyn StorageBackend> = Arc::new(EncryptingBackend::new(fs, &keys));
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    (port, handle)
+}
+
+/// True if any regular file directly under `dir` contains `needle` verbatim.
+fn dir_contains_bytes(dir: &Path, needle: &[u8]) -> bool {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_file() {
+            let bytes = std::fs::read(&p).unwrap();
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Stop a server task and wait for it to fully drop (releasing the redb file).
@@ -653,4 +691,42 @@ async fn full_stack_restart_persists_data() {
         assert_eq!(got.as_ref(), payload);
         stop(handle).await;
     }
+}
+
+/// Full S3 stack over `EncryptingBackend`: reads return plaintext (and ranges),
+/// but the bytes persisted on disk never contain the plaintext marker.
+#[tokio::test]
+async fn encrypted_roundtrip_and_ciphertext_at_rest() {
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve_encrypted(dir.path(), true).await;
+    let store = client(port);
+
+    let key = OPath::from("vault/secret.txt");
+    let marker: &'static [u8] = b"TOP-SECRET-PLAINTEXT-MARKER-0123456789";
+    store
+        .put(&key, PutPayload::from_static(marker))
+        .await
+        .unwrap();
+
+    // Reads come back decrypted through the gateway, including ranges.
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), marker);
+    let part = store.get_range(&key, 4u64..14).await.unwrap();
+    assert_eq!(part.as_ref(), &marker[4..14]);
+
+    stop(handle).await;
+
+    // The plaintext marker must appear in no file at rest (it lives in the volume
+    // only as ciphertext; metadata holds names, not payloads).
+    assert!(
+        !dir_contains_bytes(dir.path(), marker),
+        "plaintext marker found in data dir — payload was not encrypted at rest"
+    );
+
+    // A second boot with the SAME master key still decrypts the object.
+    let (port, handle) = serve_encrypted(dir.path(), false).await;
+    let store = client(port);
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), marker);
+    stop(handle).await;
 }

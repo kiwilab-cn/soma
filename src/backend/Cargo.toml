@@ -16,6 +16,9 @@ parking_lot.workspace = true
 bytes.workspace = true
 foyer.workspace = true
 metrics.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,3 +1,6 @@
+{{- if and .Values.encryption.enabled (not .Values.encryption.masterKey) (not .Values.credentials.existingSecret) }}
+{{- fail "encryption.enabled requires encryption.masterKey (base64-encoded 32 bytes) or credentials.existingSecret providing SOMA_MASTER_KEY" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -23,3 +26,8 @@ data:
     enabled = {{ .Values.config.cache.enabled }}
     max_bytes = "{{ .Values.config.cache.maxBytes }}"
     max_object_bytes = "{{ .Values.config.cache.maxObjectBytes }}"
+
+    [encryption]
+    # The master key is injected at runtime via SOMA_MASTER_KEY (from the Secret),
+    # never rendered here.
+    enabled = {{ .Values.encryption.enabled }}
