@@ -6,6 +6,7 @@ pub type ObjectId = u64;
 
 /// Identifies one volume (append-only container) file within a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VolumeId(pub u32);
 
 impl VolumeId {

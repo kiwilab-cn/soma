@@ -11,6 +11,12 @@ description = "Core on-disk format (volume + needle), in-RAM hot index, and shar
 [dependencies]
 crc32c.workspace = true
 thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+# Derive serde on the public location types so higher layers (e.g. the metadata
+# store) can persist them.
+serde = ["dep:serde"]
 
 [dev-dependencies]
 proptest.workspace = true
