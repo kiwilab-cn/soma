@@ -182,7 +182,8 @@ async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
     let meta = open_meta(&cfg)?;
     let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, open_backend(&cfg)?)?);
     let service = build_service(meta, backend, &cfg);
-    serve_s3_and_admin(&cfg, service, metrics, "standalone").await
+    // Standalone is single-node: no cluster membership, so no drain endpoint.
+    serve_s3_and_admin(&cfg, service, metrics, "standalone", None).await
 }
 
 /// Stateless gateway: S3 front-end over remote metadata + storage nodes.
@@ -234,6 +235,7 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
         ))
     };
     let meta: Arc<dyn MetadataStore> = meta_client;
+    let admin_meta = meta.clone(); // for the drain endpoint
     let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, storage)?);
     let service = build_service(meta, backend, &cfg);
     if cfg.erasure.enabled {
@@ -257,7 +259,7 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
             "gateway connected to cluster"
         );
     }
-    serve_s3_and_admin(&cfg, service, metrics, "gateway").await
+    serve_s3_and_admin(&cfg, service, metrics, "gateway", Some(admin_meta)).await
 }
 
 /// Metadata node: serves `MetadataStore` over gRPC, plus the rebalance controller.
@@ -274,6 +276,7 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
             DEFAULT_PG_COUNT,
             std::time::Duration::from_secs(cfg.rebalance.settle_secs),
             cfg.rebalance.max_copies_per_pass,
+            cfg.rebalance.down_after_secs,
         );
         tracing::info!(
             interval_secs = cfg.rebalance.interval_secs,
@@ -365,12 +368,14 @@ async fn serve_s3_and_admin(
     service: S3Service,
     metrics: PrometheusHandle,
     role: &str,
+    admin_meta: Option<Arc<dyn MetadataStore>>,
 ) -> Result<(), BoxError> {
     let ready = Arc::new(AtomicBool::new(false));
     let admin_listener = tokio::net::TcpListener::bind(&cfg.admin_listen).await?;
     let admin_state = AdminState {
         metrics,
         ready: ready.clone(),
+        meta: admin_meta,
     };
     tokio::spawn(async move {
         let _ = axum::serve(admin_listener, admin::router(admin_state)).await;

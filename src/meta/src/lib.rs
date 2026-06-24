@@ -71,6 +71,11 @@ pub trait MetadataStore: Send + Sync {
     /// if the node is not registered (so it re-registers).
     fn heartbeat(&self, node_id: &str, now: u64) -> Result<()>;
 
+    /// Set a node's lifecycle state (e.g. mark it `Down` after missed heartbeats,
+    /// or `Draining` for a graceful decommission). Errors with
+    /// [`Error::UnknownNode`] if the node is not registered.
+    fn set_node_state(&self, node_id: &str, state: NodeState) -> Result<()>;
+
     /// List all known members (sorted by node id).
     fn list_members(&self) -> Result<Vec<NodeInfo>>;
 

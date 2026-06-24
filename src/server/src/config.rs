@@ -123,6 +123,9 @@ pub struct RebalanceConfig {
     pub settle_secs: u64,
     /// Max object copies the mover performs per reconcile pass (the throttle).
     pub max_copies_per_pass: usize,
+    /// Seconds without a heartbeat before a node is marked `Down` (triggering
+    /// re-replication of its placement groups).
+    pub down_after_secs: u64,
 }
 
 impl Default for RebalanceConfig {
@@ -132,6 +135,7 @@ impl Default for RebalanceConfig {
             interval_secs: 30,
             settle_secs: 30,
             max_copies_per_pass: 64,
+            down_after_secs: 90,
         }
     }
 }

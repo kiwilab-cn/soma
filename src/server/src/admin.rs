@@ -1,15 +1,17 @@
 //! The admin HTTP surface — liveness, readiness, and Prometheus metrics — served
 //! on a **separate** port from the S3 endpoint (no SigV4, no S3 path collision).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use metrics_exporter_prometheus::PrometheusHandle;
+use soma_meta::{MetadataStore, NodeState};
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -18,6 +20,8 @@ pub struct AdminState {
     pub metrics: PrometheusHandle,
     /// Set to `true` once the node is ready to serve.
     pub ready: Arc<AtomicBool>,
+    /// Metadata handle for cluster ops (drain), when this role has one (gateway).
+    pub meta: Option<Arc<dyn MetadataStore>>,
 }
 
 /// Build the admin router.
@@ -26,6 +30,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        // Mark a node Draining (its data migrates off before removal) / undo.
+        .route("/admin/drain", post(drain))
+        .route("/admin/undrain", post(undrain))
         .with_state(state)
 }
 
@@ -40,6 +47,49 @@ async fn readyz(State(state): State<AdminState>) -> Response {
         (StatusCode::OK, "ready\n").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+    }
+}
+
+/// `POST /admin/drain?node=<id>`: gracefully decommission a node — mark it
+/// `Draining` so the rebalance controller migrates its data off before it is
+/// removed.
+async fn drain(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    set_state(&state, q.get("node"), NodeState::Draining, "draining").await
+}
+
+/// `POST /admin/undrain?node=<id>`: cancel a drain (mark the node `Active` again).
+async fn undrain(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    set_state(&state, q.get("node"), NodeState::Active, "active").await
+}
+
+/// Shared body for drain/undrain.
+async fn set_state(
+    state: &AdminState,
+    node: Option<&String>,
+    new_state: NodeState,
+    label: &str,
+) -> Response {
+    let Some(meta) = state.meta.clone() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "cluster ops not available on this role\n",
+        )
+            .into_response();
+    };
+    let Some(node) = node.cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing ?node=<id>\n").into_response();
+    };
+    let res = tokio::task::spawn_blocking(move || meta.set_node_state(&node, new_state)).await;
+    match res {
+        Ok(Ok(())) => (StatusCode::OK, format!("node marked {label}\n")).into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
     }
 }
 
@@ -69,6 +119,7 @@ mod tests {
         AdminState {
             metrics: handle,
             ready: Arc::new(AtomicBool::new(ready)),
+            meta: None,
         }
     }
 
@@ -102,5 +153,24 @@ mod tests {
         let (status, _body) = get(&app, "/metrics").await;
         // An empty registry renders an empty body; the endpoint still answers 200.
         assert_eq!(status, StatusCode::OK);
+    }
+
+    async fn post(app: &Router, path: &str) -> StatusCode {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn drain_without_meta_is_not_implemented() {
+        // The state helper has meta = None (as a non-gateway role would).
+        let app = router(state(true));
+        assert_eq!(
+            post(&app, "/admin/drain?node=node-0").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
     }
 }
