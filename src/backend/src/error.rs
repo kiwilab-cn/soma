@@ -53,6 +53,11 @@ pub enum Error {
     /// corrupt ciphertext frame, or an authentication-tag mismatch.
     #[error("crypto error: {0}")]
     Crypto(&'static str),
+
+    /// Erasure coding failed — too few shards survive to reconstruct the object,
+    /// or the Reed-Solomon encode/decode itself failed.
+    #[error("erasure coding error: {0}")]
+    Erasure(&'static str),
 }
 
 impl Error {

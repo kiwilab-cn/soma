@@ -68,6 +68,9 @@ pub struct Config {
     pub storage: StorageConfig,
     /// Read-cache tuning.
     pub cache: CacheConfig,
+    /// Erasure-coding tuning. When enabled, the gateway stripes objects with
+    /// Reed-Solomon `k+m` instead of N-way replication.
+    pub erasure: ErasureConfig,
     /// Encryption-at-rest tuning.
     pub encryption: EncryptionConfig,
     /// Static access credentials.
@@ -82,6 +85,34 @@ pub struct StorageConfig {
     pub volume_max: String,
     /// Bitrot scrub interval in seconds for the storage role (0 disables).
     pub scrub_interval_secs: u64,
+}
+
+/// Erasure-coding tuning. Opt-in: when `enabled`, the gateway stripes each object
+/// into `data_shards` data + `parity_shards` parity shards across distinct nodes
+/// (it then needs at least `data_shards + parity_shards` storage endpoints).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ErasureConfig {
+    /// Whether erasure coding replaces replication on the gateway.
+    pub enabled: bool,
+    /// Number of data shards (`k`).
+    pub data_shards: usize,
+    /// Number of parity shards (`m`); the object survives up to `m` node losses.
+    pub parity_shards: usize,
+    /// Shard writes that must ack for a write to succeed. `0` defaults to
+    /// `data_shards + 1`; clamped to `[data_shards, data_shards + parity_shards]`.
+    pub write_quorum: usize,
+}
+
+impl Default for ErasureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_shards: 4,
+            parity_shards: 2,
+            write_quorum: 0,
+        }
+    }
 }
 
 /// Encryption-at-rest tuning. Opt-in: when `enabled`, the gateway/standalone
@@ -130,6 +161,7 @@ impl Default for Config {
             write_quorum: 2,
             storage: StorageConfig::default(),
             cache: CacheConfig::default(),
+            erasure: ErasureConfig::default(),
             encryption: EncryptionConfig::default(),
             credentials: vec![Credential {
                 access_key: "soma".to_string(),

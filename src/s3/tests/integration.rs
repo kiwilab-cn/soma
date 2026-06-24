@@ -453,6 +453,93 @@ async fn settle() {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 }
 
+/// Stand up an erasure-coded cluster: 1 metadata node, `k + m` storage nodes, and
+/// a gateway whose backend stripes objects with Reed-Solomon `k+m`. Storage tasks
+/// are returned so a test can "kill" a node by aborting it.
+async fn ec_cluster(k: usize, m: usize) -> Cluster {
+    use soma_cluster::{serve_meta, serve_storage, ErasureCodedBackend, MetaClient};
+
+    let dir = TempDir::new().unwrap();
+
+    let meta_port = free_port();
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    let ms = meta_store.clone();
+    let meta_handle = tokio::spawn(async move {
+        let _ = serve_meta(sock(meta_port), ms).await;
+    });
+
+    let mut storage = Vec::new();
+    let mut endpoints = Vec::new();
+    for i in 0..(k + m) {
+        let port = free_port();
+        let sdir = dir.path().join(format!("storage-{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        storage.push(tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        }));
+        endpoints.push(format!("http://127.0.0.1:{port}"));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    let ec: Arc<dyn StorageBackend> = Arc::new(
+        ErasureCodedBackend::connect(endpoints, k, m, 0)
+            .await
+            .unwrap(),
+    );
+    let svc = S3Service::new(meta, ec, Credentials::single("AK", "SK"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    let s3 = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+
+    Cluster {
+        _dir: dir,
+        s3_port,
+        storage,
+        _meta: meta_handle,
+        _s3: s3,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn erasure_survives_losing_parity_count_nodes() {
+    let c = ec_cluster(4, 2).await; // 4 data + 2 parity, tolerate 2 losses
+    let store = client(c.s3_port);
+    let key = OPath::from("erasure/object.bin");
+    // A multi-stripe payload so reconstruction really exercises the math.
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    store
+        .put(&key, PutPayload::from(payload.clone()))
+        .await
+        .unwrap();
+
+    // Kill two of the six storage nodes (= m); any k=4 survivors reconstruct.
+    c.storage[1].abort();
+    c.storage[4].abort();
+    settle().await;
+
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), payload.as_slice());
+
+    // Degraded range read returns the right window too.
+    let part = store.get_range(&key, 100u64..150).await.unwrap();
+    assert_eq!(part.as_ref(), &payload[100..150]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replication_survives_losing_replicas() {
     let c = cluster(3, 3, 2).await; // RF=3, W=2

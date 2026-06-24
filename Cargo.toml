@@ -70,6 +70,8 @@ rand = "0.8"
 tonic = "0.12"
 prost = "0.13"
 tonic-build = "0.12"
+# Erasure coding (Reed-Solomon k+m)
+reed-solomon-simd = "3"
 # Test/utility
 proptest = "1"
 tempfile = "3"

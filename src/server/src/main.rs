@@ -15,7 +15,7 @@ use soma_backend::{
     BackendConfig, CachingBackend, EncryptingBackend, LocalFsBackend, StaticKeyProvider,
     StorageBackend,
 };
-use soma_cluster::{serve_meta, serve_storage, MetaClient, ReplicatedBackend};
+use soma_cluster::{serve_meta, serve_storage, ErasureCodedBackend, MetaClient, ReplicatedBackend};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -116,23 +116,47 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let meta: Arc<dyn MetadataStore> =
         Arc::new(MetaClient::connect(cfg.meta_endpoint.clone()).await?);
-    let storage: Arc<dyn StorageBackend> = Arc::new(
-        ReplicatedBackend::connect(
-            cfg.storage_endpoints.clone(),
-            cfg.replication_factor,
-            cfg.write_quorum,
+    let storage: Arc<dyn StorageBackend> = if cfg.erasure.enabled {
+        Arc::new(
+            ErasureCodedBackend::connect(
+                cfg.storage_endpoints.clone(),
+                cfg.erasure.data_shards,
+                cfg.erasure.parity_shards,
+                cfg.erasure.write_quorum,
+            )
+            .await?,
         )
-        .await?,
-    );
+    } else {
+        Arc::new(
+            ReplicatedBackend::connect(
+                cfg.storage_endpoints.clone(),
+                cfg.replication_factor,
+                cfg.write_quorum,
+            )
+            .await?,
+        )
+    };
     let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, storage)?);
     let service = S3Service::new(meta, backend, build_credentials(&cfg));
-    tracing::info!(
-        meta = %cfg.meta_endpoint,
-        storage_nodes = cfg.storage_endpoints.len(),
-        replication_factor = cfg.replication_factor,
-        write_quorum = cfg.write_quorum,
-        "gateway connected to cluster"
-    );
+    if cfg.erasure.enabled {
+        tracing::info!(
+            meta = %cfg.meta_endpoint,
+            storage_nodes = cfg.storage_endpoints.len(),
+            durability = "erasure",
+            data_shards = cfg.erasure.data_shards,
+            parity_shards = cfg.erasure.parity_shards,
+            "gateway connected to cluster"
+        );
+    } else {
+        tracing::info!(
+            meta = %cfg.meta_endpoint,
+            storage_nodes = cfg.storage_endpoints.len(),
+            durability = "replicated",
+            replication_factor = cfg.replication_factor,
+            write_quorum = cfg.write_quorum,
+            "gateway connected to cluster"
+        );
+    }
     serve_s3_and_admin(&cfg, service, metrics, "gateway").await
 }
 
