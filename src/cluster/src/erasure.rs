@@ -34,9 +34,6 @@ use crate::StorageClient;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Bytes of big-endian length prefix prepended to the payload before encoding.
-const LEN_PREFIX: usize = 8;
-
 /// An erasure-coded storage backend over a placement-group map.
 pub struct ErasureCodedBackend {
     placement: Placement,
@@ -126,91 +123,15 @@ impl ErasureCodedBackend {
         self.placement.acting_nodes(object_id)
     }
 
-    /// Split `data` into `k + m` shards: a length-prefixed, zero-padded payload
-    /// cut into `k` data shards, plus `m` Reed-Solomon parity shards.
+    /// Split `data` into `k + m` shards (see [`crate::ec::encode`]).
     fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let k = self.data_shards;
-        let mut framed = Vec::with_capacity(LEN_PREFIX + data.len());
-        framed.extend_from_slice(&(data.len() as u64).to_be_bytes());
-        framed.extend_from_slice(data);
-
-        // reed-solomon-simd needs equal, non-zero, even-length shards.
-        let per_shard = framed.len().div_ceil(k).max(1);
-        let shard_len = per_shard + (per_shard & 1);
-        framed.resize(shard_len * k, 0);
-
-        let mut shards: Vec<Vec<u8>> = (0..k)
-            .map(|i| framed[i * shard_len..(i + 1) * shard_len].to_vec())
-            .collect();
-
-        if self.parity_shards > 0 {
-            let parity = reed_solomon_simd::encode(k, self.parity_shards, &shards)
-                .map_err(|_| Error::Erasure("reed-solomon encode failed"))?;
-            shards.extend(parity);
-        }
-        Ok(shards)
+        crate::ec::encode(data, self.data_shards, self.parity_shards)
     }
 
     /// Reconstruct the original bytes from any `k` surviving shards
-    /// `(shard_index, bytes)`.
+    /// `(shard_index, bytes)` (see [`crate::ec::reassemble`]).
     fn reassemble(&self, present: Vec<(usize, Vec<u8>)>) -> Result<Vec<u8>> {
-        let k = self.data_shards;
-        if present.len() < k {
-            return Err(Error::Erasure("insufficient shards to reconstruct object"));
-        }
-
-        let mut data: Vec<Option<Vec<u8>>> = vec![None; k];
-        let mut recovery: Vec<(usize, Vec<u8>)> = Vec::new();
-        for (idx, shard) in present {
-            if idx < k {
-                data[idx] = Some(shard);
-            } else {
-                recovery.push((idx - k, shard));
-            }
-        }
-
-        // Fill any missing data shards from parity.
-        if data.iter().any(|s| s.is_none()) {
-            let originals = data
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| s.as_ref().map(|v| (i, v.as_slice())));
-            let recovered = reed_solomon_simd::decode(
-                k,
-                self.parity_shards,
-                originals,
-                recovery.iter().map(|(i, v)| (*i, v.as_slice())),
-            )
-            .map_err(|_| Error::Erasure("reed-solomon decode failed"))?;
-            for (i, slot) in data.iter_mut().enumerate() {
-                if slot.is_none() {
-                    *slot = Some(
-                        recovered
-                            .get(&i)
-                            .cloned()
-                            .ok_or(Error::Erasure("decode did not restore a data shard"))?,
-                    );
-                }
-            }
-        }
-
-        let mut framed = Vec::with_capacity(data.len());
-        for slot in data {
-            framed.extend_from_slice(&slot.ok_or(Error::Erasure("missing data shard"))?);
-        }
-
-        // Recover the true length from the prefix and truncate the padding.
-        if framed.len() < LEN_PREFIX {
-            return Err(Error::Erasure("stripe shorter than its length prefix"));
-        }
-        let mut len_bytes = [0u8; LEN_PREFIX];
-        len_bytes.copy_from_slice(&framed[..LEN_PREFIX]);
-        let orig_len = u64::from_be_bytes(len_bytes) as usize;
-        let end = LEN_PREFIX
-            .checked_add(orig_len)
-            .filter(|&e| e <= framed.len())
-            .ok_or(Error::Erasure("length prefix exceeds reconstructed data"))?;
-        Ok(framed[LEN_PREFIX..end].to_vec())
+        crate::ec::reassemble(present, self.data_shards, self.parity_shards)
     }
 }
 
