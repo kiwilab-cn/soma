@@ -40,6 +40,7 @@ index — the design lesson shared by Facebook Haystack, SeaweedFS, and CDN cach
 - [`docs/MVP_DESIGN.md`](docs/MVP_DESIGN.md) — the M0 (single-node skeleton) design.
 - [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md) — the M1 (read cache + cloud-native readiness) design.
 - [`docs/M2_DESIGN.md`](docs/M2_DESIGN.md) — the M2 (distributed durability) design.
+- [`docs/M3_DESIGN.md`](docs/M3_DESIGN.md) — the M3 (elastic scale: membership, rebalance, self-heal) design.
 - [`docs/M4_DESIGN.md`](docs/M4_DESIGN.md) — the M4 (erasure coding, encryption, multi-tenant QoS) design.
 
 ## Run
