@@ -18,7 +18,7 @@ pub use error::{Error, Result};
 pub use redb_store::RedbMetaStore;
 pub use types::{
     BucketMeta, BucketOpts, ETag, ListRequest, ListResult, ObjectEntry, ObjectMeta, ObjectPut,
-    PutCondition, Version,
+    PutCondition, Quota, TenantUsage, Version,
 };
 
 use soma_core::ObjectId;
@@ -55,8 +55,11 @@ pub trait MetadataStore: Send + Sync {
     fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>>;
 
     /// Delete an object, subject to `cond`. Idempotent: deleting an absent object
-    /// succeeds unless a condition forbids it.
+    /// succeeds unless a condition forbids it. Refunds the object's owning tenant.
     fn delete_object(&self, bucket: &str, key: &str, cond: PutCondition) -> Result<()>;
+
+    /// The tracked live usage for a tenant (zero if the tenant is unknown).
+    fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage>;
 
     /// List objects in a bucket (prefix + delimiter + pagination).
     fn list_objects(&self, bucket: &str, req: &ListRequest) -> Result<ListResult>;

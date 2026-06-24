@@ -17,7 +17,7 @@ use soma_backend::{
 };
 use soma_cluster::{serve_meta, serve_storage, ErasureCodedBackend, MetaClient, ReplicatedBackend};
 use soma_meta::{MetadataStore, RedbMetaStore};
-use soma_s3::{router, Credentials, S3Service};
+use soma_s3::{router, Credentials, QosPolicy, S3Service};
 
 use admin::AdminState;
 use config::Config;
@@ -72,6 +72,16 @@ fn build_credentials(cfg: &Config) -> Credentials {
     creds
 }
 
+/// Assemble the S3 service with the configured multi-tenant QoS policy.
+fn build_service(
+    meta: Arc<dyn MetadataStore>,
+    backend: Arc<dyn StorageBackend>,
+    cfg: &Config,
+) -> S3Service {
+    S3Service::new(meta, backend, build_credentials(cfg))
+        .with_qos(QosPolicy::new(cfg.tenant_policies()))
+}
+
 /// Wrap a backend in envelope encryption if enabled. Encryption sits **below** the
 /// cache (so the cache holds plaintext) and **above** replication/storage (so
 /// nodes only ever see ciphertext). Fails fast on a missing/invalid master key.
@@ -107,7 +117,7 @@ async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let meta = open_meta(&cfg)?;
     let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, open_backend(&cfg)?)?);
-    let service = S3Service::new(meta, backend, build_credentials(&cfg));
+    let service = build_service(meta, backend, &cfg);
     serve_s3_and_admin(&cfg, service, metrics, "standalone").await
 }
 
@@ -137,7 +147,7 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
         )
     };
     let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, storage)?);
-    let service = S3Service::new(meta, backend, build_credentials(&cfg));
+    let service = build_service(meta, backend, &cfg);
     if cfg.erasure.enabled {
         tracing::info!(
             meta = %cfg.meta_endpoint,

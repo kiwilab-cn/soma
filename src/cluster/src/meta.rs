@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 use soma_core::ObjectId;
 use soma_meta::{
     BucketMeta, BucketOpts, Error, ListRequest, ListResult, MetadataStore, ObjectMeta, ObjectPut,
-    PutCondition, Result, Version,
+    PutCondition, Result, TenantUsage, Version,
 };
 
 use crate::bridge::Bridge;
@@ -74,6 +74,7 @@ fn dispatch(
             store.list_objects(&bucket, &req).map(MetaReply::List)
         }
         MetaRequest::NextObjectId => store.next_object_id().map(MetaReply::ObjectId),
+        MetaRequest::TenantUsage { tenant } => store.tenant_usage(&tenant).map(MetaReply::Usage),
     };
     reply.map_err(|e| WireError {
         kind: e.kind().to_string(),
@@ -228,6 +229,15 @@ impl MetadataStore for MetaClient {
     fn next_object_id(&self) -> Result<ObjectId> {
         match self.call(MetaRequest::NextObjectId)? {
             MetaReply::ObjectId(id) => Ok(id),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage> {
+        match self.call(MetaRequest::TenantUsage {
+            tenant: tenant.to_string(),
+        })? {
+            MetaReply::Usage(u) => Ok(u),
             _ => Err(unexpected()),
         }
     }

@@ -37,6 +37,10 @@ pub enum Error {
     #[error("stored object key is not valid utf-8")]
     NonUtf8Key,
 
+    /// A tenant's quota would be exceeded by this write.
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     /// An error surfaced from a remote metadata node over RPC. Carries a stable
     /// kind tag so the S3 layer can still map it (see `kind()`).
     #[error("remote metadata error: {0}")]
@@ -53,6 +57,7 @@ impl Error {
             Error::BucketNotEmpty(_) => "bucket_not_empty",
             Error::InvalidBucketName(_) => "invalid_bucket_name",
             Error::NonUtf8Key => "non_utf8_key",
+            Error::QuotaExceeded(_) => "quota_exceeded",
             _ => "internal",
         }
     }
@@ -66,6 +71,7 @@ impl Error {
             "bucket_not_empty" => Error::BucketNotEmpty(message),
             "invalid_bucket_name" => Error::InvalidBucketName(message),
             "non_utf8_key" => Error::NonUtf8Key,
+            "quota_exceeded" => Error::QuotaExceeded(message),
             _ => Error::Remote(message),
         }
     }

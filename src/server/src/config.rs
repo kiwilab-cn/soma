@@ -8,6 +8,7 @@
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
+use soma_s3::TenantPolicy;
 
 /// Default S3 listen address.
 const DEFAULT_LISTEN: &str = "0.0.0.0:9000";
@@ -75,6 +76,25 @@ pub struct Config {
     pub encryption: EncryptionConfig,
     /// Static access credentials.
     pub credentials: Vec<Credential>,
+    /// Per-tenant QoS (quotas + rate limits), keyed by access key. Empty = none.
+    pub tenants: Vec<TenantConfig>,
+}
+
+/// Per-tenant QoS limits. A tenant is identified by its access key; any limit set
+/// to zero/empty is unlimited.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TenantConfig {
+    /// The access key this policy applies to.
+    pub access_key: String,
+    /// Max total live bytes (human-readable, e.g. `"10GiB"`; empty = unlimited).
+    pub max_bytes: String,
+    /// Max live object count (0 = unlimited).
+    pub max_objects: u64,
+    /// Sustained request rate per second (0 = no rate limit).
+    pub rate_limit_rps: f64,
+    /// Token-bucket burst capacity in requests (defaults to `rate_limit_rps`).
+    pub rate_limit_burst: f64,
 }
 
 /// Storage tuning.
@@ -167,6 +187,7 @@ impl Default for Config {
                 access_key: "soma".to_string(),
                 secret_key: "soma-secret".to_string(),
             }],
+            tenants: Vec::new(),
         }
     }
 }
@@ -224,7 +245,40 @@ impl Config {
         parse_size("storage.volume_max", &self.storage.volume_max)?;
         parse_size("cache.max_bytes", &self.cache.max_bytes)?;
         parse_size("cache.max_object_bytes", &self.cache.max_object_bytes)?;
+        for t in &self.tenants {
+            if !t.max_bytes.is_empty() {
+                parse_size("tenants.max_bytes", &t.max_bytes)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Resolve the per-tenant QoS limits into a `(access_key → TenantPolicy)` map.
+    pub fn tenant_policies(&self) -> std::collections::HashMap<String, TenantPolicy> {
+        self.tenants
+            .iter()
+            .map(|t| {
+                let max_bytes = if t.max_bytes.is_empty() {
+                    0
+                } else {
+                    parse_size("tenants.max_bytes", &t.max_bytes).unwrap_or(0)
+                };
+                let burst = if t.rate_limit_burst > 0.0 {
+                    t.rate_limit_burst
+                } else {
+                    t.rate_limit_rps
+                };
+                (
+                    t.access_key.clone(),
+                    TenantPolicy {
+                        max_bytes,
+                        max_objects: t.max_objects,
+                        rps: t.rate_limit_rps,
+                        burst,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Resolved volume rotation size in bytes.

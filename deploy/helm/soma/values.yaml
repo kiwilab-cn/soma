@@ -63,6 +63,15 @@ encryption:
   enabled: false
   masterKey: ""
 
+# Per-tenant QoS (quotas + rate limits), applied at the gateway and keyed by
+# access key. Empty = no limits. Each entry:
+#   - accessKey: the credential the policy applies to
+#     maxBytes: max live bytes, human-readable ("10GiB"); "" = unlimited
+#     maxObjects: max live object count; 0 = unlimited
+#     rateLimitRps: sustained requests/sec; 0 = no rate limit
+#     rateLimitBurst: token-bucket burst (defaults to rateLimitRps)
+tenants: []
+
 gateway:
   replicaCount: 2
   service:
