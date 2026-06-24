@@ -84,10 +84,12 @@ impl StorageBackend for CachingBackend {
         let full = match self.cache.get(&loc) {
             Some(entry) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("soma_cache_hits_total").increment(1);
                 entry.value().clone()
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("soma_cache_misses_total").increment(1);
                 let bytes = Bytes::from(self.inner.get(loc, None)?);
                 self.cache.insert(loc, bytes.clone());
                 bytes

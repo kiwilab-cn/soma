@@ -27,10 +27,13 @@ serde.workspace = true
 figment.workspace = true
 bytesize.workspace = true
 thiserror.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 # `figment::Jail` (isolated env + cwd for config tests) lives behind this feature.
 figment = { workspace = true, features = ["test"] }
+tower.workspace = true
+http-body-util.workspace = true
 
 [lints]
 workspace = true

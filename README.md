@@ -53,6 +53,10 @@ environment**. Env overrides use the `SOMA_` prefix with `__` for nesting, e.g.
 `SOMA_LISTEN`, `SOMA_DATA_DIR`, `SOMA_ACCESS_KEY`, `SOMA_SECRET_KEY`,
 `SOMA_CACHE__MAX_BYTES`. See [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md#4-structured-configuration).
 
+A separate **admin port** (`SOMA_ADMIN_LISTEN`, default `:9001`) serves
+`GET /healthz` (liveness), `GET /readyz` (readiness), and `GET /metrics`
+(Prometheus) — no auth, off the S3 endpoint.
+
 Point any S3 client at it (path-style, region `us-east-1`). With the Rust
 `object_store` crate:
 
