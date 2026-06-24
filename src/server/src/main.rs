@@ -1,16 +1,18 @@
-//! Soma server entry point: loads configuration, installs the metrics recorder,
-//! starts the admin server, then assembles the S3 protocol layer, the metadata
-//! store, and the storage backend into a running single-node S3 endpoint.
+//! Soma server entry point. One binary, four roles (`--role` / config `role`):
+//! `standalone` (single process, the M0/M1 behavior), `gateway` (stateless S3
+//! front-end), `meta` (metadata gRPC node), and `storage` (storage gRPC node).
 
 mod admin;
 mod config;
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
+use soma_cluster::{serve_meta, serve_storage, MetaClient, StorageClient};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -28,41 +30,114 @@ async fn main() -> Result<(), BoxError> {
         )
         .init();
 
-    // Install the global Prometheus recorder; its handle renders `/metrics`.
-    let metrics_handle = PrometheusBuilder::new().install_recorder()?;
-
     let cfg = Config::load(config_path().as_deref())?;
-
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let meta_path = format!("{}/meta.redb", cfg.data_dir);
-    let meta: Arc<dyn MetadataStore> = Arc::new(RedbMetaStore::open(&meta_path)?);
-    let fs_backend = Arc::new(LocalFsBackend::open(
+
+    match cfg.role.as_str() {
+        "standalone" => run_standalone(cfg).await,
+        "gateway" => run_gateway(cfg).await,
+        "meta" => run_meta(cfg).await,
+        "storage" => run_storage(cfg).await,
+        other => {
+            Err(format!("unknown role '{other}' (expected standalone|gateway|meta|storage)").into())
+        }
+    }
+}
+
+/// Open the local metadata store.
+fn open_meta(cfg: &Config) -> Result<Arc<dyn MetadataStore>, BoxError> {
+    let path = format!("{}/meta.redb", cfg.data_dir);
+    Ok(Arc::new(RedbMetaStore::open(&path)?))
+}
+
+/// Open the local storage backend (no cache — caching lives on the gateway).
+fn open_backend(cfg: &Config) -> Result<Arc<dyn StorageBackend>, BoxError> {
+    Ok(Arc::new(LocalFsBackend::open(
         &cfg.data_dir,
         BackendConfig {
             volume_max: cfg.volume_max_bytes(),
         },
-    )?);
-    let backend: Arc<dyn StorageBackend> = if cfg.cache.enabled {
-        Arc::new(CachingBackend::new(
-            fs_backend,
-            cfg.cache_max_bytes() as usize,
-            cfg.cache_max_object_bytes(),
-        ))
-    } else {
-        fs_backend
-    };
+    )?))
+}
 
+fn build_credentials(cfg: &Config) -> Credentials {
     let mut creds = Credentials::new();
     for c in &cfg.credentials {
         creds.add(&c.access_key, &c.secret_key);
     }
-    let service = S3Service::new(meta, backend, creds);
+    creds
+}
 
-    // Admin (health + metrics) server on its own port.
+/// Wrap a backend in the read cache if enabled.
+fn maybe_cache(cfg: &Config, backend: Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend> {
+    if cfg.cache.enabled {
+        Arc::new(CachingBackend::new(
+            backend,
+            cfg.cache_max_bytes() as usize,
+            cfg.cache_max_object_bytes(),
+        ))
+    } else {
+        backend
+    }
+}
+
+// --- roles -----------------------------------------------------------------
+
+/// Single process: metadata + storage + S3 + admin in one.
+async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
+    let metrics = PrometheusBuilder::new().install_recorder()?;
+    let meta = open_meta(&cfg)?;
+    let backend = maybe_cache(&cfg, open_backend(&cfg)?);
+    let service = S3Service::new(meta, backend, build_credentials(&cfg));
+    serve_s3_and_admin(&cfg, service, metrics, "standalone").await
+}
+
+/// Stateless gateway: S3 front-end over remote metadata + storage nodes.
+async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
+    let metrics = PrometheusBuilder::new().install_recorder()?;
+    let meta: Arc<dyn MetadataStore> =
+        Arc::new(MetaClient::connect(cfg.meta_endpoint.clone()).await?);
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(StorageClient::connect(cfg.storage_endpoint.clone()).await?);
+    let backend = maybe_cache(&cfg, storage);
+    let service = S3Service::new(meta, backend, build_credentials(&cfg));
+    tracing::info!(
+        meta = %cfg.meta_endpoint,
+        storage = %cfg.storage_endpoint,
+        "gateway connected to cluster"
+    );
+    serve_s3_and_admin(&cfg, service, metrics, "gateway").await
+}
+
+/// Metadata node: serves `MetadataStore` over gRPC.
+async fn run_meta(cfg: Config) -> Result<(), BoxError> {
+    let store = open_meta(&cfg)?;
+    let addr: SocketAddr = cfg.listen.parse()?;
+    tracing::info!(listen = %addr, data_dir = %cfg.data_dir, "soma meta node listening");
+    serve_meta(addr, store).await?;
+    Ok(())
+}
+
+/// Storage node: serves `StorageBackend` over gRPC.
+async fn run_storage(cfg: Config) -> Result<(), BoxError> {
+    let backend = open_backend(&cfg)?;
+    let addr: SocketAddr = cfg.listen.parse()?;
+    tracing::info!(listen = %addr, data_dir = %cfg.data_dir, "soma storage node listening");
+    serve_storage(addr, backend).await?;
+    Ok(())
+}
+
+/// Serve the S3 router and the admin (health/metrics) server.
+async fn serve_s3_and_admin(
+    cfg: &Config,
+    service: S3Service,
+    metrics: PrometheusHandle,
+    role: &str,
+) -> Result<(), BoxError> {
     let ready = Arc::new(AtomicBool::new(false));
     let admin_listener = tokio::net::TcpListener::bind(&cfg.admin_listen).await?;
     let admin_state = AdminState {
-        metrics: metrics_handle,
+        metrics,
         ready: ready.clone(),
     };
     tokio::spawn(async move {
@@ -72,13 +147,11 @@ async fn main() -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     ready.store(true, Ordering::Relaxed);
     tracing::info!(
+        role,
         listen = %cfg.listen,
         admin_listen = %cfg.admin_listen,
-        data_dir = %cfg.data_dir,
         credentials = cfg.credentials.len(),
         cache_enabled = cfg.cache.enabled,
-        cache_max_bytes = cfg.cache_max_bytes(),
-        cache_max_object_bytes = cfg.cache_max_object_bytes(),
         "soma-server listening"
     );
 

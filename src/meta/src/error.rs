@@ -36,6 +36,39 @@ pub enum Error {
     /// A stored object key was not valid UTF-8 (should never happen).
     #[error("stored object key is not valid utf-8")]
     NonUtf8Key,
+
+    /// An error surfaced from a remote metadata node over RPC. Carries a stable
+    /// kind tag so the S3 layer can still map it (see `kind()`).
+    #[error("remote metadata error: {0}")]
+    Remote(String),
+}
+
+impl Error {
+    /// A short, stable kind tag used to reconstruct the error across RPC.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::PreconditionFailed => "precondition_failed",
+            Error::NoSuchBucket(_) => "no_such_bucket",
+            Error::BucketAlreadyExists(_) => "bucket_already_exists",
+            Error::BucketNotEmpty(_) => "bucket_not_empty",
+            Error::InvalidBucketName(_) => "invalid_bucket_name",
+            Error::NonUtf8Key => "non_utf8_key",
+            _ => "internal",
+        }
+    }
+
+    /// Reconstruct an error from a `(kind, message)` pair received over RPC.
+    pub fn from_remote(kind: &str, message: String) -> Self {
+        match kind {
+            "precondition_failed" => Error::PreconditionFailed,
+            "no_such_bucket" => Error::NoSuchBucket(message),
+            "bucket_already_exists" => Error::BucketAlreadyExists(message),
+            "bucket_not_empty" => Error::BucketNotEmpty(message),
+            "invalid_bucket_name" => Error::InvalidBucketName(message),
+            "non_utf8_key" => Error::NonUtf8Key,
+            _ => Error::Remote(message),
+        }
+    }
 }
 
 // redb surfaces several distinct error types from its various operations; funnel

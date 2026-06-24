@@ -14,7 +14,7 @@ pub struct ETag(pub String);
 pub struct Version(pub u64);
 
 /// Options chosen when a bucket is created.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct BucketOpts {
     /// Whether object versioning is enabled. Stored for forward compatibility;
     /// version *history retention* is a later milestone (M0 keeps the current
@@ -32,7 +32,7 @@ pub struct BucketMeta {
 }
 
 /// Everything needed to commit an object's current version.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectPut {
     /// The internal object id (allocated via [`crate::MetadataStore::next_object_id`]).
     pub object_id: ObjectId,
@@ -65,7 +65,7 @@ pub struct ObjectMeta {
 }
 
 /// Condition under which a put/delete is allowed (S3 conditional writes).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum PutCondition {
     /// Unconditional.
     #[default]
@@ -77,7 +77,7 @@ pub enum PutCondition {
 }
 
 /// A `ListObjectsV2`-style request.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListRequest {
     /// Only keys beginning with this prefix.
     pub prefix: String,
@@ -92,7 +92,7 @@ pub struct ListRequest {
 }
 
 /// One object in a listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectEntry {
     /// Full object key.
     pub key: String,
@@ -107,7 +107,7 @@ pub struct ObjectEntry {
 }
 
 /// A `ListObjectsV2`-style response.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListResult {
     /// Matching objects (sorted by key).
     pub objects: Vec<ObjectEntry>,
