@@ -106,6 +106,20 @@ impl S3Error {
         )
     }
 
+    /// `NoSuchUpload` (404) — unknown multipart upload id.
+    pub fn no_such_upload(id: &str) -> Self {
+        Self::new(
+            "NoSuchUpload",
+            StatusCode::NOT_FOUND,
+            format!("The specified multipart upload does not exist: {id}"),
+        )
+    }
+
+    /// `InvalidPart` (400) — a completed part is missing or mismatched.
+    pub fn invalid_part(msg: impl Into<String>) -> Self {
+        Self::new("InvalidPart", StatusCode::BAD_REQUEST, msg)
+    }
+
     /// `NotImplemented` (501).
     pub fn not_implemented(msg: impl Into<String>) -> Self {
         Self::new("NotImplemented", StatusCode::NOT_IMPLEMENTED, msg)
