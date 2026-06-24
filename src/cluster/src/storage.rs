@@ -90,11 +90,12 @@ pub struct StorageClient {
 }
 
 impl StorageClient {
-    /// Connect to a storage node, e.g. `http://storage:9200`.
+    /// Connect (lazily) to a storage node, e.g. `http://storage:9200`. The TCP
+    /// connection is established on first use and reconnects automatically.
     pub async fn connect(
         endpoint: String,
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let channel = Channel::from_shared(endpoint)?.connect().await?;
+        let channel = Channel::from_shared(endpoint)?.connect_lazy();
         Ok(Self {
             channel,
             bridge: Bridge::new(),

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
-use soma_cluster::{serve_meta, serve_storage, MetaClient, StorageClient};
+use soma_cluster::{serve_meta, serve_storage, MetaClient, ReplicatedBackend};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -97,13 +97,21 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let meta: Arc<dyn MetadataStore> =
         Arc::new(MetaClient::connect(cfg.meta_endpoint.clone()).await?);
-    let storage: Arc<dyn StorageBackend> =
-        Arc::new(StorageClient::connect(cfg.storage_endpoint.clone()).await?);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        ReplicatedBackend::connect(
+            cfg.storage_endpoints.clone(),
+            cfg.replication_factor,
+            cfg.write_quorum,
+        )
+        .await?,
+    );
     let backend = maybe_cache(&cfg, storage);
     let service = S3Service::new(meta, backend, build_credentials(&cfg));
     tracing::info!(
         meta = %cfg.meta_endpoint,
-        storage = %cfg.storage_endpoint,
+        storage_nodes = cfg.storage_endpoints.len(),
+        replication_factor = cfg.replication_factor,
+        write_quorum = cfg.write_quorum,
         "gateway connected to cluster"
     );
     serve_s3_and_admin(&cfg, service, metrics, "gateway").await

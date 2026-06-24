@@ -58,8 +58,12 @@ pub struct Config {
     pub data_dir: String,
     /// Gateway → metadata node endpoint (e.g. `http://meta:9100`).
     pub meta_endpoint: String,
-    /// Gateway → storage node endpoint (e.g. `http://storage:9200`).
-    pub storage_endpoint: String,
+    /// Gateway → storage node endpoints (e.g. `["http://storage-0:9200", ...]`).
+    pub storage_endpoints: Vec<String>,
+    /// Number of replicas per object.
+    pub replication_factor: usize,
+    /// Replicas that must durably ack a write to succeed.
+    pub write_quorum: usize,
     /// Storage tuning.
     pub storage: StorageConfig,
     /// Read-cache tuning.
@@ -105,7 +109,9 @@ impl Default for Config {
             admin_listen: DEFAULT_ADMIN_LISTEN.to_string(),
             data_dir: DEFAULT_DATA_DIR.to_string(),
             meta_endpoint: "http://127.0.0.1:9100".to_string(),
-            storage_endpoint: "http://127.0.0.1:9200".to_string(),
+            storage_endpoints: vec!["http://127.0.0.1:9200".to_string()],
+            replication_factor: 3,
+            write_quorum: 2,
             storage: StorageConfig::default(),
             cache: CacheConfig::default(),
             credentials: vec![Credential {

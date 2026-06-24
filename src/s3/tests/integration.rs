@@ -338,6 +338,144 @@ async fn split_topology_object_store_roundtrip() {
     s3_handle.abort();
 }
 
+// --- replication fault-injection (M2b) -------------------------------------
+
+struct Cluster {
+    _dir: TempDir,
+    s3_port: u16,
+    storage: Vec<JoinHandle<()>>,
+    _meta: JoinHandle<()>,
+    _s3: JoinHandle<()>,
+}
+
+fn sock(port: u16) -> std::net::SocketAddr {
+    format!("127.0.0.1:{port}").parse().unwrap()
+}
+
+/// Stand up a cluster: 1 metadata node, `num_storage` storage nodes, and a
+/// gateway with a quorum-replicated backend (`rf`/`wq`). Storage tasks are
+/// returned so tests can "kill" a node by aborting it.
+async fn cluster(num_storage: usize, rf: usize, wq: usize) -> Cluster {
+    use soma_cluster::{serve_meta, serve_storage, MetaClient, ReplicatedBackend};
+
+    let dir = TempDir::new().unwrap();
+
+    let meta_port = free_port();
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    let ms = meta_store.clone();
+    let meta_handle = tokio::spawn(async move {
+        let _ = serve_meta(sock(meta_port), ms).await;
+    });
+
+    let mut storage = Vec::new();
+    let mut endpoints = Vec::new();
+    for i in 0..num_storage {
+        let port = free_port();
+        let sdir = dir.path().join(format!("storage-{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        storage.push(tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        }));
+        endpoints.push(format!("http://127.0.0.1:{port}"));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    let repl: Arc<dyn StorageBackend> =
+        Arc::new(ReplicatedBackend::connect(endpoints, rf, wq).await.unwrap());
+    let svc = S3Service::new(meta, repl, Credentials::single("AK", "SK"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    let s3 = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+
+    Cluster {
+        _dir: dir,
+        s3_port,
+        storage,
+        _meta: meta_handle,
+        _s3: s3,
+    }
+}
+
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replication_survives_losing_replicas() {
+    let c = cluster(3, 3, 2).await; // RF=3, W=2
+    let store = client(c.s3_port);
+    let key = OPath::from("replicated.bin");
+    let payload = b"this object is replicated to all three nodes";
+    store
+        .put(&key, PutPayload::from_static(payload))
+        .await
+        .unwrap();
+
+    // Kill two of the three storage nodes; the survivor still has a replica.
+    c.storage[0].abort();
+    c.storage[1].abort();
+    settle().await;
+
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_quorum_tolerates_one_failure() {
+    let c = cluster(3, 3, 2).await; // W=2 of 3
+    c.storage[0].abort(); // one node down before the write
+    settle().await;
+
+    let store = client(c.s3_port);
+    let key = OPath::from("quorum-ok.bin");
+    let payload = b"two of three acks is enough";
+    store
+        .put(&key, PutPayload::from_static(payload))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_quorum_fails_when_too_few_replicas() {
+    let c = cluster(3, 3, 3).await; // W=3: every replica must ack
+    c.storage[0].abort();
+    settle().await;
+
+    let store = client(c.s3_port);
+    let key = OPath::from("quorum-fail.bin");
+    // Only two replicas can ack (< 3) → the write fails.
+    assert!(store
+        .put(&key, PutPayload::from_static(b"x"))
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn full_stack_restart_persists_data() {
     let dir = TempDir::new().unwrap();

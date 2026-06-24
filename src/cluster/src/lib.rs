@@ -21,8 +21,11 @@ pub mod pb {
 
 mod bridge;
 mod meta;
+mod replicated;
+mod ring;
 mod storage;
 mod wire;
 
 pub use meta::{serve_meta, MetaClient};
+pub use replicated::ReplicatedBackend;
 pub use storage::{serve_storage, StorageClient};
