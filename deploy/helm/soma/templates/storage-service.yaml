@@ -1,0 +1,18 @@
+# Headless Service: stable per-pod DNS for the storage StatefulSet (the gateway
+# addresses each replica as storage-<ordinal>.<headless>).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "soma.storageHeadless" . }}
+  labels:
+    {{- include "soma.labels" (dict "root" . "component" "storage") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "soma.selectorLabels" (dict "root" . "component" "storage") | nindent 4 }}
+  ports:
+    - name: storage
+      port: {{ .Values.ports.storage }}
+      targetPort: storage
+      protocol: TCP

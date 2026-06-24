@@ -26,6 +26,6 @@ COPY --from=builder /build/target/release/soma-server /usr/local/bin/soma-server
 
 USER soma
 VOLUME ["/var/lib/soma"]
-# S3 endpoint + admin (health/metrics)
-EXPOSE 9000 9001
+# gateway: S3 (9000) + admin (9001); meta gRPC (9100); storage gRPC (9200)
+EXPOSE 9000 9001 9100 9200
 ENTRYPOINT ["/usr/local/bin/soma-server"]

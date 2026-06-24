@@ -1,23 +1,20 @@
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
-  name: {{ include "soma.fullname" . }}
+  name: {{ include "soma.gatewayName" . }}
   labels:
-    {{- include "soma.labels" . | nindent 4 }}
+    {{- include "soma.labels" (dict "root" . "component" "gateway") | nindent 4 }}
 spec:
-  # M1 is single-node. Multi-replica + anti-affinity arrive with M2.
-  replicas: {{ .Values.replicaCount }}
-  serviceName: {{ include "soma.headlessName" . }}
+  replicas: {{ .Values.gateway.replicaCount }}
   selector:
     matchLabels:
-      {{- include "soma.selectorLabels" . | nindent 6 }}
+      {{- include "soma.selectorLabels" (dict "root" . "component" "gateway") | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "soma.selectorLabels" . | nindent 8 }}
+        {{- include "soma.selectorLabels" (dict "root" . "component" "gateway") | nindent 8 }}
       annotations:
-        # Roll pods when the rendered config changes.
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/gateway-configmap.yaml") . | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -32,19 +29,15 @@ spec:
         - name: soma
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - "--config"
-            - "/etc/soma/soma.toml"
+          args: ["--config", "/etc/soma/soma.toml"]
           envFrom:
             - secretRef:
                 name: {{ include "soma.secretName" . }}
           ports:
             - name: s3
               containerPort: {{ .Values.ports.s3 }}
-              protocol: TCP
             - name: admin
               containerPort: {{ .Values.ports.admin }}
-              protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
@@ -58,21 +51,19 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /etc/soma
               readOnly: true
-            - name: data
-              mountPath: {{ .Values.config.dataDir }}
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config
           configMap:
-            name: {{ include "soma.fullname" . }}
+            name: {{ include "soma.gatewayName" . }}
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}
@@ -87,15 +78,3 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes:
-          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
-        {{- if .Values.persistence.storageClass }}
-        storageClassName: {{ .Values.persistence.storageClass | quote }}
-        {{- end }}
-        resources:
-          requests:
-            storage: {{ .Values.persistence.size | quote }}

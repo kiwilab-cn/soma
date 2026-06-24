@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "soma.metaName" . }}
+  labels:
+    {{- include "soma.labels" (dict "root" . "component" "meta") | nindent 4 }}
+spec:
+  # Single metadata node in M2 (durable, not HA). HA arrives with a distributed
+  # metadata engine behind the same trait.
+  replicas: 1
+  serviceName: {{ include "soma.metaHeadless" . }}
+  selector:
+    matchLabels:
+      {{- include "soma.selectorLabels" (dict "root" . "component" "meta") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "soma.selectorLabels" (dict "root" . "component" "meta") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/meta-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: soma
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/soma/soma.toml"]
+          ports:
+            - name: meta
+              containerPort: {{ .Values.ports.meta }}
+          livenessProbe:
+            tcpSocket:
+              port: meta
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: meta
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.meta.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/soma
+              readOnly: true
+            - name: data
+              mountPath: {{ .Values.config.dataDir }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "soma.metaName" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.meta.persistence.accessModes | nindent 10 }}
+        {{- if .Values.meta.persistence.storageClass }}
+        storageClassName: {{ .Values.meta.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.meta.persistence.size | quote }}

@@ -31,7 +31,6 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     let cfg = Config::load(config_path().as_deref())?;
-    std::fs::create_dir_all(&cfg.data_dir)?;
 
     match cfg.role.as_str() {
         "standalone" => run_standalone(cfg).await,
@@ -46,12 +45,14 @@ async fn main() -> Result<(), BoxError> {
 
 /// Open the local metadata store.
 fn open_meta(cfg: &Config) -> Result<Arc<dyn MetadataStore>, BoxError> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
     let path = format!("{}/meta.redb", cfg.data_dir);
     Ok(Arc::new(RedbMetaStore::open(&path)?))
 }
 
 /// Open the local storage backend (no cache — caching lives on the gateway).
 fn open_backend(cfg: &Config) -> Result<Arc<dyn StorageBackend>, BoxError> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
     Ok(Arc::new(LocalFsBackend::open(
         &cfg.data_dir,
         BackendConfig {
@@ -128,6 +129,7 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
 
 /// Storage node: serves `StorageBackend` over gRPC, with a background scrubber.
 async fn run_storage(cfg: Config) -> Result<(), BoxError> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
     let backend = Arc::new(LocalFsBackend::open(
         &cfg.data_dir,
         BackendConfig {

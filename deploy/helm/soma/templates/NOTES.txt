@@ -1,20 +1,23 @@
-soma is deployed.
+soma is deployed (three roles):
+
+  gateway  : Deployment ({{ .Values.gateway.replicaCount }} replicas, stateless S3 front-end)
+  meta     : StatefulSet (1 replica)
+  storage  : StatefulSet ({{ .Values.storage.replicaCount }} replicas, replication factor {{ .Values.replication.factor }}, write quorum {{ .Values.replication.writeQuorum }})
 
 S3 endpoint (in-cluster):
-  http://{{ include "soma.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.s3 }}
+  http://{{ include "soma.gatewayName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.s3 }}
 
-Admin (health + Prometheus metrics):
-  http://{{ include "soma.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.admin }}/metrics
+Admin (health + Prometheus metrics), per gateway pod:
+  GET /healthz · /readyz · /metrics on port {{ .Values.ports.admin }}
 
 Port-forward to try it locally:
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "soma.fullname" . }} {{ .Values.ports.s3 }}:{{ .Values.ports.s3 }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "soma.gatewayName" . }} {{ .Values.ports.s3 }}:{{ .Values.ports.s3 }}
 
 Credentials:
 {{- if .Values.credentials.existingSecret }}
   from the existing Secret {{ .Values.credentials.existingSecret | quote }} (keys SOMA_ACCESS_KEY / SOMA_SECRET_KEY).
 {{- else }}
-  access key: {{ .Values.credentials.accessKey }}
-  secret key: (from Secret {{ include "soma.fullname" . }})
+  access key: {{ .Values.credentials.accessKey }}  (secret in Secret {{ include "soma.fullname" . }})
 {{- end }}
 
 Region is `us-east-1`, path-style addressing.

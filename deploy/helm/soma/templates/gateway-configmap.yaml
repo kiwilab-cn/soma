@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "soma.gatewayName" . }}
+  labels:
+    {{- include "soma.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+data:
+  soma.toml: |
+    role = "gateway"
+    listen = "0.0.0.0:{{ .Values.ports.s3 }}"
+    admin_listen = "0.0.0.0:{{ .Values.ports.admin }}"
+    data_dir = "/tmp/soma"
+    meta_endpoint = "{{ include "soma.metaEndpoint" . }}"
+    replication_factor = {{ .Values.replication.factor }}
+    write_quorum = {{ .Values.replication.writeQuorum }}
+    storage_endpoints = [
+    {{- range $i := until (int .Values.storage.replicaCount) }}
+      "http://{{ include "soma.storageName" $ }}-{{ $i }}.{{ include "soma.storageHeadless" $ }}.{{ $.Release.Namespace }}.svc:{{ $.Values.ports.storage }}",
+    {{- end }}
+    ]
+
+    [cache]
+    enabled = {{ .Values.config.cache.enabled }}
+    max_bytes = "{{ .Values.config.cache.maxBytes }}"
+    max_object_bytes = "{{ .Values.config.cache.maxObjectBytes }}"
