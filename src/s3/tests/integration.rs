@@ -99,6 +99,23 @@ fn dir_contains_bytes(dir: &Path, needle: &[u8]) -> bool {
     false
 }
 
+/// Serve the full S3 stack with a multi-tenant QoS policy attached.
+async fn serve_with_qos(dir: &Path, qos: soma_s3::QosPolicy) -> (u16, JoinHandle<()>) {
+    let meta = Arc::new(RedbMetaStore::open(dir.join("meta.redb")).unwrap());
+    meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let fs = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
+    let meta: Arc<dyn MetadataStore> = meta;
+    let backend: Arc<dyn StorageBackend> = fs;
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK")).with_qos(qos);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    (port, handle)
+}
+
 /// Stop a server task and wait for it to fully drop (releasing the redb file).
 async fn stop(handle: JoinHandle<()>) {
     handle.abort();
@@ -815,5 +832,38 @@ async fn encrypted_roundtrip_and_ciphertext_at_rest() {
     let store = client(port);
     let got = store.get(&key).await.unwrap().bytes().await.unwrap();
     assert_eq!(got.as_ref(), marker);
+    stop(handle).await;
+}
+
+/// A tenant's byte quota rejects the write that would exceed it (full S3 stack),
+/// and a delete frees the space for a subsequent write.
+#[tokio::test]
+async fn tenant_byte_quota_rejects_oversized_writes() {
+    use soma_s3::{QosPolicy, TenantPolicy};
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let mut tenants = HashMap::new();
+    tenants.insert(
+        "AK".to_string(),
+        TenantPolicy {
+            max_bytes: 20,
+            max_objects: 0,
+            rps: 0.0,
+            burst: 0.0,
+        },
+    );
+    let (port, handle) = serve_with_qos(dir.path(), QosPolicy::new(tenants)).await;
+    let store = client(port);
+
+    let fifteen = PutPayload::from_static(b"123456789012345"); // 15 bytes
+    store.put(&OPath::from("a"), fifteen.clone()).await.unwrap();
+    // A second 15-byte object would total 30 > 20 → rejected.
+    assert!(store.put(&OPath::from("b"), fifteen.clone()).await.is_err());
+
+    // Deleting the first frees its bytes, so the second now fits.
+    store.delete(&OPath::from("a")).await.unwrap();
+    store.put(&OPath::from("b"), fifteen).await.unwrap();
+
     stop(handle).await;
 }

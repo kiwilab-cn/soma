@@ -48,6 +48,30 @@ pub struct ObjectPut {
     /// Creation time (unix seconds), supplied by the caller (the store does no
     /// clock access). Surfaced as S3 `LastModified`.
     pub created_at: u64,
+    /// Owning tenant (the access key). Empty disables quota accounting for this
+    /// put. When set, the store charges the tenant's usage and enforces `quota`
+    /// atomically inside the commit, refunding any overwritten version's owner.
+    pub tenant: String,
+    /// The owning tenant's quota, enforced when `tenant` is non-empty.
+    pub quota: Quota,
+}
+
+/// A per-tenant resource quota. Zero in a dimension means unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quota {
+    /// Maximum total live bytes for the tenant (0 = unlimited).
+    pub max_bytes: u64,
+    /// Maximum live object count for the tenant (0 = unlimited).
+    pub max_objects: u64,
+}
+
+/// A tenant's tracked live usage (current object versions only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantUsage {
+    /// Total live bytes.
+    pub bytes: u64,
+    /// Total live object count.
+    pub objects: u64,
 }
 
 /// Stored metadata about an object's current version (logical — no byte location).
@@ -64,6 +88,9 @@ pub struct ObjectMeta {
     pub version: Version,
     /// Creation time (unix seconds).
     pub created_at: u64,
+    /// Owning tenant (the access key), used to refund quota on overwrite/delete.
+    /// Empty when the object was written without QoS.
+    pub tenant: String,
 }
 
 /// Condition under which a put/delete is allowed (S3 conditional writes).

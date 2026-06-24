@@ -19,6 +19,7 @@ use soma_meta::{
 };
 
 use crate::error::{S3Error, S3Result};
+use crate::qos::QosPolicy;
 use crate::sigv4::{self, AuthError};
 
 /// Maps access key ids to secret keys.
@@ -70,6 +71,8 @@ pub struct S3Service {
     meta: Arc<dyn MetadataStore>,
     backend: Arc<dyn StorageBackend>,
     creds: Arc<Credentials>,
+    /// Multi-tenant quotas + rate limiting (empty = no limits).
+    qos: Arc<QosPolicy>,
     /// Active multipart uploads, keyed by upload id.
     uploads: Arc<Mutex<HashMap<String, MultipartUpload>>>,
     /// Monotonic source of upload ids (unique within this process).
@@ -119,19 +122,27 @@ impl S3Service {
             meta,
             backend,
             creds: Arc::new(creds),
+            qos: Arc::new(QosPolicy::default()),
             uploads: Arc::new(Mutex::new(HashMap::new())),
             upload_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Verify the request's SigV4 signature. Pure CPU; no IO.
+    /// Attach a multi-tenant QoS policy (quotas + rate limiting).
+    pub fn with_qos(mut self, qos: QosPolicy) -> Self {
+        self.qos = Arc::new(qos);
+        self
+    }
+
+    /// Verify the request's SigV4 signature, returning the authenticated access
+    /// key (the tenant). Pure CPU; no IO.
     pub fn authorize(
         &self,
         method: &str,
         path: &str,
         query: &str,
         headers: &HeaderMap,
-    ) -> S3Result<()> {
+    ) -> S3Result<String> {
         let auth_value = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -156,7 +167,13 @@ impl S3Service {
             &auth,
             secret,
         )?;
-        Ok(())
+        Ok(auth.access_key)
+    }
+
+    /// Whether `tenant` may make another request now (rate limiting). `false`
+    /// means the tenant is over its configured rate; reply with `SlowDown`.
+    pub fn allow_request(&self, tenant: &str) -> bool {
+        self.qos.allow_request(tenant)
     }
 
     /// `CreateBucket`.
@@ -199,12 +216,14 @@ impl S3Service {
         body: Bytes,
         cond: PutCondition,
         now: u64,
+        tenant: String,
     ) -> S3Result<PutObjectOk> {
         let meta = self.meta.clone();
         let backend = self.backend.clone();
         let etag = md5_hex(&body);
         let etag_stored = etag.clone();
         let size = body.len() as u64;
+        let quota = self.qos.quota(&tenant);
 
         let version = block(move || {
             let id = meta.next_object_id()?;
@@ -217,6 +236,8 @@ impl S3Service {
                     size,
                     etag: ETag(etag_stored),
                     created_at: now,
+                    tenant,
+                    quota,
                 },
                 cond,
             )?;
@@ -362,6 +383,7 @@ impl S3Service {
         upload_id: String,
         requested: Vec<(u32, String)>,
         now: u64,
+        tenant: String,
     ) -> S3Result<String> {
         if requested.is_empty() {
             return Err(S3Error::invalid_argument("no parts specified"));
@@ -396,6 +418,7 @@ impl S3Service {
         let backend = self.backend.clone();
         let etag_stored = final_etag.clone();
         let (b, k) = (bucket.clone(), key.clone());
+        let quota = self.qos.quota(&tenant);
         block(move || {
             // Assemble part bytes in order, then write the final object.
             let mut assembled = Vec::new();
@@ -413,6 +436,8 @@ impl S3Service {
                     size,
                     etag: ETag(etag_stored),
                     created_at: now,
+                    tenant,
+                    quota,
                 },
                 PutCondition::None,
             )?;

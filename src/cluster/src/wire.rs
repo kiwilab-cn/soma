@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use soma_meta::{
-    BucketMeta, BucketOpts, ListRequest, ListResult, ObjectMeta, ObjectPut, PutCondition, Version,
+    BucketMeta, BucketOpts, ListRequest, ListResult, ObjectMeta, ObjectPut, PutCondition,
+    TenantUsage, Version,
 };
 
 /// A metadata operation (mirrors the `MetadataStore` trait).
@@ -39,6 +40,9 @@ pub(crate) enum MetaRequest {
         req: ListRequest,
     },
     NextObjectId,
+    TenantUsage {
+        tenant: String,
+    },
 }
 
 /// A metadata reply.
@@ -51,6 +55,7 @@ pub(crate) enum MetaReply {
     Object(Option<ObjectMeta>),
     List(ListResult),
     ObjectId(u64),
+    Usage(TenantUsage),
 }
 
 /// A storage operation (mirrors the `StorageBackend` trait). Ranges travel as a

@@ -40,3 +40,12 @@ data:
     # The master key is injected at runtime via SOMA_MASTER_KEY (from the Secret),
     # never rendered here.
     enabled = {{ .Values.encryption.enabled }}
+    {{- range .Values.tenants }}
+
+    [[tenants]]
+    access_key = "{{ .accessKey }}"
+    max_bytes = "{{ .maxBytes | default "" }}"
+    max_objects = {{ .maxObjects | default 0 }}
+    rate_limit_rps = {{ .rateLimitRps | default 0 }}
+    rate_limit_burst = {{ .rateLimitBurst | default 0 }}
+    {{- end }}

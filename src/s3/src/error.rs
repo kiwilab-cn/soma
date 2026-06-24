@@ -125,6 +125,20 @@ impl S3Error {
         Self::new("NotImplemented", StatusCode::NOT_IMPLEMENTED, msg)
     }
 
+    /// `QuotaExceeded` (403) — the tenant's storage quota would be exceeded.
+    pub fn quota_exceeded(msg: impl Into<String>) -> Self {
+        Self::new("QuotaExceeded", StatusCode::FORBIDDEN, msg)
+    }
+
+    /// `SlowDown` (503) — the tenant exceeded its request rate limit.
+    pub fn slow_down() -> Self {
+        Self::new(
+            "SlowDown",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Reduce your request rate",
+        )
+    }
+
     /// `InternalError` (500).
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(
@@ -182,6 +196,7 @@ impl From<soma_meta::Error> for S3Error {
             M::BucketNotEmpty(b) => S3Error::bucket_not_empty(&b),
             M::InvalidBucketName(b) => S3Error::invalid_bucket_name(&b),
             M::PreconditionFailed => S3Error::precondition_failed(),
+            M::QuotaExceeded(msg) => S3Error::quota_exceeded(msg),
             other => S3Error::internal(other.to_string()),
         }
     }
