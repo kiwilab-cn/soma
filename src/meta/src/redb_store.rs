@@ -135,7 +135,6 @@ impl MetadataStore for RedbMetaStore {
             new_version = Version(current.as_ref().map_or(1, |c| c.version.0 + 1));
             let meta = ObjectMeta {
                 object_id: put.object_id,
-                location: put.location,
                 size: put.size,
                 etag: put.etag,
                 version: new_version,

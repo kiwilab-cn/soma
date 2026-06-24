@@ -2,7 +2,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use soma_core::{NeedleLoc, ObjectLocation, VolumeId};
 use soma_meta::{
     BucketOpts, ETag, ListRequest, MetadataStore, ObjectPut, PutCondition, RedbMetaStore, Version,
 };
@@ -12,21 +11,9 @@ fn store(dir: &TempDir) -> RedbMetaStore {
     RedbMetaStore::open(dir.path().join("meta.redb")).unwrap()
 }
 
-fn loc(offset: u64, size: u32) -> ObjectLocation {
-    ObjectLocation::new(
-        VolumeId(1),
-        NeedleLoc {
-            offset,
-            size,
-            flags: 0,
-        },
-    )
-}
-
-fn put(object_id: u64, offset: u64, size: u32, etag: &str) -> ObjectPut {
+fn put(object_id: u64, _offset: u64, size: u32, etag: &str) -> ObjectPut {
     ObjectPut {
         object_id,
-        location: loc(offset, size),
         size: size as u64,
         etag: ETag(etag.to_string()),
         created_at: 0,

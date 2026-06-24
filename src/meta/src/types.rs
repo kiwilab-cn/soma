@@ -1,7 +1,7 @@
 //! Public data types for the metadata store.
 
 use serde::{Deserialize, Serialize};
-use soma_core::{ObjectId, ObjectLocation};
+use soma_core::ObjectId;
 
 /// An S3-style entity tag. Opaque to the metadata store: it only stores and
 /// compares it (e.g. for `If-Match`). The S3 layer decides its format (an MD5
@@ -32,12 +32,15 @@ pub struct BucketMeta {
 }
 
 /// Everything needed to commit an object's current version.
+///
+/// Distributed model: the metadata is **logical** — it identifies the object by
+/// `object_id`; the physical byte location lives only in each storage node's
+/// node-local index (placement is computed from `object_id`). See
+/// `docs/M2_DESIGN.md` §2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectPut {
     /// The internal object id (allocated via [`crate::MetadataStore::next_object_id`]).
     pub object_id: ObjectId,
-    /// Where the bytes live.
-    pub location: ObjectLocation,
     /// Payload size in bytes.
     pub size: u64,
     /// Content tag.
@@ -47,13 +50,12 @@ pub struct ObjectPut {
     pub created_at: u64,
 }
 
-/// Stored metadata about an object's current version.
+/// Stored metadata about an object's current version (logical — no byte location).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMeta {
-    /// The internal object id of this version.
+    /// The internal object id of this version. Storage nodes resolve this to
+    /// bytes via their node-local index.
     pub object_id: ObjectId,
-    /// Where the bytes live.
-    pub location: ObjectLocation,
     /// Payload size in bytes.
     pub size: u64,
     /// Content tag.

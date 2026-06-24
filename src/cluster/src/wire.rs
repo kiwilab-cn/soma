@@ -1,7 +1,6 @@
 //! Postcard-encoded request/reply payloads carried over the gRPC `Frame`.
 
 use serde::{Deserialize, Serialize};
-use soma_core::ObjectLocation;
 use soma_meta::{
     BucketMeta, BucketOpts, ListRequest, ListResult, ObjectMeta, ObjectPut, PutCondition, Version,
 };
@@ -63,7 +62,7 @@ pub(crate) enum StorageRequest {
         data: Vec<u8>,
     },
     Get {
-        location: ObjectLocation,
+        object_id: u64,
         range: Option<(u64, u64)>,
     },
     Delete {
@@ -76,7 +75,6 @@ pub(crate) enum StorageRequest {
 /// A storage reply.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum StorageReply {
-    Location(ObjectLocation),
     Data(Vec<u8>),
     Unit,
 }

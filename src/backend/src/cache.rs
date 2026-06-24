@@ -1,18 +1,18 @@
 //! In-memory read cache layered over a [`StorageBackend`] (M1).
 //!
 //! [`CachingBackend`] is a transparent decorator: writes pass straight through;
-//! only `get` consults the cache. It is keyed by the **immutable**
-//! [`ObjectLocation`] (a new object version is a new needle at a new location), so
-//! there is no invalidation on overwrite or delete — stale entries simply age out
-//! (see `docs/M1_DESIGN.md` §3). Admission is biased to small objects: anything
-//! larger than `max_object_bytes` bypasses the cache.
+//! only `get` consults the cache. It is keyed by the **immutable** object id (a
+//! new object version gets a new id), so there is no invalidation on overwrite —
+//! stale entries simply age out (delete also drops the entry). Admission is
+//! biased to small objects: full objects larger than `max_object_bytes` are not
+//! cached.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use foyer::{Cache, CacheBuilder};
-use soma_core::{ObjectId, ObjectLocation};
+use soma_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::{ByteRange, StorageBackend};
@@ -29,7 +29,7 @@ pub struct CacheStats {
 /// A read-through, in-memory cache in front of an inner [`StorageBackend`].
 pub struct CachingBackend {
     inner: Arc<dyn StorageBackend>,
-    cache: Cache<ObjectLocation, Bytes>,
+    cache: Cache<ObjectId, Bytes>,
     max_object_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -44,7 +44,7 @@ impl CachingBackend {
         max_object_bytes: u64,
     ) -> Self {
         let cache = CacheBuilder::new(capacity_bytes)
-            .with_weighter(|_k: &ObjectLocation, v: &Bytes| v.len())
+            .with_weighter(|_k: &ObjectId, v: &Bytes| v.len())
             .build();
         Self {
             inner,
@@ -62,47 +62,43 @@ impl CachingBackend {
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
-
-    fn cacheable(&self, loc: &ObjectLocation) -> bool {
-        u64::from(loc.needle.size) <= self.max_object_bytes
-    }
 }
 
 impl StorageBackend for CachingBackend {
-    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<ObjectLocation> {
+    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
         self.inner.put(object_id, data)
     }
 
-    fn get(&self, loc: ObjectLocation, range: Option<ByteRange>) -> Result<Vec<u8>> {
-        // Large objects bypass the cache entirely.
-        if !self.cacheable(&loc) {
-            return self.inner.get(loc, range);
+    fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
+        // Hit: serve full bytes (slicing any range from them).
+        if let Some(entry) = self.cache.get(&object_id) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("soma_cache_hits_total").increment(1);
+            let full = entry.value().clone();
+            return match range {
+                None => Ok(full.to_vec()),
+                Some(r) => slice_range(&full, r),
+            };
         }
 
-        // Small object: get (or warm) the full bytes, then slice any range from
-        // them. A ranged read of a small object thus caches the whole object.
-        let full = match self.cache.get(&loc) {
-            Some(entry) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("soma_cache_hits_total").increment(1);
-                entry.value().clone()
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("soma_cache_misses_total").increment(1);
-                let bytes = Bytes::from(self.inner.get(loc, None)?);
-                self.cache.insert(loc, bytes.clone());
-                bytes
-            }
-        };
-
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("soma_cache_misses_total").increment(1);
         match range {
-            None => Ok(full.to_vec()),
-            Some(r) => slice_range(&full, r),
+            // Full miss: fetch the whole object and cache it if it is small.
+            None => {
+                let data = self.inner.get(object_id, None)?;
+                if data.len() as u64 <= self.max_object_bytes {
+                    self.cache.insert(object_id, Bytes::from(data.clone()));
+                }
+                Ok(data)
+            }
+            // Ranged miss: fetch only the range; don't cache partials.
+            Some(r) => self.inner.get(object_id, Some(r)),
         }
     }
 
-    fn delete(&self, object_id: ObjectId) -> Result<ObjectLocation> {
+    fn delete(&self, object_id: ObjectId) -> Result<()> {
+        self.cache.remove(&object_id);
         self.inner.delete(object_id)
     }
 
@@ -134,13 +130,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use parking_lot::Mutex;
-    use soma_core::{NeedleLoc, VolumeId};
     use std::collections::HashMap;
 
     /// An in-memory backend that counts `get` calls, for asserting cache behavior.
     struct CountingBackend {
-        store: Mutex<HashMap<ObjectLocation, Vec<u8>>>,
-        next_offset: AtomicU64,
+        store: Mutex<HashMap<ObjectId, Vec<u8>>>,
         gets: AtomicU64,
     }
 
@@ -148,7 +142,6 @@ mod tests {
         fn new() -> Self {
             Self {
                 store: Mutex::new(HashMap::new()),
-                next_offset: AtomicU64::new(0),
                 gets: AtomicU64::new(0),
             }
         }
@@ -158,34 +151,26 @@ mod tests {
     }
 
     impl StorageBackend for CountingBackend {
-        fn put(&self, _object_id: ObjectId, data: &[u8]) -> Result<ObjectLocation> {
-            let offset = self.next_offset.fetch_add(1, Ordering::Relaxed);
-            let loc = ObjectLocation::new(
-                VolumeId(1),
-                NeedleLoc {
-                    offset,
-                    size: data.len() as u32,
-                    flags: 0,
-                },
-            );
-            self.store.lock().insert(loc, data.to_vec());
-            Ok(loc)
+        fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
+            self.store.lock().insert(object_id, data.to_vec());
+            Ok(())
         }
-        fn get(&self, loc: ObjectLocation, range: Option<ByteRange>) -> Result<Vec<u8>> {
+        fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
             self.gets.fetch_add(1, Ordering::Relaxed);
             let data = self
                 .store
                 .lock()
-                .get(&loc)
+                .get(&object_id)
                 .cloned()
-                .ok_or(Error::VolumeNotFound(loc.volume.get()))?;
+                .ok_or(Error::ObjectNotFound(object_id))?;
             match range {
                 None => Ok(data),
                 Some(r) => slice_range(&Bytes::from(data), r),
             }
         }
-        fn delete(&self, _object_id: ObjectId) -> Result<ObjectLocation> {
-            unimplemented!()
+        fn delete(&self, object_id: ObjectId) -> Result<()> {
+            self.store.lock().remove(&object_id);
+            Ok(())
         }
         fn sync(&self) -> Result<()> {
             Ok(())
@@ -204,39 +189,38 @@ mod tests {
     #[test]
     fn second_read_is_a_hit() {
         let (inner, cache) = setup(1024);
-        let loc = cache.put(1, b"hello").unwrap();
+        cache.put(1, b"hello").unwrap();
 
-        assert_eq!(cache.get(loc, None).unwrap(), b"hello"); // miss
-        assert_eq!(cache.get(loc, None).unwrap(), b"hello"); // hit
-        assert_eq!(cache.get(loc, None).unwrap(), b"hello"); // hit
+        assert_eq!(cache.get(1, None).unwrap(), b"hello"); // miss
+        assert_eq!(cache.get(1, None).unwrap(), b"hello"); // hit
+        assert_eq!(cache.get(1, None).unwrap(), b"hello"); // hit
 
         assert_eq!(inner.get_count(), 1); // inner hit only once
         assert_eq!(cache.stats(), CacheStats { hits: 2, misses: 1 });
     }
 
     #[test]
-    fn large_object_bypasses_cache() {
+    fn large_object_is_not_cached() {
         let (inner, cache) = setup(4); // tiny threshold
-        let loc = cache.put(1, b"too large to cache").unwrap();
+        cache.put(1, b"too large to cache").unwrap();
 
-        cache.get(loc, None).unwrap();
-        cache.get(loc, None).unwrap();
+        cache.get(1, None).unwrap();
+        cache.get(1, None).unwrap();
 
-        assert_eq!(inner.get_count(), 2); // every read hits the inner backend
-        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0 });
+        // Every read misses and hits the inner backend (never cached).
+        assert_eq!(inner.get_count(), 2);
+        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 2 });
     }
 
     #[test]
     fn range_served_from_cached_small_object() {
         let (inner, cache) = setup(1024);
-        let loc = cache.put(1, b"0123456789").unwrap();
+        cache.put(1, b"0123456789").unwrap();
 
-        // Full read warms the cache.
-        cache.get(loc, None).unwrap();
-        // Range read is served from the cached bytes (no extra inner get).
+        cache.get(1, None).unwrap(); // full read warms the cache
         let part = cache
             .get(
-                loc,
+                1,
                 Some(ByteRange {
                     offset: 2,
                     length: 4,
@@ -244,18 +228,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(part, b"2345");
-        assert_eq!(inner.get_count(), 1);
+        assert_eq!(inner.get_count(), 1); // range served from cache
     }
 
     #[test]
-    fn range_miss_warms_full_object() {
+    fn ranged_miss_is_not_cached() {
         let (inner, cache) = setup(1024);
-        let loc = cache.put(1, b"0123456789").unwrap();
+        cache.put(1, b"0123456789").unwrap();
 
-        // First access is a ranged miss: fetches the full small object + caches.
+        // Ranged read on a cold object fetches just the range, no caching.
         let part = cache
             .get(
-                loc,
+                1,
                 Some(ByteRange {
                     offset: 0,
                     length: 3,
@@ -263,8 +247,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(part, b"012");
-        // Subsequent full read is a hit.
-        assert_eq!(cache.get(loc, None).unwrap(), b"0123456789");
-        assert_eq!(inner.get_count(), 1);
+        // A following full read still misses (and now caches).
+        assert_eq!(cache.get(1, None).unwrap(), b"0123456789");
+        assert_eq!(cache.get(1, None).unwrap(), b"0123456789"); // hit
+        assert_eq!(inner.get_count(), 2); // ranged miss + full miss
+    }
+
+    #[test]
+    fn delete_evicts_cache() {
+        let (inner, cache) = setup(1024);
+        cache.put(1, b"data").unwrap();
+        cache.get(1, None).unwrap(); // cache it
+        cache.delete(1).unwrap(); // evict + delete in inner
+        assert!(cache.get(1, None).is_err()); // gone
+        assert_eq!(inner.get_count(), 2);
     }
 }

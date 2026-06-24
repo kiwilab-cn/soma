@@ -27,7 +27,7 @@ pub use cache::{CacheStats, CachingBackend};
 pub use error::{Error, Result};
 pub use local::{BackendConfig, LocalFsBackend};
 
-use soma_core::{ObjectId, ObjectLocation};
+use soma_core::ObjectId;
 
 /// A byte range within an object, used for S3 `Range` reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,23 +38,23 @@ pub struct ByteRange {
     pub length: u64,
 }
 
-/// A durable object-bytes store.
+/// A durable object-bytes store, addressed by [`ObjectId`].
 ///
 /// Implementations own how bytes are laid out and made durable; they do **not**
-/// own the authority for "which object name maps to which location" — that is the
-/// metadata store's job. A backend deals only in [`ObjectId`] and
-/// [`ObjectLocation`].
+/// own the authority for "which object name maps to which id" — that is the
+/// metadata store's job. The physical byte location is an internal detail
+/// (resolved by a node-local index); callers only ever name an `ObjectId`.
 pub trait StorageBackend: Send + Sync {
-    /// Append `data` as a needle, fsync it, and return its durable location.
-    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<ObjectLocation>;
+    /// Append `data` as a needle for `object_id` and fsync it.
+    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()>;
 
-    /// Read an object's bytes, optionally just a byte range, verifying the
+    /// Read an object's bytes by id, optionally just a byte range, verifying the
     /// payload CRC (bitrot guard).
-    fn get(&self, loc: ObjectLocation, range: Option<ByteRange>) -> Result<Vec<u8>>;
+    fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>>;
 
-    /// Append a tombstone (delete marker) for `object_id` and return its
-    /// location. Physical space is reclaimed later by compaction.
-    fn delete(&self, object_id: ObjectId) -> Result<ObjectLocation>;
+    /// Append a tombstone (delete marker) for `object_id`. Physical space is
+    /// reclaimed later by compaction.
+    fn delete(&self, object_id: ObjectId) -> Result<()>;
 
     /// Flush all volumes to disk (`fsync`).
     fn sync(&self) -> Result<()>;
