@@ -5,19 +5,23 @@
 //! replication / erasure-coding layer below, only ever see ciphertext.
 //!
 //! **Envelope scheme.** Each object gets a fresh random 256-bit *data encryption
-//! key* (DEK). The payload is sealed with AES-256-GCM under the DEK; the DEK is
-//! then *wrapped* (encrypted) with the *master key* (KEK) and stored alongside the
-//! ciphertext, so the stored bytes are self-describing — no per-object key
-//! database is needed to decrypt:
+//! key* (DEK), wrapped by the *master key* (KEK) and stored alongside the payload
+//! so the bytes are self-describing — no per-object key database is needed.
+//!
+//! **Chunked AEAD for seekable range reads.** The payload is split into fixed-size
+//! chunks, each sealed *independently* with AES-256-GCM (its own nonce + tag), so
+//! a range read fetches and decrypts only the chunks covering the requested window
+//! — not the whole object — while every chunk is still authenticated:
 //!
 //! ```text
-//! frame = [ version:1 ][ kek_nonce:12 ][ wrapped_dek:48 ][ data_nonce:12 ][ ciphertext+tag ]
+//! frame = [ version:1 ][ kek_nonce:12 ][ wrapped_dek:48 ][ chunk_size:4 ][ orig_len:8 ]
+//!         [ chunk_0+tag ][ chunk_1+tag ] ...
 //! ```
 //!
-//! Reads fetch the whole frame (AES-GCM is not seekable), unwrap the DEK with the
-//! KEK, decrypt, then slice any requested range. GCM is authenticated, so a wrong
-//! master key or tampered bytes surface as an [`Error::Crypto`] rather than
-//! silently wrong data.
+//! A read reads just the header (for the DEK + layout), then the ciphertext bytes
+//! of the covering chunks (one ranged fetch from the inner backend), decrypts them,
+//! and slices. GCM authentication means a wrong master key or tampered bytes
+//! surface as an [`Error::Crypto`] rather than silently wrong data.
 
 use std::sync::Arc;
 
@@ -30,16 +34,22 @@ use soma_core::ObjectId;
 use crate::error::{Error, Result};
 use crate::{ByteRange, StorageBackend};
 
-/// Frame format version (the first stored byte), so the layout can evolve.
-const VERSION: u8 = 1;
+/// Frame format version (the first stored byte). v2 is the chunked layout.
+const VERSION: u8 = 2;
 /// AES-GCM nonce length.
 const NONCE: usize = 12;
 /// Data encryption key length (AES-256).
 const DEK: usize = 32;
+/// AES-GCM authentication tag length.
+const TAG: usize = 16;
 /// A DEK wrapped by the KEK: AES-256-GCM ciphertext (32) + tag (16).
-const WRAPPED_DEK: usize = DEK + 16;
-/// Fixed self-describing header before the payload ciphertext.
-const HEADER: usize = 1 + NONCE + WRAPPED_DEK + NONCE;
+const WRAPPED_DEK: usize = DEK + TAG;
+/// Default plaintext chunk size (each chunk is sealed independently for seekable
+/// range reads).
+const DEFAULT_CHUNK: usize = 64 * 1024;
+/// Self-describing header: `version(1) | kek_nonce(12) | wrapped_dek(48) |
+/// chunk_size(4) | orig_len(8)`, followed by the per-chunk ciphertexts.
+const HEADER: usize = 1 + NONCE + WRAPPED_DEK + 4 + 8;
 
 /// Source of the master key (KEK) that wraps per-object data keys.
 ///
@@ -84,52 +94,83 @@ impl KeyProvider for StaticKeyProvider {
 pub struct EncryptingBackend {
     inner: Arc<dyn StorageBackend>,
     kek: Aes256Gcm,
+    chunk_size: usize,
 }
 
 impl EncryptingBackend {
     /// Wrap `inner`, sealing every payload under the master key from `keys`.
     pub fn new(inner: Arc<dyn StorageBackend>, keys: &dyn KeyProvider) -> Self {
         let kek = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(keys.master_key()));
-        Self { inner, kek }
+        Self {
+            inner,
+            kek,
+            chunk_size: DEFAULT_CHUNK,
+        }
     }
 
-    /// Seal `plaintext` into a self-describing frame.
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    /// Override the chunk size (smaller = finer range granularity, more tag
+    /// overhead). Mainly for tests.
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size.max(1);
+        self
+    }
+
+    /// The nonce for chunk `i` — deterministic but unique within an object (the
+    /// per-object DEK is random, so `(DEK, nonce)` never repeats).
+    fn chunk_nonce(i: u64) -> [u8; NONCE] {
+        let mut n = [0u8; NONCE];
+        n[NONCE - 8..].copy_from_slice(&i.to_be_bytes());
+        n
+    }
+
+    /// Seal `data` into a chunked, self-describing frame.
+    fn seal(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut dek = [0u8; DEK];
         OsRng.fill_bytes(&mut dek);
-        let mut data_nonce = [0u8; NONCE];
-        OsRng.fill_bytes(&mut data_nonce);
         let mut kek_nonce = [0u8; NONCE];
         OsRng.fill_bytes(&mut kek_nonce);
-
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&data_nonce), plaintext)
-            .map_err(|_| Error::Crypto("payload encryption failed"))?;
         let wrapped = self
             .kek
             .encrypt(Nonce::from_slice(&kek_nonce), dek.as_slice())
             .map_err(|_| Error::Crypto("key wrap failed"))?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
 
-        let mut frame = Vec::with_capacity(HEADER + ciphertext.len());
+        let mut frame = Vec::with_capacity(HEADER + data.len() + TAG);
         frame.push(VERSION);
         frame.extend_from_slice(&kek_nonce);
         frame.extend_from_slice(&wrapped);
-        frame.extend_from_slice(&data_nonce);
-        frame.extend_from_slice(&ciphertext);
+        frame.extend_from_slice(&(self.chunk_size as u32).to_be_bytes());
+        frame.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        for (i, chunk) in data.chunks(self.chunk_size).enumerate() {
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&Self::chunk_nonce(i as u64)), chunk)
+                .map_err(|_| Error::Crypto("payload encryption failed"))?;
+            frame.extend_from_slice(&ct);
+        }
         Ok(frame)
     }
 
-    /// Open a frame produced by [`Self::seal`], returning the plaintext.
-    fn open(&self, frame: &[u8]) -> Result<Vec<u8>> {
-        if frame.len() < HEADER || frame[0] != VERSION {
+    /// Parse a frame header, unwrapping the DEK → `(cipher, chunk_size, orig_len)`.
+    fn open_header(&self, header: &[u8]) -> Result<(Aes256Gcm, usize, u64)> {
+        if header.len() < HEADER || header[0] != VERSION {
             return Err(Error::Crypto("malformed or unknown ciphertext frame"));
         }
-        let kek_nonce = &frame[1..1 + NONCE];
-        let wrapped = &frame[1 + NONCE..1 + NONCE + WRAPPED_DEK];
-        let data_nonce = &frame[1 + NONCE + WRAPPED_DEK..HEADER];
-        let ciphertext = &frame[HEADER..];
-
+        let kek_nonce = &header[1..1 + NONCE];
+        let wrapped = &header[1 + NONCE..1 + NONCE + WRAPPED_DEK];
+        let cs = 1 + NONCE + WRAPPED_DEK;
+        let chunk_size = u32::from_be_bytes(
+            header[cs..cs + 4]
+                .try_into()
+                .map_err(|_| Error::Crypto("bad header"))?,
+        ) as usize;
+        let orig_len = u64::from_be_bytes(
+            header[cs + 4..cs + 12]
+                .try_into()
+                .map_err(|_| Error::Crypto("bad header"))?,
+        );
+        if chunk_size == 0 {
+            return Err(Error::Crypto("invalid chunk size"));
+        }
         let dek = self
             .kek
             .decrypt(Nonce::from_slice(kek_nonce), wrapped)
@@ -137,10 +178,53 @@ impl EncryptingBackend {
         if dek.len() != DEK {
             return Err(Error::Crypto("unwrapped data key has the wrong length"));
         }
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
-        cipher
-            .decrypt(Nonce::from_slice(data_nonce), ciphertext)
-            .map_err(|_| Error::Crypto("payload authentication failed"))
+        Ok((
+            Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek)),
+            chunk_size,
+            orig_len,
+        ))
+    }
+
+    /// Frame byte offset where chunk `i`'s ciphertext starts.
+    fn chunk_ct_offset(chunk_size: usize, i: usize) -> usize {
+        HEADER + i * (chunk_size + TAG)
+    }
+
+    /// Ciphertext length of chunk `i` (the last chunk is shorter).
+    fn chunk_ct_len(chunk_size: usize, orig_len: u64, i: usize) -> usize {
+        let pt_start = i as u64 * chunk_size as u64;
+        let pt = orig_len.saturating_sub(pt_start).min(chunk_size as u64) as usize;
+        pt + TAG
+    }
+
+    /// Decrypt consecutive chunks (starting at chunk index `first`) from `ct`,
+    /// returning their concatenated plaintext.
+    fn decrypt_chunks(
+        cipher: &Aes256Gcm,
+        chunk_size: usize,
+        orig_len: u64,
+        first: usize,
+        ct: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(ct.len());
+        let mut pos = 0usize;
+        let mut i = first;
+        while pos < ct.len() && (i as u64 * chunk_size as u64) < orig_len {
+            let this = Self::chunk_ct_len(chunk_size, orig_len, i);
+            if pos + this > ct.len() {
+                return Err(Error::Crypto("truncated ciphertext chunk"));
+            }
+            let dec = cipher
+                .decrypt(
+                    Nonce::from_slice(&Self::chunk_nonce(i as u64)),
+                    &ct[pos..pos + this],
+                )
+                .map_err(|_| Error::Crypto("payload authentication failed"))?;
+            out.extend_from_slice(&dec);
+            pos += this;
+            i += 1;
+        }
+        Ok(out)
     }
 }
 
@@ -151,23 +235,55 @@ impl StorageBackend for EncryptingBackend {
     }
 
     fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
-        // GCM seals the whole payload, so a ranged read still fetches and decrypts
-        // the full object, then slices.
-        let frame = self.inner.get(object_id, None)?;
-        let plain = self.open(&frame)?;
         match range {
-            None => Ok(plain),
+            None => {
+                let frame = self.inner.get(object_id, None)?;
+                let (cipher, chunk_size, orig_len) = self.open_header(&frame)?;
+                Self::decrypt_chunks(&cipher, chunk_size, orig_len, 0, &frame[HEADER..])
+            }
+            // Seekable: read just the header (for the DEK + layout) and the chunks
+            // covering the requested window, decrypt them, and slice.
             Some(r) => {
+                let header = self.inner.get(
+                    object_id,
+                    Some(ByteRange {
+                        offset: 0,
+                        length: HEADER as u64,
+                    }),
+                )?;
+                let (cipher, chunk_size, orig_len) = self.open_header(&header)?;
                 let end = r
                     .offset
                     .checked_add(r.length)
-                    .filter(|&e| e <= plain.len() as u64)
+                    .filter(|&e| e <= orig_len)
                     .ok_or(Error::BadRange {
                         offset: r.offset,
                         len: r.length,
-                        size: plain.len() as u32,
+                        size: orig_len.min(u32::MAX as u64) as u32,
                     })?;
-                Ok(plain[r.offset as usize..end as usize].to_vec())
+                if r.length == 0 {
+                    return Ok(Vec::new());
+                }
+                let first = (r.offset / chunk_size as u64) as usize;
+                let last = ((end - 1) / chunk_size as u64) as usize;
+                let ct_start = Self::chunk_ct_offset(chunk_size, first);
+                let ct_end = Self::chunk_ct_offset(chunk_size, last)
+                    + Self::chunk_ct_len(chunk_size, orig_len, last);
+                let ct = self.inner.get(
+                    object_id,
+                    Some(ByteRange {
+                        offset: ct_start as u64,
+                        length: (ct_end - ct_start) as u64,
+                    }),
+                )?;
+                let span = Self::decrypt_chunks(&cipher, chunk_size, orig_len, first, &ct)?;
+                let span_start = first as u64 * chunk_size as u64;
+                let lo = (r.offset - span_start) as usize;
+                let hi = (end - span_start) as usize;
+                if hi > span.len() {
+                    return Err(Error::Crypto("decrypted span shorter than expected"));
+                }
+                Ok(span[lo..hi].to_vec())
             }
         }
     }
@@ -192,10 +308,12 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
 
-    /// A minimal in-memory backend, so tests can inspect the bytes at rest.
+    /// A minimal in-memory backend, so tests can inspect the bytes at rest and
+    /// count how many bytes a read pulled from it (to prove seekability).
     #[derive(Default)]
     struct MemBackend {
         store: Mutex<HashMap<ObjectId, Vec<u8>>>,
+        bytes_read: std::sync::atomic::AtomicU64,
     }
 
     impl StorageBackend for MemBackend {
@@ -210,10 +328,13 @@ mod tests {
                 .get(&object_id)
                 .cloned()
                 .ok_or(Error::ObjectNotFound(object_id))?;
-            match range {
-                None => Ok(data),
-                Some(r) => Ok(data[r.offset as usize..(r.offset + r.length) as usize].to_vec()),
-            }
+            let out = match range {
+                None => data,
+                Some(r) => data[r.offset as usize..(r.offset + r.length) as usize].to_vec(),
+            };
+            self.bytes_read
+                .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(out)
         }
         fn delete(&self, object_id: ObjectId) -> Result<()> {
             self.store.lock().remove(&object_id);
@@ -322,5 +443,96 @@ mod tests {
         assert!(StaticKeyProvider::from_base64("not base64!!!").is_err());
         let short = base64::engine::general_purpose::STANDARD.encode([5u8; 16]);
         assert!(StaticKeyProvider::from_base64(&short).is_err());
+    }
+
+    fn chunked(key: [u8; 32], chunk: usize) -> (Arc<MemBackend>, EncryptingBackend) {
+        let mem = Arc::new(MemBackend::default());
+        let enc = EncryptingBackend::new(mem.clone(), &StaticKeyProvider::new(key))
+            .with_chunk_size(chunk);
+        (mem, enc)
+    }
+
+    #[test]
+    fn chunked_roundtrip_various_sizes() {
+        let (_mem, enc) = chunked([5u8; 32], 16);
+        for size in [0usize, 1, 15, 16, 17, 31, 32, 33, 100, 1000] {
+            let payload: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+            enc.put(size as u64, &payload).unwrap();
+            assert_eq!(enc.get(size as u64, None).unwrap(), payload, "size {size}");
+        }
+    }
+
+    #[test]
+    fn range_reads_span_chunk_boundaries() {
+        let (_mem, enc) = chunked([6u8; 32], 16);
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        enc.put(1, &payload).unwrap();
+        // Windows aligned to, inside, and straddling chunk boundaries.
+        for (off, len) in [
+            (0u64, 5u64),
+            (10, 12),
+            (16, 16),
+            (15, 2),
+            (300, 200),
+            (999, 1),
+            (0, 1000),
+        ] {
+            let got = enc
+                .get(
+                    1,
+                    Some(ByteRange {
+                        offset: off,
+                        length: len,
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                got,
+                &payload[off as usize..(off + len) as usize],
+                "off {off} len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_read_is_seekable_not_whole_object() {
+        // 64 chunks of 64 bytes = ~4 KiB plaintext.
+        let (mem, enc) = chunked([8u8; 32], 64);
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+        enc.put(1, &payload).unwrap();
+        let stored = mem.store.lock().get(&1).cloned().unwrap().len() as u64;
+
+        mem.bytes_read
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let got = enc
+            .get(
+                1,
+                Some(ByteRange {
+                    offset: 2000,
+                    length: 50,
+                }),
+            )
+            .unwrap();
+        assert_eq!(got, &payload[2000..2050]);
+        // Only the header + the one covering chunk were read — far less than the
+        // whole stored object.
+        let read = mem.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            read < stored / 4,
+            "range read pulled {read} of {stored} bytes"
+        );
+    }
+
+    #[test]
+    fn tampered_chunk_is_rejected() {
+        let (mem, enc) = chunked([9u8; 32], 16);
+        enc.put(1, &[3u8; 100]).unwrap();
+        {
+            let mut g = mem.store.lock();
+            let v = g.get_mut(&1).unwrap();
+            let last = v.len() - 1;
+            v[last] ^= 0xff; // corrupt the final chunk's tag
+        }
+        assert!(matches!(enc.get(1, None), Err(Error::Crypto(_))));
     }
 }

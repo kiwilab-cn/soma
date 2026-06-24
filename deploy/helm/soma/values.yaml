@@ -84,6 +84,8 @@ credentials:
 encryption:
   enabled: false
   masterKey: ""
+  # Plaintext chunk size for the seekable chunked AEAD (0 = 64 KiB default).
+  chunkSizeBytes: 0
 
 # Per-tenant QoS (quotas + rate limits), applied at the gateway and keyed by
 # access key. Empty = no limits. Each entry:

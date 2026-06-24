@@ -94,7 +94,11 @@ fn maybe_encrypt(
 ) -> Result<Arc<dyn StorageBackend>, BoxError> {
     if cfg.encryption.enabled {
         let keys = StaticKeyProvider::from_base64(&cfg.encryption.master_key)?;
-        Ok(Arc::new(EncryptingBackend::new(backend, &keys)))
+        let mut enc = EncryptingBackend::new(backend, &keys);
+        if cfg.encryption.chunk_size_bytes > 0 {
+            enc = enc.with_chunk_size(cfg.encryption.chunk_size_bytes);
+        }
+        Ok(Arc::new(enc))
     } else {
         Ok(backend)
     }
