@@ -1,0 +1,73 @@
+# Default values for the soma chart.
+# M1 is single-node: replicaCount is 1; multi-replica arrives with M2.
+
+replicaCount: 1
+
+image:
+  repository: soma
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Ports the server listens on (must match the rendered config below).
+ports:
+  s3: 9000
+  admin: 9001
+
+service:
+  type: ClusterIP
+  # Per-service annotations, if needed.
+  annotations: {}
+
+# Rendered into /etc/soma/soma.toml (credentials come from the Secret, not here).
+config:
+  dataDir: /var/lib/soma
+  volumeMax: "4GiB"
+  cache:
+    enabled: true
+    maxBytes: "512MiB"
+    maxObjectBytes: "1MiB"
+
+# Access credentials. A Secret is created from these unless `existingSecret` is
+# set, in which case that Secret must provide SOMA_ACCESS_KEY / SOMA_SECRET_KEY.
+credentials:
+  accessKey: soma
+  secretKey: soma-secret
+  existingSecret: ""
+
+persistence:
+  enabled: true
+  size: 50Gi
+  # Empty uses the cluster default StorageClass.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+resources: {}
+  # limits:
+  #   cpu: "2"
+  #   memory: 2Gi
+  # requests:
+  #   cpu: "500m"
+  #   memory: 512Mi
+
+# Runs as a non-root user (matches the image's uid 10001).
+podSecurityContext:
+  fsGroup: 10001
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
