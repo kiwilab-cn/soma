@@ -38,6 +38,7 @@ index — the design lesson shared by Facebook Haystack, SeaweedFS, and CDN cach
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the full system design.
 - [`docs/MVP_DESIGN.md`](docs/MVP_DESIGN.md) — the M0 (single-node skeleton) design.
+- [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md) — the M1 (read cache + cloud-native readiness) design.
 
 ## Run (M0)
 
