@@ -151,6 +151,10 @@ pub struct StorageConfig {
     /// Membership heartbeat interval in seconds for the storage role (0 disables
     /// registration).
     pub heartbeat_interval_secs: u64,
+    /// Volume compaction interval in seconds for the storage role (0 disables).
+    pub compact_interval_secs: u64,
+    /// Only compact a volume when at least this fraction of it is reclaimable.
+    pub compact_min_reclaim_ratio: f64,
 }
 
 /// Erasure-coding tuning. Opt-in: when `enabled`, the gateway stripes each object
@@ -248,6 +252,8 @@ impl Default for StorageConfig {
             volume_max: "4GiB".to_string(),
             scrub_interval_secs: 3600,
             heartbeat_interval_secs: 10,
+            compact_interval_secs: 3600,
+            compact_min_reclaim_ratio: 0.2,
         }
     }
 }

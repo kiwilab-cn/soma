@@ -213,3 +213,106 @@ fn newest_write_for_same_id_wins() {
     let be = open(&dir);
     assert_eq!(be.get(5, None).unwrap(), b"v2");
 }
+
+// --- compaction (space reclamation) ----------------------------------------
+
+fn total_vol_bytes(dir: &TempDir) -> u64 {
+    std::fs::read_dir(dir.path().join("volumes"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("vol"))
+        .map(|e| e.metadata().unwrap().len())
+        .sum()
+}
+
+#[test]
+fn compaction_reclaims_deleted_and_keeps_live() {
+    let dir = TempDir::new().unwrap();
+    // Tiny volume_max + sizable payloads → each object lands in its own volume,
+    // so deleted objects sit in sealed (compactable) volumes.
+    let be = open_with(&dir, 64);
+    let payload = |i: u64| [i as u8; 200];
+    for i in 1..=6 {
+        be.put(i, &payload(i)).unwrap();
+    }
+    for i in [1u64, 2, 3] {
+        be.delete(i).unwrap();
+    }
+
+    let before = total_vol_bytes(&dir);
+    let report = be.compact(0.0).unwrap();
+    let after = total_vol_bytes(&dir);
+
+    assert!(
+        report.bytes_reclaimed > 0,
+        "should reclaim deleted needle space"
+    );
+    assert!(after < before, "volumes should shrink: {after} < {before}");
+    for i in [1u64, 2, 3] {
+        assert!(matches!(
+            be.get(i, None),
+            Err(soma_backend::Error::ObjectNotFound(_))
+        ));
+    }
+    for i in [4u64, 5, 6] {
+        assert_eq!(be.get(i, None).unwrap(), payload(i));
+    }
+}
+
+#[test]
+fn compaction_reclaims_superseded_same_id() {
+    let dir = TempDir::new().unwrap();
+    let be = open_with(&dir, 64);
+    be.put(1, &[9u8; 200]).unwrap(); // sealed
+    be.put(2, &[8u8; 200]).unwrap();
+    be.put(1, &[7u8; 200]).unwrap(); // re-put id 1 → the first needle is dead
+
+    let before = total_vol_bytes(&dir);
+    let report = be.compact(0.0).unwrap();
+    let after = total_vol_bytes(&dir);
+
+    assert!(report.bytes_reclaimed > 0 && after < before);
+    assert_eq!(be.get(1, None).unwrap(), [7u8; 200]); // newest wins
+    assert_eq!(be.get(2, None).unwrap(), [8u8; 200]);
+}
+
+#[test]
+fn compaction_is_noop_without_garbage() {
+    let dir = TempDir::new().unwrap();
+    let be = open_with(&dir, 64);
+    for i in 1..=4 {
+        be.put(i, &[i as u8; 200]).unwrap();
+    }
+    let report = be.compact(0.0).unwrap();
+    assert_eq!(report.bytes_reclaimed, 0);
+    assert_eq!(report.volumes_compacted, 0);
+    for i in 1..=4 {
+        assert_eq!(be.get(i, None).unwrap(), [i as u8; 200]);
+    }
+}
+
+#[test]
+fn compacted_volumes_survive_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let be = open_with(&dir, 64);
+        for i in 1..=6 {
+            be.put(i, &[i as u8; 200]).unwrap();
+        }
+        for i in [1u64, 2, 3] {
+            be.delete(i).unwrap();
+        }
+        be.compact(0.0).unwrap();
+    }
+    // Reopen: the rebuild from compacted volumes preserves the live/deleted state.
+    let be = open(&dir);
+    for i in [1u64, 2, 3] {
+        assert!(be.get(i, None).is_err());
+    }
+    for i in [4u64, 5, 6] {
+        assert_eq!(be.get(i, None).unwrap(), [i as u8; 200]);
+    }
+    // And the backend keeps working after compaction + reopen.
+    be.put(99, b"after compaction").unwrap();
+    assert_eq!(be.get(99, None).unwrap(), b"after compaction");
+}

@@ -58,6 +58,10 @@ config:
   scrubIntervalSecs: 3600
   # Storage-node membership heartbeat interval (0 disables registration).
   heartbeatIntervalSecs: 10
+  # Volume compaction (space reclamation) interval (0 disables); only compact a
+  # volume when at least this fraction of it is dead.
+  compactIntervalSecs: 3600
+  compactMinReclaimRatio: 0.2
   cache:
     enabled: true
     maxBytes: "512MiB"
