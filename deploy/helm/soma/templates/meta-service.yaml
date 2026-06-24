@@ -1,0 +1,16 @@
+# Headless Service: stable DNS for the metadata StatefulSet pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "soma.metaHeadless" . }}
+  labels:
+    {{- include "soma.labels" (dict "root" . "component" "meta") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "soma.selectorLabels" (dict "root" . "component" "meta") | nindent 4 }}
+  ports:
+    - name: meta
+      port: {{ .Values.ports.meta }}
+      targetPort: meta
+      protocol: TCP

@@ -1,7 +1,9 @@
-# Default values for the soma chart.
-# M1 is single-node: replicaCount is 1; multi-replica arrives with M2.
-
-replicaCount: 1
+# Default values for the soma chart (M2: three-role distributed topology).
+#
+# One image, three roles:
+#   - gateway : stateless S3 front-end (Deployment, scalable)
+#   - meta    : metadata node (StatefulSet, single replica in M2)
+#   - storage : storage nodes (StatefulSet, N replicas, quorum-replicated)
 
 image:
   repository: soma
@@ -13,20 +15,23 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# Ports the server listens on (must match the rendered config below).
+# Listen ports for each role.
 ports:
-  s3: 9000
-  admin: 9001
+  s3: 9000      # gateway S3 endpoint
+  admin: 9001   # gateway health + metrics
+  meta: 9100    # metadata gRPC
+  storage: 9200 # storage gRPC
 
-service:
-  type: ClusterIP
-  # Per-service annotations, if needed.
-  annotations: {}
+# Replication policy (gateway).
+replication:
+  factor: 3
+  writeQuorum: 2
 
-# Rendered into /etc/soma/soma.toml (credentials come from the Secret, not here).
+# Shared object/cache config rendered into each role's soma.toml.
 config:
   dataDir: /var/lib/soma
   volumeMax: "4GiB"
+  scrubIntervalSecs: 3600
   cache:
     enabled: true
     maxBytes: "512MiB"
@@ -39,23 +44,31 @@ credentials:
   secretKey: soma-secret
   existingSecret: ""
 
-persistence:
-  enabled: true
-  size: 50Gi
-  # Empty uses the cluster default StorageClass.
-  storageClass: ""
-  accessModes:
-    - ReadWriteOnce
+gateway:
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    annotations: {}
+  resources: {}
 
-resources: {}
-  # limits:
-  #   cpu: "2"
-  #   memory: 2Gi
-  # requests:
-  #   cpu: "500m"
-  #   memory: 512Mi
+meta:
+  persistence:
+    size: 10Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+  resources: {}
 
-# Runs as a non-root user (matches the image's uid 10001).
+storage:
+  replicaCount: 3
+  persistence:
+    size: 100Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+  resources: {}
+
+# Non-root (matches the image's uid 10001).
 podSecurityContext:
   fsGroup: 10001
 securityContext:

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "soma.metaName" . }}
+  labels:
+    {{- include "soma.labels" (dict "root" . "component" "meta") | nindent 4 }}
+data:
+  soma.toml: |
+    role = "meta"
+    listen = "0.0.0.0:{{ .Values.ports.meta }}"
+    data_dir = {{ .Values.config.dataDir | quote }}

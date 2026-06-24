@@ -75,16 +75,19 @@ let store = object_store::aws::AmazonS3Builder::new()
 ## Deploy
 
 ```sh
-docker build -t soma:0.1.0 .                     # multi-stage build
+docker build -t soma:0.1.0 .                     # one image, all roles
 helm install soma deploy/helm/soma \
   --set image.repository=soma --set image.tag=0.1.0 \
+  --set storage.replicaCount=3 \
   --set credentials.accessKey=... --set credentials.secretKey=...
 ```
 
-The chart deploys a single-node `StatefulSet` with a persistent data volume, a
-`Service` for the S3 port, a `ConfigMap` (`soma.toml`), a `Secret` for
-credentials, and liveness/readiness probes on the admin port. Tune via
-[`deploy/helm/soma/values.yaml`](deploy/helm/soma/values.yaml). Multi-node is M2.
+The chart deploys the distributed three-role topology: a stateless **gateway**
+`Deployment` (S3 + admin), a **metadata** `StatefulSet` (1 replica, PV), and a
+**storage** `StatefulSet` (`storage.replicaCount` replicas, PVs) — wired together
+by gRPC, with N-way quorum replication (`replication.factor` / `writeQuorum`). The
+gateway is reached via its `Service` on the S3 port; tune everything via
+[`deploy/helm/soma/values.yaml`](deploy/helm/soma/values.yaml).
 
 ## Status
 
