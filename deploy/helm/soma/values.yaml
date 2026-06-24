@@ -44,6 +44,15 @@ credentials:
   secretKey: soma-secret
   existingSecret: ""
 
+# Envelope encryption at rest (applied at the gateway, below the cache, above
+# replication — storage nodes only ever see ciphertext). When enabled, supply a
+# base64-encoded 32-byte master key here, or provide it as SOMA_MASTER_KEY via
+# `credentials.existingSecret`. The key is delivered through the Secret (env),
+# never written into the ConfigMap.
+encryption:
+  enabled: false
+  masterKey: ""
+
 gateway:
   replicaCount: 2
   service:

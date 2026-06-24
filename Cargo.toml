@@ -63,6 +63,9 @@ figment = { version = "0.10", features = ["toml", "env"] }
 bytesize = "1"
 # Cache
 foyer = "0.20"
+# Encryption at rest (envelope: AES-256-GCM)
+aes-gcm = "0.10"
+rand = "0.8"
 # Cluster RPC
 tonic = "0.12"
 prost = "0.13"

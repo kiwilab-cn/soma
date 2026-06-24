@@ -48,6 +48,11 @@ pub enum Error {
     /// An error surfaced from a remote storage node over RPC.
     #[error("remote storage error: {0}")]
     Remote(String),
+
+    /// Encryption, decryption, or key (un)wrapping failed — a bad master key, a
+    /// corrupt ciphertext frame, or an authentication-tag mismatch.
+    #[error("crypto error: {0}")]
+    Crypto(&'static str),
 }
 
 impl Error {

@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
-use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
+use soma_backend::{
+    BackendConfig, CachingBackend, EncryptingBackend, LocalFsBackend, StaticKeyProvider,
+    StorageBackend,
+};
 use soma_cluster::{serve_meta, serve_storage, MetaClient, ReplicatedBackend};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
@@ -69,6 +72,21 @@ fn build_credentials(cfg: &Config) -> Credentials {
     creds
 }
 
+/// Wrap a backend in envelope encryption if enabled. Encryption sits **below** the
+/// cache (so the cache holds plaintext) and **above** replication/storage (so
+/// nodes only ever see ciphertext). Fails fast on a missing/invalid master key.
+fn maybe_encrypt(
+    cfg: &Config,
+    backend: Arc<dyn StorageBackend>,
+) -> Result<Arc<dyn StorageBackend>, BoxError> {
+    if cfg.encryption.enabled {
+        let keys = StaticKeyProvider::from_base64(&cfg.encryption.master_key)?;
+        Ok(Arc::new(EncryptingBackend::new(backend, &keys)))
+    } else {
+        Ok(backend)
+    }
+}
+
 /// Wrap a backend in the read cache if enabled.
 fn maybe_cache(cfg: &Config, backend: Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend> {
     if cfg.cache.enabled {
@@ -88,7 +106,7 @@ fn maybe_cache(cfg: &Config, backend: Arc<dyn StorageBackend>) -> Arc<dyn Storag
 async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let meta = open_meta(&cfg)?;
-    let backend = maybe_cache(&cfg, open_backend(&cfg)?);
+    let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, open_backend(&cfg)?)?);
     let service = S3Service::new(meta, backend, build_credentials(&cfg));
     serve_s3_and_admin(&cfg, service, metrics, "standalone").await
 }
@@ -106,7 +124,7 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
         )
         .await?,
     );
-    let backend = maybe_cache(&cfg, storage);
+    let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, storage)?);
     let service = S3Service::new(meta, backend, build_credentials(&cfg));
     tracing::info!(
         meta = %cfg.meta_endpoint,
@@ -197,6 +215,7 @@ async fn serve_s3_and_admin(
         admin_listen = %cfg.admin_listen,
         credentials = cfg.credentials.len(),
         cache_enabled = cfg.cache.enabled,
+        encryption_enabled = cfg.encryption.enabled,
         "soma-server listening"
     );
 
