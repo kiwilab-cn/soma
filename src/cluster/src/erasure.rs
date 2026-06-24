@@ -23,47 +23,38 @@
 //! object. Persisting reconstructed shards back to a replacement node
 //! (reconstruction/rebalance) is deferred (see `docs/M4_DESIGN.md` §2).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use soma_backend::{ByteRange, Error, Result, StorageBackend};
 use soma_core::ObjectId;
 
-use crate::ring::Ring;
+use crate::placement::{Placement, DEFAULT_PG_COUNT};
 use crate::StorageClient;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Number of virtual points per node on the ring (matches replication).
-const VNODES: usize = 64;
 /// Bytes of big-endian length prefix prepended to the payload before encoding.
 const LEN_PREFIX: usize = 8;
 
-/// An erasure-coded storage backend over a fixed set of storage nodes.
+/// An erasure-coded storage backend over a placement-group map.
 pub struct ErasureCodedBackend {
-    nodes: Vec<Arc<dyn StorageBackend>>,
-    ring: Ring,
+    placement: Placement,
     data_shards: usize,
     parity_shards: usize,
     write_quorum: usize,
 }
 
 impl ErasureCodedBackend {
-    /// Build over already-constructed node backends. Requires at least
-    /// `data_shards + parity_shards` nodes; with fewer, the scheme is clamped to
-    /// the node count (parity is reduced) so it stays consistent rather than
-    /// panicking. `write_quorum` is the number of shard writes that must ack;
-    /// `0` defaults to `data_shards + 1`, and it is clamped to
-    /// `[data_shards, k + m]` so a write that succeeds is always readable.
-    pub fn new(
-        nodes: Vec<Arc<dyn StorageBackend>>,
+    /// Build over a resolved [`Placement`] whose PG width is `data_shards +
+    /// parity_shards` (the gateway path). `write_quorum` `0` defaults to
+    /// `data_shards + 1`, clamped to `[data_shards, k + m]`.
+    pub fn from_placement(
+        placement: Placement,
         data_shards: usize,
         parity_shards: usize,
         write_quorum: usize,
     ) -> Self {
-        let n = nodes.len().max(1);
-        let ring = Ring::new(nodes.len(), VNODES);
-        let data_shards = data_shards.clamp(1, n);
-        let parity_shards = parity_shards.min(n - data_shards);
         let total = data_shards + parity_shards;
         let write_quorum = if write_quorum == 0 {
             (data_shards + 1).min(total)
@@ -71,16 +62,36 @@ impl ErasureCodedBackend {
             write_quorum.clamp(data_shards, total)
         };
         Self {
-            nodes,
-            ring,
+            placement,
             data_shards,
             parity_shards,
             write_quorum,
         }
     }
 
-    /// Connect (lazily) to each storage endpoint and build the backend. Errors if
-    /// there are fewer endpoints than `data_shards + parity_shards`.
+    /// Build over already-constructed node backends (node id = list index). With
+    /// fewer than `data_shards + parity_shards` nodes the scheme is clamped to the
+    /// node count (parity reduced) so it stays consistent. Used by tests.
+    pub fn new(
+        nodes: Vec<Arc<dyn StorageBackend>>,
+        data_shards: usize,
+        parity_shards: usize,
+        write_quorum: usize,
+    ) -> Self {
+        let n = nodes.len().max(1);
+        let data_shards = data_shards.clamp(1, n);
+        let parity_shards = parity_shards.min(n - data_shards);
+        let clients: HashMap<String, Arc<dyn StorageBackend>> = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, node)| (i.to_string(), node))
+            .collect();
+        let placement = Placement::local(clients, data_shards + parity_shards, DEFAULT_PG_COUNT);
+        Self::from_placement(placement, data_shards, parity_shards, write_quorum)
+    }
+
+    /// Connect (lazily) to each storage endpoint and build the backend (node id =
+    /// endpoint). Errors if there are fewer endpoints than `k + m`. Used by tests.
     pub async fn connect(
         endpoints: Vec<String>,
         data_shards: usize,
@@ -95,21 +106,24 @@ impl ErasureCodedBackend {
             )
             .into());
         }
-        let mut nodes: Vec<Arc<dyn StorageBackend>> = Vec::with_capacity(endpoints.len());
+        let mut clients: HashMap<String, Arc<dyn StorageBackend>> = HashMap::new();
         for ep in endpoints {
-            nodes.push(Arc::new(StorageClient::connect(ep).await?));
+            let client = StorageClient::connect(ep.clone()).await?;
+            clients.insert(ep, Arc::new(client));
         }
-        Ok(Self::new(nodes, data_shards, parity_shards, write_quorum))
+        let placement = Placement::local(clients, data_shards + parity_shards, DEFAULT_PG_COUNT);
+        Ok(Self::from_placement(
+            placement,
+            data_shards,
+            parity_shards,
+            write_quorum,
+        ))
     }
 
-    /// Total shards per object (`k + m`).
-    fn total(&self) -> usize {
-        self.data_shards + self.parity_shards
-    }
-
-    /// The placement node indices for an object: `k + m` distinct ring nodes.
-    fn placement(&self, object_id: ObjectId) -> Vec<usize> {
-        self.ring.replicas(object_id, self.total())
+    /// The ordered storage clients for an object's `k + m` shards (shard `i` →
+    /// position `i`).
+    fn placement(&self, object_id: ObjectId) -> Vec<Arc<dyn StorageBackend>> {
+        self.placement.nodes_for(object_id)
     }
 
     /// Split `data` into `k + m` shards: a length-prefixed, zero-padded payload
@@ -206,8 +220,8 @@ impl StorageBackend for ErasureCodedBackend {
         let placement = self.placement(object_id);
         let mut acks = 0;
         let mut last_err = None;
-        for (i, &node) in placement.iter().enumerate() {
-            match self.nodes[node].put(object_id, &shards[i]) {
+        for (i, node) in placement.iter().enumerate() {
+            match node.put(object_id, &shards[i]) {
                 Ok(()) => acks += 1,
                 Err(e) => last_err = Some(e),
             }
@@ -224,8 +238,8 @@ impl StorageBackend for ErasureCodedBackend {
         let placement = self.placement(object_id);
         let mut present: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut last_err = None;
-        for (idx, &node) in placement.iter().enumerate() {
-            match self.nodes[node].get(object_id, None) {
+        for (idx, node) in placement.iter().enumerate() {
+            match node.get(object_id, None) {
                 Ok(shard) => present.push((idx, shard)),
                 Err(Error::ObjectNotFound(_)) => {}
                 Err(e) => last_err = Some(e),
@@ -265,8 +279,8 @@ impl StorageBackend for ErasureCodedBackend {
     fn delete(&self, object_id: ObjectId) -> Result<()> {
         let mut acks = 0;
         let mut last_err = None;
-        for &node in &self.placement(object_id) {
-            match self.nodes[node].delete(object_id) {
+        for node in self.placement(object_id) {
+            match node.delete(object_id) {
                 Ok(()) => acks += 1,
                 Err(e) => last_err = Some(e),
             }
@@ -279,14 +293,14 @@ impl StorageBackend for ErasureCodedBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        for node in &self.nodes {
+        for node in self.placement.all_nodes() {
             node.sync()?;
         }
         Ok(())
     }
 
     fn checkpoint(&self) -> Result<()> {
-        for node in &self.nodes {
+        for node in self.placement.all_nodes() {
             node.checkpoint()?;
         }
         Ok(())

@@ -1,67 +1,73 @@
 //! N-way quorum replication across storage nodes.
 //!
 //! [`ReplicatedBackend`] is a `StorageBackend` the gateway uses in place of a
-//! single storage node. A write fans out to the object's `replication_factor`
-//! replica nodes (chosen by the consistent-hash [`Ring`]) and succeeds once
-//! `write_quorum` of them durably ack; a read tries the replicas in turn and
-//! returns the first success (failover). The metadata remains the authority for
-//! what is committed, so replication needs no consensus (see `docs/M2_DESIGN.md`
-//! §5).
+//! single storage node. A write fans out to the object's replica nodes (resolved
+//! through the placement-group [`Placement`]) and succeeds once `write_quorum` of
+//! them durably ack; a read tries the replicas in turn and returns the first
+//! success (failover), repairing any that are up but missing the object. The
+//! metadata remains the authority for what is committed, so replication needs no
+//! consensus (see `docs/M2_DESIGN.md` §5).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use soma_backend::{ByteRange, Error, Result, StorageBackend};
 use soma_core::ObjectId;
 
-use crate::ring::Ring;
+use crate::placement::{Placement, DEFAULT_PG_COUNT};
 use crate::StorageClient;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Number of virtual points per node on the ring.
-const VNODES: usize = 64;
-
-/// A quorum-replicated storage backend over a fixed set of storage nodes.
+/// A quorum-replicated storage backend over a placement-group map.
 pub struct ReplicatedBackend {
-    nodes: Vec<Arc<dyn StorageBackend>>,
-    ring: Ring,
-    replication_factor: usize,
+    placement: Placement,
     write_quorum: usize,
 }
 
 impl ReplicatedBackend {
-    /// Build over already-constructed node backends.
-    pub fn new(nodes: Vec<Arc<dyn StorageBackend>>, rf: usize, wq: usize) -> Self {
-        let n = nodes.len();
-        let ring = Ring::new(n, VNODES);
-        let replication_factor = rf.min(n).max(1);
-        let write_quorum = wq.min(replication_factor).max(1);
+    /// Build over a resolved [`Placement`] (the gateway path). `write_quorum` is
+    /// clamped to `[1, node_count]`.
+    pub fn from_placement(placement: Placement, write_quorum: usize) -> Self {
+        let write_quorum = write_quorum.clamp(1, placement.node_count().max(1));
         Self {
-            nodes,
-            ring,
-            replication_factor,
+            placement,
             write_quorum,
         }
     }
 
-    /// Connect (lazily) to each storage endpoint and build the replicated backend.
+    /// Build over an explicit list of node backends (node id = list index). Used by
+    /// tests and any no-metadata path. `rf` is the replica width.
+    pub fn new(nodes: Vec<Arc<dyn StorageBackend>>, rf: usize, wq: usize) -> Self {
+        let clients: HashMap<String, Arc<dyn StorageBackend>> = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (i.to_string(), n))
+            .collect();
+        let width = rf.clamp(1, clients.len().max(1));
+        Self::from_placement(Placement::local(clients, width, DEFAULT_PG_COUNT), wq)
+    }
+
+    /// Connect (lazily) to each storage endpoint and build the replicated backend
+    /// (node id = endpoint). Used by tests / the no-metadata path.
     pub async fn connect(
         endpoints: Vec<String>,
         rf: usize,
         wq: usize,
     ) -> std::result::Result<Self, BoxError> {
-        let mut nodes: Vec<Arc<dyn StorageBackend>> = Vec::with_capacity(endpoints.len());
-        for ep in endpoints {
-            nodes.push(Arc::new(StorageClient::connect(ep).await?));
-        }
-        if nodes.is_empty() {
+        if endpoints.is_empty() {
             return Err("no storage endpoints configured".into());
         }
-        Ok(Self::new(nodes, rf, wq))
-    }
-
-    fn replicas(&self, object_id: ObjectId) -> Vec<usize> {
-        self.ring.replicas(object_id, self.replication_factor)
+        let mut clients: HashMap<String, Arc<dyn StorageBackend>> = HashMap::new();
+        for ep in endpoints {
+            let client = StorageClient::connect(ep.clone()).await?;
+            clients.insert(ep, Arc::new(client));
+        }
+        let width = rf.clamp(1, clients.len());
+        Ok(Self::from_placement(
+            Placement::local(clients, width, DEFAULT_PG_COUNT),
+            wq,
+        ))
     }
 }
 
@@ -69,8 +75,8 @@ impl StorageBackend for ReplicatedBackend {
     fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
         let mut acks = 0;
         let mut last_err = None;
-        for &node in &self.replicas(object_id) {
-            match self.nodes[node].put(object_id, data) {
+        for node in self.placement.nodes_for(object_id) {
+            match node.put(object_id, data) {
                 Ok(()) => acks += 1,
                 Err(e) => last_err = Some(e),
             }
@@ -88,14 +94,14 @@ impl StorageBackend for ReplicatedBackend {
     }
 
     fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
-        let replicas = self.replicas(object_id);
+        let replicas = self.placement.nodes_for(object_id);
 
         // Ranged reads: fail over to the first replica that has the bytes; no
         // repair (we don't hold the full object to rewrite).
         if range.is_some() {
             let mut last_err = None;
-            for &node in &replicas {
-                match self.nodes[node].get(object_id, range) {
+            for node in &replicas {
+                match node.get(object_id, range) {
                     Ok(data) => return Ok(data),
                     Err(e) => last_err = Some(e),
                 }
@@ -105,26 +111,24 @@ impl StorageBackend for ReplicatedBackend {
 
         // Full reads: query every replica so read-repair can refill any that are
         // up but missing the object (e.g. a node that was down during the write).
-        // (This trades read amplification for self-heal; a background/async repair
-        // pass is a later optimization.)
         let mut found: Option<Vec<u8>> = None;
         let mut missing = Vec::new();
         let mut last_err = None;
-        for &node in &replicas {
-            match self.nodes[node].get(object_id, None) {
+        for node in &replicas {
+            match node.get(object_id, None) {
                 Ok(data) => {
                     if found.is_none() {
                         found = Some(data);
                     }
                 }
-                Err(Error::ObjectNotFound(_)) => missing.push(node),
+                Err(Error::ObjectNotFound(_)) => missing.push(node.clone()),
                 Err(e) => last_err = Some(e),
             }
         }
         let data = found.ok_or_else(|| last_err.unwrap_or(Error::ObjectNotFound(object_id)))?;
         // Read-repair: best-effort rewrite to replicas that lacked the object.
-        for &node in &missing {
-            let _ = self.nodes[node].put(object_id, &data);
+        for node in &missing {
+            let _ = node.put(object_id, &data);
         }
         Ok(data)
     }
@@ -132,8 +136,8 @@ impl StorageBackend for ReplicatedBackend {
     fn delete(&self, object_id: ObjectId) -> Result<()> {
         let mut acks = 0;
         let mut last_err = None;
-        for &node in &self.replicas(object_id) {
-            match self.nodes[node].delete(object_id) {
+        for node in self.placement.nodes_for(object_id) {
+            match node.delete(object_id) {
                 Ok(()) => acks += 1,
                 Err(e) => last_err = Some(e),
             }
@@ -146,14 +150,14 @@ impl StorageBackend for ReplicatedBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        for node in &self.nodes {
+        for node in self.placement.all_nodes() {
             node.sync()?;
         }
         Ok(())
     }
 
     fn checkpoint(&self) -> Result<()> {
-        for node in &self.nodes {
+        for node in self.placement.all_nodes() {
             node.checkpoint()?;
         }
         Ok(())

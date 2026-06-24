@@ -22,6 +22,7 @@ pub mod pb {
 mod bridge;
 mod erasure;
 mod meta;
+mod placement;
 mod replicated;
 mod ring;
 mod storage;
@@ -29,5 +30,6 @@ mod wire;
 
 pub use erasure::ErasureCodedBackend;
 pub use meta::{serve_meta, MetaClient};
+pub use placement::{compute_pg_table, Placement, DEFAULT_PG_COUNT};
 pub use replicated::ReplicatedBackend;
 pub use storage::{serve_storage, StorageClient};

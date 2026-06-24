@@ -19,11 +19,8 @@ data:
     meta_endpoint = "{{ include "soma.metaEndpoint" . }}"
     replication_factor = {{ .Values.replication.factor }}
     write_quorum = {{ .Values.replication.writeQuorum }}
-    storage_endpoints = [
-    {{- range $i := until (int .Values.storage.replicaCount) }}
-      "http://{{ include "soma.storageName" $ }}-{{ $i }}.{{ include "soma.storageHeadless" $ }}.{{ $.Release.Namespace }}.svc:{{ $.Values.ports.storage }}",
-    {{- end }}
-    ]
+    # The gateway discovers its storage node set from the cluster membership
+    # table (storage nodes self-register), not from static endpoints.
 
     [cache]
     enabled = {{ .Values.config.cache.enabled }}

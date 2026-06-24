@@ -929,3 +929,101 @@ async fn membership_and_pg_table_over_grpc() {
     .await
     .unwrap();
 }
+
+/// Stand up a cluster whose gateway resolves placement from **cluster membership**
+/// (the M3a-placement path): storage nodes register, the gateway builds its
+/// `Placement` via `from_membership` (seeding + reading the PG table), and serves.
+async fn membership_cluster(num_storage: usize, rf: usize, wq: usize) -> Cluster {
+    use soma_cluster::{
+        serve_meta, serve_storage, MetaClient, Placement, ReplicatedBackend, DEFAULT_PG_COUNT,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let meta_port = free_port();
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    let ms = meta_store.clone();
+    let meta_handle = tokio::spawn(async move {
+        let _ = serve_meta(sock(meta_port), ms).await;
+    });
+
+    let mut storage = Vec::new();
+    let mut nodes = Vec::new();
+    for i in 0..num_storage {
+        let port = free_port();
+        let sdir = dir.path().join(format!("storage-{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        storage.push(tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        }));
+        nodes.push((format!("node-{i}"), format!("http://127.0.0.1:{port}")));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let meta_client = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    // Storage nodes self-register (here driven explicitly); use a fixed clock so
+    // they read as live when the gateway resolves placement.
+    let now = 1_000_000u64;
+    {
+        let c = meta_client.clone();
+        let regs = nodes.clone();
+        tokio::task::spawn_blocking(move || {
+            for (id, ep) in &regs {
+                c.register_node(id, ep, now).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    let placement = Placement::from_membership(meta_client.clone(), rf, DEFAULT_PG_COUNT, now)
+        .await
+        .unwrap();
+    let repl: Arc<dyn StorageBackend> = Arc::new(ReplicatedBackend::from_placement(placement, wq));
+    let meta: Arc<dyn MetadataStore> = meta_client;
+    let svc = S3Service::new(meta, repl, Credentials::single("AK", "SK"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    let s3 = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+
+    Cluster {
+        _dir: dir,
+        s3_port,
+        storage,
+        _meta: meta_handle,
+        _s3: s3,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_driven_gateway_roundtrip_and_failover() {
+    let c = membership_cluster(3, 3, 2).await; // RF=3, W=2, placement from membership
+    let store = client(c.s3_port);
+
+    let key = OPath::from("via-membership.bin");
+    let payload = b"placed through the PG table resolved from cluster membership".to_vec();
+    store
+        .put(&key, PutPayload::from(payload.clone()))
+        .await
+        .unwrap();
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), payload.as_slice());
+
+    // Kill a node; the gateway's PG-table placement still serves via failover.
+    c.storage[0].abort();
+    settle().await;
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), payload.as_slice());
+}
