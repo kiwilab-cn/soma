@@ -30,6 +30,8 @@ tracing.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+object_store.workspace = true
+futures.workspace = true
 
 [lints]
 workspace = true

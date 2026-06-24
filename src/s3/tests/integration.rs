@@ -1,0 +1,202 @@
+//! Acceptance tests: drive a real running soma-server (over a TCP socket) with
+//! the independent `object_store` S3 client — validating SigV4 and the S3 wire
+//! protocol against a third-party implementation — plus full-stack restart
+//! recovery.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::path::Path;
+use std::sync::Arc;
+
+use futures::StreamExt;
+use object_store::aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut};
+use object_store::path::Path as OPath;
+use object_store::{MultipartUpload, ObjectStore, PutMode, PutOptions, PutPayload};
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
+
+use soma_backend::{BackendConfig, LocalFsBackend, StorageBackend};
+use soma_meta::{BucketOpts, MetadataStore, RedbMetaStore};
+use soma_s3::{router, Credentials, S3Service};
+
+const BUCKET: &str = "testbucket";
+
+/// Open the stores at `dir` and serve on an ephemeral port; returns the port and
+/// the server task handle. Optionally creates the test bucket first.
+async fn serve(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) {
+    let meta = Arc::new(RedbMetaStore::open(dir.join("meta.redb")).unwrap());
+    if create_bucket {
+        meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    }
+    let backend = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
+    let meta: Arc<dyn MetadataStore> = meta;
+    let backend: Arc<dyn StorageBackend> = backend;
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    (port, handle)
+}
+
+/// Stop a server task and wait for it to fully drop (releasing the redb file).
+async fn stop(handle: JoinHandle<()>) {
+    handle.abort();
+    let _ = handle.await;
+}
+
+fn client(port: u16) -> AmazonS3 {
+    AmazonS3Builder::new()
+        .with_endpoint(format!("http://127.0.0.1:{port}"))
+        .with_region("us-east-1")
+        .with_bucket_name(BUCKET)
+        .with_access_key_id("AK")
+        .with_secret_access_key("SK")
+        .with_allow_http(true)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn object_store_crud_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve(dir.path(), true).await;
+    let store = client(port);
+
+    // PUT + GET.
+    let key = OPath::from("docs/greeting.txt");
+    let payload = b"hello soma via object_store";
+    store
+        .put(&key, PutPayload::from_static(payload))
+        .await
+        .unwrap();
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), payload);
+
+    // HEAD (size + etag).
+    let meta = store.head(&key).await.unwrap();
+    assert_eq!(meta.size, payload.len() as u64);
+    assert!(meta.e_tag.is_some());
+
+    // Range GET.
+    let part = store.get_range(&key, 6u64..10).await.unwrap();
+    assert_eq!(part.as_ref(), b"soma");
+
+    // LIST by prefix.
+    store
+        .put(
+            &OPath::from("docs/other.txt"),
+            PutPayload::from_static(b"x"),
+        )
+        .await
+        .unwrap();
+    store
+        .put(&OPath::from("root.txt"), PutPayload::from_static(b"y"))
+        .await
+        .unwrap();
+    let mut keys: Vec<String> = store
+        .list(Some(&OPath::from("docs")))
+        .map(|r| r.unwrap().location.to_string())
+        .collect::<Vec<_>>()
+        .await;
+    keys.sort();
+    assert_eq!(keys, vec!["docs/greeting.txt", "docs/other.txt"]);
+
+    // DELETE → subsequent GET is NotFound.
+    store.delete(&key).await.unwrap();
+    assert!(matches!(
+        store.get(&key).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    stop(handle).await;
+}
+
+#[tokio::test]
+async fn object_store_conditional_create() {
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve(dir.path(), true).await;
+    let store = client(port);
+
+    let key = OPath::from("once.txt");
+    let create = || PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+
+    // First create succeeds; second fails (AlreadyExists).
+    store
+        .put_opts(&key, PutPayload::from_static(b"v1"), create())
+        .await
+        .unwrap();
+    let second = store
+        .put_opts(&key, PutPayload::from_static(b"v2"), create())
+        .await;
+    assert!(matches!(
+        second,
+        Err(object_store::Error::AlreadyExists { .. })
+    ));
+
+    stop(handle).await;
+}
+
+#[tokio::test]
+async fn object_store_multipart() {
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve(dir.path(), true).await;
+    let store = client(port);
+
+    let key = OPath::from("big.bin");
+    let mut upload = store.put_multipart(&key).await.unwrap();
+    let part1 = vec![1u8; 6 * 1024 * 1024]; // >5 MiB so object_store flushes a part
+    let part2 = vec![2u8; 1024];
+    upload
+        .put_part(PutPayload::from(part1.clone()))
+        .await
+        .unwrap();
+    upload
+        .put_part(PutPayload::from(part2.clone()))
+        .await
+        .unwrap();
+    upload.complete().await.unwrap();
+
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let mut expected = part1;
+    expected.extend_from_slice(&part2);
+    assert_eq!(got.len(), expected.len());
+    assert_eq!(got.as_ref(), expected.as_slice());
+
+    stop(handle).await;
+}
+
+#[tokio::test]
+async fn full_stack_restart_persists_data() {
+    let dir = TempDir::new().unwrap();
+
+    // First boot: write an object, then stop the server.
+    let key = OPath::from("durable/object.dat");
+    let payload = b"survive the restart";
+    {
+        let (port, handle) = serve(dir.path(), true).await;
+        let store = client(port);
+        store
+            .put(&key, PutPayload::from_static(payload))
+            .await
+            .unwrap();
+        store.head(&key).await.unwrap(); // committed
+        stop(handle).await;
+    }
+
+    // Second boot on the SAME data dir (bucket already exists): the object is
+    // still readable — metadata persisted (redb) and bytes recovered from the
+    // volume + .idx.
+    {
+        let (port, handle) = serve(dir.path(), false).await;
+        let store = client(port);
+        let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(got.as_ref(), payload);
+        stop(handle).await;
+    }
+}

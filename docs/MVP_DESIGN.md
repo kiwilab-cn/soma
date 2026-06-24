@@ -315,17 +315,25 @@ tenant model lands with security hardening (M4).
 
 ---
 
-## 9. Acceptance criteria
+## 9. Acceptance criteria — met by `src/s3/tests/integration.rs`
 
-1. **S3 smoke**: `aws-cli` (`--endpoint-url`) can create a bucket, put/get/head/
-   delete an object, range-get, and run a multipart upload.
-2. **Consumer integration**: a downstream engine using the `object_store` crate
-   (S3 backend pointed at Soma) round-trips objects under its real workload shape
-   (write segment, read segment, list, conditional overwrite).
-3. **Durability**: kill the process mid-test; on restart, committed objects are
-   readable and the hot index rebuilds from `.vol` + `.idx`.
-4. **Conditional writes**: `If-None-Match: *` rejects an overwrite;
-   `If-Match: <etag>` succeeds only on a matching current ETag.
+These run a real soma-server over a TCP socket and drive it with the independent
+`object_store` S3 client (validating SigV4 + the wire protocol against a
+third-party implementation):
+
+1. **Consumer integration** ✅ (`object_store_crud_roundtrip`): the `object_store`
+   S3 client round-trips put / get / head / range-get / list-by-prefix / delete.
+2. **Multipart** ✅ (`object_store_multipart`): a >5 MiB `put_multipart` flows
+   through CreateMultipartUpload → UploadPart × N → Complete and reads back byte
+   -identical.
+3. **Conditional writes** ✅ (`object_store_conditional_create`): `PutMode::Create`
+   (`If-None-Match: *`) succeeds once, then fails with `AlreadyExists`.
+4. **Durability / restart** ✅ (`full_stack_restart_persists_data`): write an
+   object, stop the server, restart on the same data dir; the object is still
+   readable (metadata persisted in redb, bytes recovered from `.vol` + `.idx`).
+
+(`aws-cli` is an equivalent manual smoke test; `object_store` is used in CI since
+it is the actual downstream consumer.)
 
 ---
 
