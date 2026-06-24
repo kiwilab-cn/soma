@@ -9,8 +9,15 @@ data:
     role = "meta"
     listen = "0.0.0.0:{{ .Values.ports.meta }}"
     data_dir = {{ .Values.config.dataDir | quote }}
-    # The rebalance controller (meta role) uses the replica factor as the PG width.
+    # The rebalance controller (meta role) needs the durability mode: replica
+    # factor for replication, or k+m for erasure (which decides how it reconstructs
+    # data during migration / self-heal).
     replication_factor = {{ .Values.replication.factor }}
+
+    [erasure]
+    enabled = {{ .Values.erasure.enabled }}
+    data_shards = {{ .Values.erasure.dataShards }}
+    parity_shards = {{ .Values.erasure.parityShards }}
 
     [rebalance]
     enabled = {{ .Values.rebalance.enabled }}

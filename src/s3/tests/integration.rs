@@ -1144,7 +1144,7 @@ async fn scale_out_rebalances_data_to_new_node() {
     register_nodes(&meta_client, &nodes[2..3], now).await;
     let controller = RebalanceController::new(
         store.clone(),
-        2,
+        soma_cluster::Durability::Replicated { factor: 2 },
         DEFAULT_PG_COUNT,
         Duration::ZERO,
         1000,
@@ -1308,7 +1308,7 @@ async fn node_loss_re_replicates_to_survivors() {
     // Controller with down_after=100s: at `later`, node-2 is stale → Down.
     let controller = RebalanceController::new(
         f.store.clone(),
-        2,
+        soma_cluster::Durability::Replicated { factor: 2 },
         DEFAULT_PG_COUNT,
         Duration::ZERO,
         1000,
@@ -1370,7 +1370,7 @@ async fn drain_migrates_data_off_a_node() {
 
     let controller = RebalanceController::new(
         f.store.clone(),
-        2,
+        soma_cluster::Durability::Replicated { factor: 2 },
         DEFAULT_PG_COUNT,
         Duration::ZERO,
         1000,
@@ -1410,4 +1410,147 @@ async fn drain_migrates_data_off_a_node() {
         on_drained, 0,
         "drained node still holds {on_drained} objects"
     );
+}
+
+/// Erasure-coded node loss: a `Down` node's shards are reconstructed (from k
+/// survivors) onto a spare, restoring the full shard count on live nodes — the
+/// reconstruction deferred from M4b, landing in M3d.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn erasure_node_loss_reconstructs_shards() {
+    use soma_cluster::{
+        serve_meta, serve_storage, Durability, ErasureCodedBackend, MetaClient, Placement,
+        RebalanceController, DEFAULT_PG_COUNT,
+    };
+    use std::time::Duration;
+
+    let (k, m) = (2usize, 2usize);
+    let width = k + m; // 4 shards
+    let total_nodes = 5; // one spare beyond k+m so a lost slot can be repaired
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    store.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let meta_port = free_port();
+    {
+        let s: Arc<dyn MetadataStore> = store.clone();
+        tokio::spawn(async move {
+            let _ = serve_meta(sock(meta_port), s).await;
+        });
+    }
+
+    let mut backends: Vec<Arc<dyn StorageBackend>> = Vec::new();
+    let mut storage_tasks = Vec::new();
+    let mut nodes = Vec::new();
+    for i in 0..total_nodes {
+        let port = free_port();
+        let sdir = dir.path().join(format!("s{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        backends.push(backend.clone());
+        storage_tasks.push(tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        }));
+        nodes.push((format!("node-{i}"), format!("http://127.0.0.1:{port}")));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta_client = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    let t0 = 1_000_000u64;
+    register_nodes(&meta_client, &nodes, t0).await;
+
+    let placement = Placement::from_membership(meta_client.clone(), width, DEFAULT_PG_COUNT, t0)
+        .await
+        .unwrap();
+    let ec: Arc<dyn StorageBackend> = Arc::new(ErasureCodedBackend::from_placement(
+        placement.clone(),
+        k,
+        m,
+        0,
+    ));
+    let meta_dyn: Arc<dyn MetadataStore> = meta_client.clone();
+    let svc = S3Service::new(meta_dyn, ec, Credentials::single("AK", "SK"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    let api = client(s3_port);
+
+    let n = 12usize;
+    let body = |i: usize| format!("erasure-object-{i}-with-some-payload-bytes").into_bytes();
+    for i in 0..n {
+        api.put(&OPath::from(format!("obj-{i}")), PutPayload::from(body(i)))
+            .await
+            .unwrap();
+    }
+    let object_ids = store.list_object_ids().unwrap();
+
+    // node-4 dies: stop it, keep the survivors heartbeating.
+    storage_tasks[4].abort();
+    let later = t0 + 1000;
+    heartbeat_nodes(
+        &meta_client,
+        &[
+            "node-0".into(),
+            "node-1".into(),
+            "node-2".into(),
+            "node-3".into(),
+        ],
+        later,
+    )
+    .await;
+
+    // Erasure controller: the Down sweep excludes node-4; the mover reconstructs
+    // its shards onto the spare.
+    let controller = RebalanceController::new(
+        store.clone(),
+        Durability::Erasure {
+            data_shards: k,
+            parity_shards: m,
+        },
+        DEFAULT_PG_COUNT,
+        Duration::ZERO,
+        1000,
+        100,
+    );
+    let mut iters = 0;
+    loop {
+        placement.refresh(&meta_client, later).await.unwrap();
+        let r = controller.reconcile_once(later).await.unwrap();
+        iters += 1;
+        if r.migrating == 0 && iters > 1 {
+            break;
+        }
+        assert!(iters < 100, "erasure self-heal did not converge");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    placement.refresh(&meta_client, later).await.unwrap();
+
+    // Every object still reconstructs through the gateway after the loss + repair.
+    for i in 0..n {
+        let got = api
+            .get(&OPath::from(format!("obj-{i}")))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), body(i).as_slice());
+    }
+    // Each object now has all k+m shards on the four live nodes (node-4 excluded):
+    // reconstruction restored full durability.
+    for &oid in &object_ids {
+        let live_shards = (0..4)
+            .filter(|&j| backends[j].get(oid, None).is_ok())
+            .count();
+        assert_eq!(
+            live_shards, width,
+            "object {oid} not fully reconstructed: {live_shards}/{width}"
+        );
+    }
 }

@@ -21,6 +21,7 @@ pub mod pb {
 
 mod bridge;
 mod controller;
+mod ec;
 mod erasure;
 mod meta;
 mod placement;
@@ -29,7 +30,7 @@ mod ring;
 mod storage;
 mod wire;
 
-pub use controller::{RebalanceController, ReconcileReport};
+pub use controller::{Durability, RebalanceController, ReconcileReport};
 pub use erasure::ErasureCodedBackend;
 pub use meta::{serve_meta, MetaClient};
 pub use placement::{compute_pg_table, Placement, DEFAULT_PG_COUNT};

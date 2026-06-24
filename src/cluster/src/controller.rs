@@ -49,11 +49,36 @@ pub struct ReconcileReport {
     pub migrating: usize,
 }
 
+/// How the cluster stores data, which decides how the mover moves it.
+#[derive(Debug, Clone, Copy)]
+pub enum Durability {
+    /// N-way replication; the mover copies whole objects (M3b).
+    Replicated { factor: usize },
+    /// Reed-Solomon `k+m`; the mover reconstructs shards for repaired slots (M3d).
+    Erasure {
+        data_shards: usize,
+        parity_shards: usize,
+    },
+}
+
+impl Durability {
+    /// Nodes per placement group.
+    fn width(&self) -> usize {
+        match self {
+            Durability::Replicated { factor } => *factor,
+            Durability::Erasure {
+                data_shards,
+                parity_shards,
+            } => data_shards + parity_shards,
+        }
+    }
+}
+
 struct Inner {
     store: Arc<RedbMetaStore>,
     clients: RwLock<HashMap<String, Arc<dyn StorageBackend>>>,
     started: Mutex<HashMap<u32, Instant>>,
-    width: usize,
+    durability: Durability,
     pg_count: u32,
     settle: Duration,
     max_copies_per_pass: usize,
@@ -67,14 +92,14 @@ pub struct RebalanceController {
 }
 
 impl RebalanceController {
-    /// Create a controller over the concrete metadata store. `width` is the
-    /// replica factor; `settle` is the minimum time a PG migrates before it may
-    /// finalize (≥ the gateway refresh interval); `max_copies_per_pass` throttles
-    /// the mover.
+    /// Create a controller over the concrete metadata store. `durability` decides
+    /// PG width and how the mover moves data; `settle` is the minimum time a PG
+    /// migrates before it may finalize (≥ the gateway refresh interval);
+    /// `max_copies_per_pass` throttles the mover.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<RedbMetaStore>,
-        width: usize,
+        durability: Durability,
         pg_count: u32,
         settle: Duration,
         max_copies_per_pass: usize,
@@ -85,7 +110,7 @@ impl RebalanceController {
                 store,
                 clients: RwLock::new(HashMap::new()),
                 started: Mutex::new(HashMap::new()),
-                width,
+                durability,
                 pg_count,
                 settle,
                 max_copies_per_pass,
@@ -175,19 +200,29 @@ impl RebalanceController {
             return Ok(report);
         }
 
-        let target_table: HashMap<u32, Vec<String>> =
-            compute_pg_table(&node_ids, inner.width.min(node_ids.len()), inner.pg_count)
+        let width = inner.durability.width().min(node_ids.len());
+        // Replication targets come straight from the ring; erasure targets are a
+        // slot-preserving repair (computed per PG below) so surviving shards never
+        // move (which would corrupt in-flight reads).
+        let ring_targets: HashMap<u32, Vec<String>> = match inner.durability {
+            Durability::Replicated { .. } => compute_pg_table(&node_ids, width, inner.pg_count)
                 .into_iter()
                 .map(|(pg, p)| (pg, p.node_ids))
-                .collect();
+                .collect(),
+            Durability::Erasure { .. } => HashMap::new(),
+        };
         let table = inner.store.list_pg_table()?;
         let clients = inner.clients.read().clone();
         let object_ids = inner.store.list_object_ids()?;
         let mut budget = inner.max_copies_per_pass;
 
         for (pg, placement) in &table {
+            let desired = match inner.durability {
+                Durability::Replicated { .. } => ring_targets.get(pg).cloned().unwrap_or_default(),
+                Durability::Erasure { .. } => ec_target(&placement.node_ids, &node_ids, width),
+            };
+
             if !placement.is_migrating() {
-                let desired = target_table.get(pg).cloned().unwrap_or_default();
                 if !desired.is_empty() && placement.node_ids != desired {
                     inner.store.begin_migration(*pg, desired)?;
                     inner.started.lock().insert(*pg, Instant::now());
@@ -198,15 +233,31 @@ impl RebalanceController {
             }
 
             report.migrating += 1;
-            let (done, copied) = migrate_pg(
-                *pg,
-                &placement.node_ids,
-                &placement.target,
-                &object_ids,
-                &clients,
-                inner.pg_count,
-                &mut budget,
-            )?;
+            let (done, copied) = match inner.durability {
+                Durability::Replicated { .. } => migrate_pg(
+                    *pg,
+                    &placement.node_ids,
+                    &placement.target,
+                    &object_ids,
+                    &clients,
+                    inner.pg_count,
+                    &mut budget,
+                )?,
+                Durability::Erasure {
+                    data_shards,
+                    parity_shards,
+                } => migrate_pg_ec(
+                    *pg,
+                    &placement.node_ids,
+                    &placement.target,
+                    &object_ids,
+                    &clients,
+                    data_shards,
+                    parity_shards,
+                    inner.pg_count,
+                    &mut budget,
+                )?,
+            };
             report.copied += copied;
 
             let settled = {
@@ -294,6 +345,120 @@ fn migrate_pg(
             }
             if let Some(c) = clients.get(&home) {
                 c.put(oid, &bytes)?;
+                copied += 1;
+                *budget -= 1;
+            }
+        }
+    }
+    Ok((all_present, copied))
+}
+
+/// Slot-preserving erasure target: keep acting nodes that are still active at
+/// their slots, and fill each inactive slot with a spare active node. Surviving
+/// shards stay put (only repaired slots move), so erasure migration never reorders
+/// shards. Returns `acting` unchanged when every slot is healthy (so a pure
+/// scale-out triggers no erasure migration).
+fn ec_target(acting: &[String], active: &[String], _width: usize) -> Vec<String> {
+    use std::collections::HashSet;
+    let active_set: HashSet<&String> = active.iter().collect();
+    let mut result = acting.to_vec();
+    let in_use: HashSet<String> = result
+        .iter()
+        .filter(|n| active_set.contains(n))
+        .cloned()
+        .collect();
+    let mut spares: Vec<String> = active
+        .iter()
+        .filter(|n| !in_use.contains(*n))
+        .cloned()
+        .collect();
+    spares.sort();
+    let mut next = 0;
+    for slot in result.iter_mut() {
+        // Replace an inactive node's slot with a spare, if one is available;
+        // otherwise leave it (degraded, retried on a later pass).
+        if !active_set.contains(slot) && next < spares.len() {
+            *slot = spares[next].clone();
+            next += 1;
+        }
+    }
+    result
+}
+
+/// Reconstruct an erasure-coded PG's shards onto repaired slots (M3d). For each
+/// slot whose node changed, the new node needs that slot's shard: gather `k`
+/// surviving shards, reconstruct the full set, and write the one shard. Surviving
+/// slots are untouched. Returns `(done, copied)`.
+#[allow(clippy::too_many_arguments)]
+fn migrate_pg_ec(
+    pg: u32,
+    acting: &[String],
+    target: &[String],
+    object_ids: &[u64],
+    clients: &HashMap<String, Arc<dyn StorageBackend>>,
+    k: usize,
+    m: usize,
+    pg_count: u32,
+    budget: &mut usize,
+) -> Result<(bool, usize), BoxError> {
+    let changed: Vec<usize> = (0..target.len())
+        .filter(|&i| acting.get(i) != Some(&target[i]))
+        .collect();
+    if changed.is_empty() {
+        return Ok((true, 0));
+    }
+
+    let mut copied = 0;
+    let mut all_present = true;
+    for &oid in object_ids {
+        if (hash64(&oid) % pg_count.max(1) as u64) as u32 != pg {
+            continue;
+        }
+        // Which repaired slots' new node still lacks its shard?
+        let mut needed = Vec::new();
+        for &i in &changed {
+            match clients.get(&target[i]).map(|c| c.get(oid, None)) {
+                Some(Ok(_)) => {}
+                Some(Err(BackendError::ObjectNotFound(_))) => needed.push(i),
+                _ => all_present = false,
+            }
+        }
+        if needed.is_empty() {
+            continue;
+        }
+        if *budget == 0 {
+            return Ok((false, copied));
+        }
+        // Gather k surviving shards (acting node j holds shard j).
+        let mut present: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (j, node) in acting.iter().enumerate() {
+            if present.len() >= k {
+                break;
+            }
+            if let Some(c) = clients.get(node) {
+                if let Ok(shard) = c.get(oid, None) {
+                    present.push((j, shard));
+                }
+            }
+        }
+        if present.len() < k {
+            all_present = false;
+            continue;
+        }
+        let shards = match crate::ec::reconstruct_all_shards(present, k, m) {
+            Ok(s) => s,
+            Err(_) => {
+                all_present = false;
+                continue;
+            }
+        };
+        for i in needed {
+            if *budget == 0 {
+                all_present = false;
+                break;
+            }
+            if let (Some(c), Some(shard)) = (clients.get(&target[i]), shards.get(i)) {
+                c.put(oid, shard)?;
                 copied += 1;
                 *budget -= 1;
             }

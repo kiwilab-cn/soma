@@ -16,8 +16,8 @@ use soma_backend::{
     StorageBackend,
 };
 use soma_cluster::{
-    serve_meta, serve_storage, ErasureCodedBackend, MetaClient, Placement, RebalanceController,
-    ReplicatedBackend, DEFAULT_PG_COUNT,
+    serve_meta, serve_storage, Durability, ErasureCodedBackend, MetaClient, Placement,
+    RebalanceController, ReplicatedBackend, DEFAULT_PG_COUNT,
 };
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, QosPolicy, S3Service};
@@ -270,9 +270,19 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
     // The rebalance controller reconciles placement toward live membership and
     // moves data for migrating PGs (throttled). It needs the concrete store.
     if cfg.rebalance.enabled {
+        let durability = if cfg.erasure.enabled {
+            Durability::Erasure {
+                data_shards: cfg.erasure.data_shards,
+                parity_shards: cfg.erasure.parity_shards,
+            }
+        } else {
+            Durability::Replicated {
+                factor: cfg.replication_factor,
+            }
+        };
         let controller = RebalanceController::new(
             store.clone(),
-            cfg.replication_factor,
+            durability,
             DEFAULT_PG_COUNT,
             std::time::Duration::from_secs(cfg.rebalance.settle_secs),
             cfg.rebalance.max_copies_per_pass,
@@ -282,6 +292,7 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
             interval_secs = cfg.rebalance.interval_secs,
             settle_secs = cfg.rebalance.settle_secs,
             max_copies_per_pass = cfg.rebalance.max_copies_per_pass,
+            durability = ?durability,
             "rebalance controller enabled"
         );
         tokio::spawn(controller.run(std::time::Duration::from_secs(
