@@ -47,6 +47,8 @@ pub struct ReconcileReport {
     pub finalized: usize,
     /// PGs still migrating after this pass.
     pub migrating: usize,
+    /// Orphaned object ids reclaimed (deleted from storage nodes) this pass.
+    pub gc: usize,
 }
 
 /// How the cluster stores data, which decides how the mover moves it.
@@ -83,6 +85,7 @@ struct Inner {
     settle: Duration,
     max_copies_per_pass: usize,
     down_after_secs: u64,
+    max_garbage_per_pass: usize,
 }
 
 /// Drives PG migration to match live membership. Cheap to clone (shared state).
@@ -104,6 +107,7 @@ impl RebalanceController {
         settle: Duration,
         max_copies_per_pass: usize,
         down_after_secs: u64,
+        max_garbage_per_pass: usize,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -115,6 +119,7 @@ impl RebalanceController {
                 settle,
                 max_copies_per_pass,
                 down_after_secs,
+                max_garbage_per_pass,
             }),
         }
     }
@@ -125,11 +130,12 @@ impl RebalanceController {
         loop {
             ticker.tick().await;
             match self.reconcile_once(now_secs()).await {
-                Ok(r) if r.started + r.copied + r.finalized > 0 => tracing::info!(
+                Ok(r) if r.started + r.copied + r.finalized + r.gc > 0 => tracing::info!(
                     started = r.started,
                     copied = r.copied,
                     finalized = r.finalized,
                     migrating = r.migrating,
+                    gc = r.gc,
                     "rebalance progress"
                 ),
                 Ok(_) => {}
@@ -280,6 +286,48 @@ impl RebalanceController {
                 report.finalized += 1;
                 report.migrating -= 1;
             }
+        }
+
+        // Reclaim orphaned objects: delete each garbage id from its placement
+        // nodes (idempotent — a no-op where absent), then clear it. An id is only
+        // cleared once every reachable placement node confirmed the delete, so a
+        // node that was down keeps the id for a later pass.
+        let pg_nodes: HashMap<u32, Vec<String>> = table
+            .iter()
+            .map(|(pg, p)| {
+                let mut ids = p.node_ids.clone();
+                for t in &p.target {
+                    if !ids.contains(t) {
+                        ids.push(t.clone());
+                    }
+                }
+                (*pg, ids)
+            })
+            .collect();
+        let mut reclaimed = Vec::new();
+        for oid in inner.store.list_garbage(inner.max_garbage_per_pass)? {
+            let pg = (hash64(&oid) % inner.pg_count.max(1) as u64) as u32;
+            let Some(nodes) = pg_nodes.get(&pg) else {
+                continue; // PG table not loaded for this pg — retry later
+            };
+            let mut all_ok = true;
+            for node in nodes {
+                match clients.get(node) {
+                    Some(c) => {
+                        if c.delete(oid).is_err() {
+                            all_ok = false;
+                        }
+                    }
+                    None => all_ok = false, // node unreachable — don't clear yet
+                }
+            }
+            if all_ok {
+                reclaimed.push(oid);
+            }
+        }
+        if !reclaimed.is_empty() {
+            inner.store.remove_garbage(&reclaimed)?;
+            report.gc = reclaimed.len();
         }
         Ok(report)
     }

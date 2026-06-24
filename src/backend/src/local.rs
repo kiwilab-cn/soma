@@ -479,10 +479,16 @@ impl StorageBackend for LocalFsBackend {
     }
 
     fn delete(&self, object_id: ObjectId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        // Idempotent: nothing live to delete → no redundant tombstone. This keeps
+        // orphan GC (which may delete an id from every node) from littering nodes
+        // that never held the object with tombstones.
+        match inner.objects.get(&object_id) {
+            Some(loc) if !loc.is_tombstone() => {}
+            _ => return Ok(()),
+        }
         let needle = encode_needle(object_id, FLAG_TOMBSTONE, &[])?;
-        self.inner
-            .lock()
-            .append(object_id, &needle, 0, FLAG_TOMBSTONE)
+        inner.append(object_id, &needle, 0, FLAG_TOMBSTONE)
     }
 
     fn sync(&self) -> Result<()> {

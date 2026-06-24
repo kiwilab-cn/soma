@@ -287,6 +287,7 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
             std::time::Duration::from_secs(cfg.rebalance.settle_secs),
             cfg.rebalance.max_copies_per_pass,
             cfg.rebalance.down_after_secs,
+            cfg.rebalance.max_garbage_per_pass,
         );
         tracing::info!(
             interval_secs = cfg.rebalance.interval_secs,

@@ -1149,6 +1149,7 @@ async fn scale_out_rebalances_data_to_new_node() {
         Duration::ZERO,
         1000,
         3600,
+        1000,
     );
     let mut iters = 0;
     loop {
@@ -1313,6 +1314,7 @@ async fn node_loss_re_replicates_to_survivors() {
         Duration::ZERO,
         1000,
         100,
+        1000,
     );
     let mut iters = 0;
     loop {
@@ -1375,6 +1377,7 @@ async fn drain_migrates_data_off_a_node() {
         Duration::ZERO,
         1000,
         3600, // don't mark anyone Down in this test
+        1000,
     );
     let mut iters = 0;
     loop {
@@ -1517,6 +1520,7 @@ async fn erasure_node_loss_reconstructs_shards() {
         Duration::ZERO,
         1000,
         100,
+        1000,
     );
     let mut iters = 0;
     loop {
@@ -1553,4 +1557,106 @@ async fn erasure_node_loss_reconstructs_shards() {
             "object {oid} not fully reconstructed: {live_shards}/{width}"
         );
     }
+}
+
+/// Orphan GC: overwriting a key leaves the old versions' bytes on storage nodes;
+/// metadata records them as garbage and the controller reclaims them (the bytes
+/// stop being served), while the live key keeps its latest value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orphan_gc_reclaims_overwritten_objects() {
+    use soma_cluster::{
+        serve_meta, serve_storage, Durability, MetaClient, Placement, RebalanceController,
+        ReplicatedBackend, DEFAULT_PG_COUNT,
+    };
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    store.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let meta_port = free_port();
+    {
+        let s: Arc<dyn MetadataStore> = store.clone();
+        tokio::spawn(async move {
+            let _ = serve_meta(sock(meta_port), s).await;
+        });
+    }
+
+    let mut backends: Vec<Arc<dyn StorageBackend>> = Vec::new();
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        let port = free_port();
+        let sdir = dir.path().join(format!("s{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        backends.push(backend.clone());
+        tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        });
+        nodes.push((format!("node-{i}"), format!("http://127.0.0.1:{port}")));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let meta_client = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    let now = 1_000_000u64;
+    register_nodes(&meta_client, &nodes, now).await;
+
+    let placement = Placement::from_membership(meta_client.clone(), 2, DEFAULT_PG_COUNT, now)
+        .await
+        .unwrap();
+    let repl: Arc<dyn StorageBackend> = Arc::new(ReplicatedBackend::from_placement(placement, 1));
+    let meta_dyn: Arc<dyn MetadataStore> = meta_client.clone();
+    let svc = S3Service::new(meta_dyn, repl, Credentials::single("AK", "SK"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    let api = client(s3_port);
+
+    // Overwrite the same key several times → the superseded ids become garbage.
+    let key = OPath::from("k");
+    for v in 0..4 {
+        api.put(&key, PutPayload::from(format!("version-{v}").into_bytes()))
+            .await
+            .unwrap();
+    }
+    let garbage = store.list_garbage(100).unwrap();
+    assert_eq!(garbage.len(), 3, "3 overwrites leave 3 orphans");
+    let held = |oid: u64| backends.iter().filter(|b| b.get(oid, None).is_ok()).count();
+    assert!(
+        garbage.iter().all(|&oid| held(oid) > 0),
+        "orphan bytes present before GC"
+    );
+
+    // Drive the controller; with stable membership it only runs GC.
+    let controller = RebalanceController::new(
+        store.clone(),
+        Durability::Replicated { factor: 2 },
+        DEFAULT_PG_COUNT,
+        Duration::ZERO,
+        1000,
+        3600,
+        1000,
+    );
+    let mut iters = 0;
+    loop {
+        controller.reconcile_once(now).await.unwrap();
+        if store.list_garbage(100).unwrap().is_empty() {
+            break;
+        }
+        iters += 1;
+        assert!(iters < 40, "gc did not drain");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    // Every orphan is reclaimed (no longer served); the live key is intact.
+    for &oid in &garbage {
+        assert_eq!(held(oid), 0, "orphan {oid} not reclaimed");
+    }
+    let got = api.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), b"version-3");
 }

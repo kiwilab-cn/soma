@@ -441,6 +441,9 @@ impl S3Service {
                 },
                 PutCondition::None,
             )?;
+            // The part needles are now orphaned (the object has a fresh id) — hand
+            // their ids to GC.
+            meta.mark_garbage(&part_ids)?;
             Ok(())
         })
         .await?;
@@ -449,10 +452,21 @@ impl S3Service {
         Ok(final_etag)
     }
 
-    /// `AbortMultipartUpload`. Discards the upload's state (part needles become
-    /// orphans, reclaimed by later GC).
+    /// `AbortMultipartUpload`. Discards the upload's state and hands its already-
+    /// written part needles to GC.
     pub async fn abort_multipart(&self, upload_id: String) -> S3Result<()> {
-        self.uploads.lock().remove(&upload_id);
+        let part_ids: Vec<u64> = match self.uploads.lock().remove(&upload_id) {
+            Some(up) => up.parts.values().map(|p| p.object_id).collect(),
+            None => return Ok(()),
+        };
+        if !part_ids.is_empty() {
+            let meta = self.meta.clone();
+            block(move || {
+                meta.mark_garbage(&part_ids)?;
+                Ok(())
+            })
+            .await?;
+        }
         Ok(())
     }
 }
