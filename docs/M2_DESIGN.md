@@ -124,6 +124,13 @@ Why groups rather than per-object hashing:
 - Membership change reassigns **groups**, and rebalance migrates **groups** — a
   bounded, coarse unit — instead of touching every object independently.
 
+> **M2b ships the simpler form first**: a direct consistent-hash ring over the
+> configured storage nodes (virtual nodes for balance) computes an object's
+> replica set straight from `hash(object_id)` — no `group_table` indirection,
+> since the node set is static. The placement-**group** table and the
+> membership-driven rebalance it enables land with **M2c** (self-heal +
+> rebalance), where a mutable mapping is what's actually needed.
+
 ---
 
 ## 5. Replication & the write/read protocol
