@@ -53,6 +53,9 @@ base64 = "0.22"
 percent-encoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+bytesize = "1"
 # Test/utility
 proptest = "1"
 tempfile = "3"

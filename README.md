@@ -40,13 +40,18 @@ index — the design lesson shared by Facebook Haystack, SeaweedFS, and CDN cach
 - [`docs/MVP_DESIGN.md`](docs/MVP_DESIGN.md) — the M0 (single-node skeleton) design.
 - [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md) — the M1 (read cache + cloud-native readiness) design.
 
-## Run (M0)
+## Run
 
 ```sh
-cargo run --bin soma-server
+cargo run --bin soma-server                  # defaults below
+cargo run --bin soma-server -- --config soma.toml   # or a TOML config file
 # defaults: listen 0.0.0.0:9000, data ./soma-data, key soma / soma-secret
-# override via env: SOMA_LISTEN, SOMA_DATA_DIR, SOMA_ACCESS_KEY, SOMA_SECRET_KEY
 ```
+
+Configuration is layered **defaults → TOML file (`--config` / `SOMA_CONFIG`) →
+environment**. Env overrides use the `SOMA_` prefix with `__` for nesting, e.g.
+`SOMA_LISTEN`, `SOMA_DATA_DIR`, `SOMA_ACCESS_KEY`, `SOMA_SECRET_KEY`,
+`SOMA_CACHE__MAX_BYTES`. See [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md#4-structured-configuration).
 
 Point any S3 client at it (path-style, region `us-east-1`). With the Rust
 `object_store` crate:
