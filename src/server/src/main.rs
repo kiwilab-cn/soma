@@ -6,7 +6,7 @@ mod config;
 
 use std::sync::Arc;
 
-use soma_backend::{BackendConfig, LocalFsBackend, StorageBackend};
+use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -28,12 +28,21 @@ async fn main() -> Result<(), BoxError> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let meta_path = format!("{}/meta.redb", cfg.data_dir);
     let meta: Arc<dyn MetadataStore> = Arc::new(RedbMetaStore::open(&meta_path)?);
-    let backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::open(
+    let fs_backend = Arc::new(LocalFsBackend::open(
         &cfg.data_dir,
         BackendConfig {
             volume_max: cfg.volume_max_bytes(),
         },
     )?);
+    let backend: Arc<dyn StorageBackend> = if cfg.cache.enabled {
+        Arc::new(CachingBackend::new(
+            fs_backend,
+            cfg.cache_max_bytes() as usize,
+            cfg.cache_max_object_bytes(),
+        ))
+    } else {
+        fs_backend
+    };
 
     let mut creds = Credentials::new();
     for c in &cfg.credentials {

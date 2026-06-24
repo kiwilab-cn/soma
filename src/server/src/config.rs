@@ -209,14 +209,19 @@ mod tests {
 
     #[test]
     fn defaults_are_sane() {
-        let cfg = Config::load(None).unwrap();
-        assert_eq!(cfg.listen, DEFAULT_LISTEN);
-        assert_eq!(cfg.admin_listen, DEFAULT_ADMIN_LISTEN);
-        assert_eq!(cfg.volume_max_bytes(), DEFAULT_VOLUME_MAX);
-        assert_eq!(cfg.cache_max_bytes(), DEFAULT_CACHE_MAX);
-        assert!(cfg.cache.enabled);
-        assert_eq!(cfg.credentials.len(), 1);
-        assert_eq!(cfg.credentials[0].access_key, "soma");
+        // Run under a Jail so this is isolated from (and serialized with) the
+        // other env-mutating tests in this binary.
+        figment::Jail::expect_with(|_jail| {
+            let cfg = Config::load(None).unwrap();
+            assert_eq!(cfg.listen, DEFAULT_LISTEN);
+            assert_eq!(cfg.admin_listen, DEFAULT_ADMIN_LISTEN);
+            assert_eq!(cfg.volume_max_bytes(), DEFAULT_VOLUME_MAX);
+            assert_eq!(cfg.cache_max_bytes(), DEFAULT_CACHE_MAX);
+            assert!(cfg.cache.enabled);
+            assert_eq!(cfg.credentials.len(), 1);
+            assert_eq!(cfg.credentials[0].access_key, "soma");
+            Ok(())
+        });
     }
 
     #[test]

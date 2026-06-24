@@ -18,10 +18,12 @@
 //! exhaustively testable without a runtime and avoids surprising async-in-disk-IO
 //! footguns.
 
+mod cache;
 mod error;
 mod idxfile;
 mod local;
 
+pub use cache::{CacheStats, CachingBackend};
 pub use error::{Error, Result};
 pub use local::{BackendConfig, LocalFsBackend};
 

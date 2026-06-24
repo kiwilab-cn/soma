@@ -12,7 +12,7 @@ use crate::id::{ObjectId, VolumeId};
 use crate::needle::{ScanOutcome, FLAG_TOMBSTONE};
 
 /// Location of a needle's payload within its volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NeedleLoc {
     /// Byte offset of the needle *header* within the volume file.
@@ -36,7 +36,7 @@ impl NeedleLoc {
 /// This is what the metadata store persists as the authority for "object name →
 /// bytes", and what the storage backend consumes to read/delete. `NeedleLoc`
 /// alone is volume-relative; `ObjectLocation` adds the [`VolumeId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ObjectLocation {
     /// Volume holding the needle.
