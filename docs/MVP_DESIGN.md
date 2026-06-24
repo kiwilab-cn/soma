@@ -185,38 +185,39 @@ Deliberately **excluded** from M0: ACL APIs, bucket policies/versioning-list API
 
 ## 6. Trait drafts
 
-These signatures are the contract later milestones implement behind. Async,
-`bytes::Bytes` for zero-copy. (Final form may adjust during implementation.)
+These signatures are the contract later milestones implement behind. The storage
+and metadata layers are **synchronous**: they do blocking, fsync-bound IO (like
+the embedded engines they wrap), and the async edge — the S3 HTTP server —
+bridges to them via `spawn_blocking`. Keeping them sync makes the cores
+exhaustively testable without a runtime and avoids async-in-disk-IO footguns.
+(Final form may adjust during implementation.)
 
 ### 6.1 `MetadataStore` (`soma-meta`)
 
 ```rust
-#[async_trait]
 pub trait MetadataStore: Send + Sync {
     // Buckets
-    async fn create_bucket(&self, name: &str, opts: BucketOpts) -> Result<()>;
-    async fn delete_bucket(&self, name: &str) -> Result<()>;
-    async fn list_buckets(&self) -> Result<Vec<BucketMeta>>;
+    fn create_bucket(&self, name: &str, opts: BucketOpts) -> Result<()>;
+    fn delete_bucket(&self, name: &str) -> Result<()>;
+    fn list_buckets(&self) -> Result<Vec<BucketMeta>>;
 
     // Objects — `cond` carries If-Match / If-None-Match.
     // Returns the committed version (CAS evaluated atomically inside the store).
-    async fn put_object(
+    fn put_object(
         &self,
         bucket: &str,
         key: &str,
-        loc: ObjectLocation,      // needle location(s), size, content hash
+        loc: ObjectLocation,      // needle location, size, content hash
         cond: PutCondition,
     ) -> Result<Version>;
 
-    async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>>;
-    async fn delete_object(&self, bucket: &str, key: &str, cond: PutCondition)
-        -> Result<()>;
+    fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>>;
+    fn delete_object(&self, bucket: &str, key: &str, cond: PutCondition) -> Result<()>;
 
-    async fn list_objects(&self, bucket: &str, req: ListRequest)
-        -> Result<ListResult>;
+    fn list_objects(&self, bucket: &str, req: ListRequest) -> Result<ListResult>;
 
     // Internal id allocation (monotonic object ids).
-    async fn next_object_id(&self) -> Result<u64>;
+    fn next_object_id(&self) -> Result<u64>;
 }
 
 pub enum PutCondition {
@@ -233,25 +234,31 @@ without changing this trait (per `ARCHITECTURE.md` §5.3).
 ### 6.2 `StorageBackend` (`soma-backend`)
 
 ```rust
-#[async_trait]
 pub trait StorageBackend: Send + Sync {
-    /// Append object bytes; fsync; return the durable location.
-    async fn put(&self, object_id: u64, data: Bytes) -> Result<ObjectLocation>;
+    /// Append `data` as a needle, fsync it, return its durable location.
+    fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<ObjectLocation>;
 
-    /// Read object bytes (optionally a byte range).
-    async fn get(&self, loc: &ObjectLocation, range: Option<ByteRange>)
-        -> Result<Bytes>;
+    /// Read object bytes (optionally a byte range), verifying the payload CRC.
+    fn get(&self, loc: ObjectLocation, range: Option<ByteRange>) -> Result<Vec<u8>>;
 
-    /// Mark deleted (tombstone needle). Physical reclaim is async/later.
-    async fn delete(&self, loc: &ObjectLocation) -> Result<()>;
+    /// Append a tombstone (delete marker); return its location. Physical reclaim
+    /// happens later via compaction.
+    fn delete(&self, object_id: ObjectId) -> Result<ObjectLocation>;
 
-    /// Flush + checkpoint (.idx).
-    async fn sync(&self) -> Result<()>;
+    /// Flush all volumes (fsync).
+    fn sync(&self) -> Result<()>;
+
+    /// Write a `.idx` checkpoint per volume so recovery can skip a full scan.
+    fn checkpoint(&self) -> Result<()>;
 }
 ```
 
-`LocalFsBackend` is the M0 implementation. The write aggregator batches concurrent
-small `put`s into one sequential fsync where possible.
+`LocalFsBackend` is the M0 implementation: bytes live in append-only
+`<id>.vol` files, one needle per object, fsynced on `put` before the location is
+returned (durability before metadata commit). On open it recovers each volume by
+loading the `.idx` checkpoint and scanning the tail forward, truncating any torn
+tail. M0 fsyncs per `put` for correctness; coalescing concurrent writes into one
+fsync (write aggregation) is a later performance pass.
 
 ---
 
