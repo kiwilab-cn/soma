@@ -1,0 +1,19 @@
+[package]
+name = "soma-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core on-disk format (volume + needle), in-RAM hot index, and shared types for Soma."
+
+[dependencies]
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

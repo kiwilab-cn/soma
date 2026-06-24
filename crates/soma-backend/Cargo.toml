@@ -1,0 +1,16 @@
+[package]
+name = "soma-backend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Storage backend: durable needle IO over volume files (StorageBackend trait + LocalFsBackend)."
+
+[dependencies]
+soma-core.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

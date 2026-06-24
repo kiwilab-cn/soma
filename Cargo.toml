@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/soma-core",
+    "crates/soma-meta",
+    "crates/soma-backend",
+    "crates/soma-s3",
+    "crates/soma-server",
+]
+default-members = ["crates/soma-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Zerry <zerix.os@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/kiwilab-cn/soma"
+rust-version = "1.84"
+
+# Robustness discipline shared by every crate: no silent panics on fallible paths.
+[workspace.lints.rust]
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+# Internal crates
+soma-core = { path = "crates/soma-core" }
+soma-meta = { path = "crates/soma-meta" }
+soma-backend = { path = "crates/soma-backend" }
+soma-s3 = { path = "crates/soma-s3" }
+
+# Third-party
+crc32c = "0.6"
+thiserror = "2"
+bytes = "1"
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
