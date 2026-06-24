@@ -1,7 +1,332 @@
-//! S3-compatible protocol layer for Soma — request parsing, XML responses, S3
-//! error codes, and AWS SigV4 verification, mapping S3 operations onto the
-//! metadata store (`soma-meta`) and storage backend (`soma-backend`).
+//! S3-compatible HTTP service for Soma.
 //!
-//! The `S3Service` and `SigV4Verifier` land in the `feat/m0-s3` branch (see
-//! `docs/MVP_DESIGN.md` §5). This crate is currently a placeholder that
-//! establishes the workspace boundary.
+//! Exposes a [`router`] that maps the S3 REST API onto an [`S3Service`]. M0
+//! covers bucket lifecycle, single-part object CRUD, range reads, `ListObjectsV2`
+//! (prefix/delimiter/pagination), conditional writes, and SigV4 auth. Multipart
+//! upload is rejected with `NotImplemented` (a follow-up milestone).
+//!
+//! Routing uses a single fallback handler that dispatches on method + path +
+//! query, matching S3's "operation is determined by query parameters" model.
+
+mod error;
+mod service;
+mod sigv4;
+mod xml;
+
+#[cfg(test)]
+mod tests;
+
+pub use error::{S3Error, S3Result};
+pub use service::{Credentials, GetObjectOk, HeadObjectOk, PutObjectOk, S3Service};
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Router;
+use base64::Engine;
+use percent_encoding::percent_decode_str;
+
+use soma_meta::{ETag, ListRequest, PutCondition};
+
+/// Maximum request body Soma will buffer for a single-part `PutObject` (5 GiB,
+/// the S3 single-PUT limit).
+const MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
+
+/// Build the S3 HTTP router over the given service.
+pub fn router(service: S3Service) -> Router {
+    Router::new().fallback(handle).with_state(service)
+}
+
+async fn handle(State(svc): State<S3Service>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
+    let path = uri.path().to_string();
+    let query = uri.query().unwrap_or("").to_string();
+
+    if let Err(e) = svc.authorize(method.as_str(), &path, &query, &headers) {
+        return e.into_response();
+    }
+
+    match dispatch(&svc, &method, &path, &query, &headers, body).await {
+        Ok(resp) => resp,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn dispatch(
+    svc: &S3Service,
+    method: &Method,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> S3Result<Response> {
+    let (bucket, key) = split_path(path);
+    let (bucket, key) = (bucket.as_str(), key.as_str());
+    let q = parse_query(query);
+
+    // Service level: GET / -> ListBuckets.
+    if bucket.is_empty() {
+        return match *method {
+            Method::GET => list_buckets(svc).await,
+            _ => Err(S3Error::not_implemented(
+                "unsupported service-level operation",
+            )),
+        };
+    }
+
+    // Object level.
+    if !key.is_empty() {
+        // Reject multipart sub-resources explicitly.
+        if qhas(&q, "uploads") || qhas(&q, "uploadId") || qhas(&q, "partNumber") {
+            return Err(S3Error::not_implemented(
+                "multipart upload is not yet supported",
+            ));
+        }
+        return match *method {
+            Method::PUT => put_object(svc, bucket, key, headers, body).await,
+            Method::GET => get_object(svc, bucket, key, headers, false).await,
+            Method::HEAD => get_object(svc, bucket, key, headers, true).await,
+            Method::DELETE => delete_object(svc, bucket, key, headers).await,
+            _ => Err(S3Error::not_implemented("unsupported object operation")),
+        };
+    }
+
+    // Bucket level.
+    match *method {
+        Method::PUT => {
+            svc.create_bucket(bucket.to_string()).await?;
+            Ok(([(header::LOCATION, format!("/{bucket}"))], StatusCode::OK).into_response())
+        }
+        Method::DELETE => {
+            svc.delete_bucket(bucket.to_string()).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Method::GET => list_objects(svc, bucket, &q).await,
+        Method::HEAD => {
+            // HeadBucket: 200 if it exists, else 404.
+            match svc.list_buckets().await?.iter().any(|b| b.name == bucket) {
+                true => Ok(StatusCode::OK.into_response()),
+                false => Err(S3Error::no_such_bucket(bucket)),
+            }
+        }
+        _ => Err(S3Error::not_implemented("unsupported bucket operation")),
+    }
+}
+
+async fn list_buckets(svc: &S3Service) -> S3Result<Response> {
+    let buckets = svc.list_buckets().await?;
+    let body = xml::list_all_buckets(&buckets, now_secs());
+    Ok(xml_response(StatusCode::OK, body))
+}
+
+async fn list_objects(svc: &S3Service, bucket: &str, q: &[(String, String)]) -> S3Result<Response> {
+    let prefix = qget(q, "prefix").unwrap_or("").to_string();
+    let delimiter = qget(q, "delimiter")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let max_keys = qget(q, "max-keys")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let continuation_token = match qget(q, "continuation-token") {
+        Some(t) if !t.is_empty() => Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(t)
+                .map_err(|_| S3Error::invalid_argument("bad continuation-token"))?,
+        ),
+        _ => None,
+    };
+
+    let req = ListRequest {
+        prefix: prefix.clone(),
+        delimiter: delimiter.clone(),
+        continuation_token,
+        max_keys,
+    };
+    let result = svc.list_objects(bucket.to_string(), req).await?;
+
+    let next_token = result
+        .next_continuation_token
+        .as_ref()
+        .map(|t| base64::engine::general_purpose::STANDARD.encode(t));
+
+    let body = xml::list_objects_v2(&xml::ListObjectsXml {
+        bucket,
+        prefix: &prefix,
+        delimiter: delimiter.as_deref(),
+        max_keys,
+        is_truncated: result.is_truncated,
+        next_token: next_token.as_deref(),
+        objects: &result.objects,
+        common_prefixes: &result.common_prefixes,
+    });
+    Ok(xml_response(StatusCode::OK, body))
+}
+
+async fn put_object(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> S3Result<Response> {
+    // Chunked streaming payloads are not decoded in M0.
+    if let Some(h) = headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+    {
+        if h.starts_with("STREAMING") {
+            return Err(S3Error::not_implemented(
+                "chunked streaming upload is not supported",
+            ));
+        }
+    }
+
+    let cond = put_condition(headers)?;
+    let bytes = axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
+
+    let ok = svc
+        .put_object(bucket.to_string(), key.to_string(), bytes, cond, now_secs())
+        .await?;
+
+    let mut h = HeaderMap::new();
+    h.insert(header::ETAG, hv(&format!("\"{}\"", ok.etag)));
+    Ok((StatusCode::OK, h).into_response())
+}
+
+async fn get_object(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    head_only: bool,
+) -> S3Result<Response> {
+    if head_only {
+        let m = svc.head_object(bucket.to_string(), key.to_string()).await?;
+        let mut h = object_headers(&m.etag, m.size, m.created_at);
+        h.insert(header::CONTENT_LENGTH, hv(&m.size.to_string()));
+        return Ok((StatusCode::OK, h).into_response());
+    }
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let partial = range.is_some();
+    let obj = svc
+        .get_object(bucket.to_string(), key.to_string(), range)
+        .await?;
+
+    let mut h = object_headers(&obj.etag, obj.size, obj.created_at);
+    h.insert(header::CONTENT_LENGTH, hv(&obj.data.len().to_string()));
+    let status = match (&obj.content_range, partial) {
+        (Some(cr), _) => {
+            h.insert(header::CONTENT_RANGE, hv(cr));
+            StatusCode::PARTIAL_CONTENT
+        }
+        _ => StatusCode::OK,
+    };
+    Ok((status, h, obj.data).into_response())
+}
+
+async fn delete_object(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> S3Result<Response> {
+    let cond = put_condition(headers)?;
+    svc.delete_object(bucket.to_string(), key.to_string(), cond)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Build the conditional-write precondition from `If-None-Match` / `If-Match`.
+fn put_condition(headers: &HeaderMap) -> S3Result<PutCondition> {
+    if let Some(v) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if v.trim() == "*" {
+            return Ok(PutCondition::IfNoneMatch);
+        }
+        return Err(S3Error::invalid_argument(
+            "only 'If-None-Match: *' is supported",
+        ));
+    }
+    if let Some(v) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        return Ok(PutCondition::IfMatch(ETag(unquote(v).to_string())));
+    }
+    Ok(PutCondition::None)
+}
+
+/// Common object response headers (ETag, Last-Modified, Accept-Ranges, type).
+fn object_headers(etag: &str, _size: u64, created_at: u64) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(header::ETAG, hv(&format!("\"{etag}\"")));
+    h.insert(header::LAST_MODIFIED, hv(&xml::http_date(created_at)));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    h
+}
+
+fn xml_response(status: StatusCode, body: String) -> Response {
+    (status, [(header::CONTENT_TYPE, "application/xml")], body).into_response()
+}
+
+/// Split a request path into a (decoded bucket, decoded key) pair.
+fn split_path(path: &str) -> (String, String) {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    match trimmed.split_once('/') {
+        Some((b, k)) => (pct(b), pct(k)),
+        None => (pct(trimmed), String::new()),
+    }
+}
+
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (pct(k), pct(v))
+        })
+        .collect()
+}
+
+fn qget<'a>(q: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    q.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+fn qhas(q: &[(String, String)], name: &str) -> bool {
+    q.iter().any(|(k, _)| k == name)
+}
+
+fn pct(s: &str) -> String {
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
+fn unquote(s: &str) -> &str {
+    s.trim().trim_matches('"')
+}
+
+fn hv(s: &str) -> HeaderValue {
+    HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

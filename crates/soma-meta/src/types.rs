@@ -42,6 +42,9 @@ pub struct ObjectPut {
     pub size: u64,
     /// Content tag.
     pub etag: ETag,
+    /// Creation time (unix seconds), supplied by the caller (the store does no
+    /// clock access). Surfaced as S3 `LastModified`.
+    pub created_at: u64,
 }
 
 /// Stored metadata about an object's current version.
@@ -57,6 +60,8 @@ pub struct ObjectMeta {
     pub etag: ETag,
     /// Version number of this object.
     pub version: Version,
+    /// Creation time (unix seconds).
+    pub created_at: u64,
 }
 
 /// Condition under which a put/delete is allowed (S3 conditional writes).
@@ -97,6 +102,8 @@ pub struct ObjectEntry {
     pub etag: ETag,
     /// Version number.
     pub version: Version,
+    /// Creation time (unix seconds).
+    pub created_at: u64,
 }
 
 /// A `ListObjectsV2`-style response.

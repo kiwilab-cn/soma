@@ -139,6 +139,7 @@ impl MetadataStore for RedbMetaStore {
                 size: put.size,
                 etag: put.etag,
                 version: new_version,
+                created_at: put.created_at,
             };
             objects.insert(ck.as_slice(), postcard::to_allocvec(&meta)?.as_slice())?;
         }
@@ -244,6 +245,7 @@ impl MetadataStore for RedbMetaStore {
                 size: meta.size,
                 etag: meta.etag,
                 version: meta.version,
+                created_at: meta.created_at,
             });
             count += 1;
         }

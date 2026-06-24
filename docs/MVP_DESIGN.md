@@ -347,8 +347,13 @@ branches (each PR'd to `main` and merged before the next):
 2. `feat/m0-backend` — `StorageBackend` + `LocalFsBackend` (volumes, aggregation,
    `.idx`, rebuild).
 3. `feat/m0-meta` — `MetadataStore` + `RedbMetaStore` (CAS, versioning, listing).
-4. `feat/m0-s3` — S3 protocol + SigV4 in `soma-s3`, wired into `soma-server`.
-5. `feat/m0-integration` — end-to-end tests, consumer round-trip, restart recovery,
+4. `feat/m0-s3` — S3 protocol + SigV4 in `soma-s3` (bucket lifecycle, single-part
+   object CRUD, range reads, `ListObjectsV2`, conditional writes), wired into
+   `soma-server`. Multipart upload is split out to keep this PR reviewable.
+5. `feat/m0-multipart` — multipart upload (`CreateMultipartUpload` / `UploadPart` /
+   `CompleteMultipartUpload` / `AbortMultipartUpload`); until then those routes
+   return `NotImplemented`.
+6. `feat/m0-integration` — end-to-end tests, consumer round-trip, restart recovery,
    acceptance criteria.
 
 Each branch is independently testable and reviewable.

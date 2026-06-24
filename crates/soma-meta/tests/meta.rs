@@ -29,6 +29,7 @@ fn put(object_id: u64, offset: u64, size: u32, etag: &str) -> ObjectPut {
         location: loc(offset, size),
         size: size as u64,
         etag: ETag(etag.to_string()),
+        created_at: 0,
     }
 }
 
