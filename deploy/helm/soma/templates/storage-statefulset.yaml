@@ -29,6 +29,16 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--config", "/etc/soma/soma.toml"]
+          env:
+            # Per-pod stable identity + advertised address for cluster membership.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SOMA_NODE_ID
+              value: "$(POD_NAME)"
+            - name: SOMA_ADVERTISE_ENDPOINT
+              value: "http://$(POD_NAME).{{ include "soma.storageHeadless" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.storage }}"
           ports:
             - name: storage
               containerPort: {{ .Values.ports.storage }}

@@ -110,6 +110,67 @@ fn maybe_cache(cfg: &Config, backend: Arc<dyn StorageBackend>) -> Arc<dyn Storag
     }
 }
 
+/// Current unix time in seconds (the membership clock; the meta store itself does
+/// no clock access and takes `now` from callers).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Background membership loop for a storage node: register with the meta node,
+/// then heartbeat on an interval (re-registering if the meta store forgot us).
+/// Best-effort — a meta outage never crashes the storage node.
+async fn run_membership(
+    meta_endpoint: String,
+    node_id: String,
+    endpoint: String,
+    interval_secs: u64,
+) {
+    let client = match MetaClient::connect(meta_endpoint).await {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "membership: cannot reach meta; node will not register");
+            return;
+        }
+    };
+    let mut registered = false;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+    loop {
+        ticker.tick().await;
+        let (c, nid, ep, now, need_register) = (
+            client.clone(),
+            node_id.clone(),
+            endpoint.clone(),
+            now_secs(),
+            !registered,
+        );
+        let res = tokio::task::spawn_blocking(move || {
+            if need_register {
+                c.register_node(&nid, &ep, now)
+            } else {
+                c.heartbeat(&nid, now)
+            }
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                if need_register {
+                    registered = true;
+                    tracing::info!(node_id = %node_id, endpoint = %endpoint, "registered with cluster membership");
+                }
+            }
+            // A failed heartbeat (e.g. the meta store forgot us) → re-register next tick.
+            Ok(Err(e)) => {
+                registered = false;
+                tracing::debug!(error = %e, "membership heartbeat failed; will re-register");
+            }
+            Err(e) => tracing::warn!(error = %e, "membership task join error"),
+        }
+    }
+}
+
 // --- roles -----------------------------------------------------------------
 
 /// Single process: metadata + storage + S3 + admin in one.
@@ -210,6 +271,27 @@ async fn run_storage(cfg: Config) -> Result<(), BoxError> {
                 }
             }
         });
+    }
+
+    // Self-register with cluster membership and heartbeat (M3). Best-effort.
+    if !cfg.meta_endpoint.is_empty() && cfg.storage.heartbeat_interval_secs > 0 {
+        let node_id = if cfg.node_id.is_empty() {
+            cfg.listen.clone()
+        } else {
+            cfg.node_id.clone()
+        };
+        let advertise = if cfg.advertise_endpoint.is_empty() {
+            format!("http://{}", cfg.listen)
+        } else {
+            cfg.advertise_endpoint.clone()
+        };
+        tracing::info!(node_id = %node_id, advertise = %advertise, meta = %cfg.meta_endpoint, "storage joining cluster membership");
+        tokio::spawn(run_membership(
+            cfg.meta_endpoint.clone(),
+            node_id,
+            advertise,
+            cfg.storage.heartbeat_interval_secs,
+        ));
     }
 
     let addr: SocketAddr = cfg.listen.parse()?;

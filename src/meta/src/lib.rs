@@ -17,8 +17,8 @@ mod types;
 pub use error::{Error, Result};
 pub use redb_store::RedbMetaStore;
 pub use types::{
-    BucketMeta, BucketOpts, ETag, ListRequest, ListResult, ObjectEntry, ObjectMeta, ObjectPut,
-    PutCondition, Quota, TenantUsage, Version,
+    BucketMeta, BucketOpts, ETag, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry,
+    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, TenantUsage, Version,
 };
 
 use soma_core::ObjectId;
@@ -60,6 +60,27 @@ pub trait MetadataStore: Send + Sync {
 
     /// The tracked live usage for a tenant (zero if the tenant is unknown).
     fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage>;
+
+    // --- cluster membership + placement (M3) -------------------------------
+
+    /// Register (or re-register) a storage node, marking it `Active` and bumping
+    /// its generation. `now` is the caller-supplied unix-seconds clock.
+    fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()>;
+
+    /// Record a heartbeat for a registered node. Errors with [`Error::UnknownNode`]
+    /// if the node is not registered (so it re-registers).
+    fn heartbeat(&self, node_id: &str, now: u64) -> Result<()>;
+
+    /// List all known members (sorted by node id).
+    fn list_members(&self) -> Result<Vec<NodeInfo>>;
+
+    /// Seed the placement-group table, but only if it is currently empty. Returns
+    /// `true` if this call wrote the table, `false` if it was already populated.
+    /// Idempotent under concurrent gateways (first writer wins, atomically).
+    fn seed_pg_table(&self, entries: &[(u32, PgPlacement)]) -> Result<bool>;
+
+    /// Read the entire placement-group table (sorted by pg).
+    fn list_pg_table(&self) -> Result<Vec<(u32, PgPlacement)>>;
 
     /// List objects in a bucket (prefix + delimiter + pagination).
     fn list_objects(&self, bucket: &str, req: &ListRequest) -> Result<ListResult>;

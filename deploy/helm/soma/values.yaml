@@ -42,6 +42,8 @@ config:
   dataDir: /var/lib/soma
   volumeMax: "4GiB"
   scrubIntervalSecs: 3600
+  # Storage-node membership heartbeat interval (0 disables registration).
+  heartbeatIntervalSecs: 10
   cache:
     enabled: true
     maxBytes: "512MiB"

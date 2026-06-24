@@ -9,8 +9,8 @@ use tonic::{Request, Response, Status};
 
 use soma_core::ObjectId;
 use soma_meta::{
-    BucketMeta, BucketOpts, Error, ListRequest, ListResult, MetadataStore, ObjectMeta, ObjectPut,
-    PutCondition, Result, TenantUsage, Version,
+    BucketMeta, BucketOpts, Error, ListRequest, ListResult, MetadataStore, NodeInfo, ObjectMeta,
+    ObjectPut, PgPlacement, PutCondition, Result, TenantUsage, Version,
 };
 
 use crate::bridge::Bridge;
@@ -75,6 +75,21 @@ fn dispatch(
         }
         MetaRequest::NextObjectId => store.next_object_id().map(MetaReply::ObjectId),
         MetaRequest::TenantUsage { tenant } => store.tenant_usage(&tenant).map(MetaReply::Usage),
+        MetaRequest::RegisterNode {
+            node_id,
+            endpoint,
+            now,
+        } => store
+            .register_node(&node_id, &endpoint, now)
+            .map(|()| MetaReply::Unit),
+        MetaRequest::Heartbeat { node_id, now } => {
+            store.heartbeat(&node_id, now).map(|()| MetaReply::Unit)
+        }
+        MetaRequest::ListMembers => store.list_members().map(MetaReply::Members),
+        MetaRequest::SeedPgTable { entries } => {
+            store.seed_pg_table(&entries).map(MetaReply::Seeded)
+        }
+        MetaRequest::ListPgTable => store.list_pg_table().map(MetaReply::PgTable),
     };
     reply.map_err(|e| WireError {
         kind: e.kind().to_string(),
@@ -238,6 +253,50 @@ impl MetadataStore for MetaClient {
             tenant: tenant.to_string(),
         })? {
             MetaReply::Usage(u) => Ok(u),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()> {
+        match self.call(MetaRequest::RegisterNode {
+            node_id: node_id.to_string(),
+            endpoint: endpoint.to_string(),
+            now,
+        })? {
+            MetaReply::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn heartbeat(&self, node_id: &str, now: u64) -> Result<()> {
+        match self.call(MetaRequest::Heartbeat {
+            node_id: node_id.to_string(),
+            now,
+        })? {
+            MetaReply::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn list_members(&self) -> Result<Vec<NodeInfo>> {
+        match self.call(MetaRequest::ListMembers)? {
+            MetaReply::Members(m) => Ok(m),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn seed_pg_table(&self, entries: &[(u32, PgPlacement)]) -> Result<bool> {
+        match self.call(MetaRequest::SeedPgTable {
+            entries: entries.to_vec(),
+        })? {
+            MetaReply::Seeded(b) => Ok(b),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn list_pg_table(&self) -> Result<Vec<(u32, PgPlacement)>> {
+        match self.call(MetaRequest::ListPgTable)? {
+            MetaReply::PgTable(t) => Ok(t),
             _ => Err(unexpected()),
         }
     }

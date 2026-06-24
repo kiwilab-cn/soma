@@ -41,6 +41,10 @@ pub enum Error {
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
 
+    /// A heartbeat referenced a node that is not registered.
+    #[error("unknown node: {0}")]
+    UnknownNode(String),
+
     /// An error surfaced from a remote metadata node over RPC. Carries a stable
     /// kind tag so the S3 layer can still map it (see `kind()`).
     #[error("remote metadata error: {0}")]
@@ -58,6 +62,7 @@ impl Error {
             Error::InvalidBucketName(_) => "invalid_bucket_name",
             Error::NonUtf8Key => "non_utf8_key",
             Error::QuotaExceeded(_) => "quota_exceeded",
+            Error::UnknownNode(_) => "unknown_node",
             _ => "internal",
         }
     }
@@ -72,6 +77,7 @@ impl Error {
             "invalid_bucket_name" => Error::InvalidBucketName(message),
             "non_utf8_key" => Error::NonUtf8Key,
             "quota_exceeded" => Error::QuotaExceeded(message),
+            "unknown_node" => Error::UnknownNode(message),
             _ => Error::Remote(message),
         }
     }
