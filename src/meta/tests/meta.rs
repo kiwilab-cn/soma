@@ -516,6 +516,7 @@ fn pg_table_seeds_once_and_reads_back() {
                 pg,
                 PgPlacement {
                     node_ids: vec![format!("n{}", pg % 3), format!("n{}", (pg + 1) % 3)],
+                    target: Vec::new(),
                     generation: 1,
                 },
             )
@@ -537,6 +538,7 @@ fn pg_table_seeds_once_and_reads_back() {
         0,
         PgPlacement {
             node_ids: vec!["different".to_string()],
+            target: Vec::new(),
             generation: 9,
         },
     )];
@@ -558,6 +560,7 @@ fn membership_and_pg_table_persist_across_reopen() {
             0,
             PgPlacement {
                 node_ids: vec!["n1".to_string()],
+                target: Vec::new(),
                 generation: 1,
             },
         )])
@@ -566,4 +569,53 @@ fn membership_and_pg_table_persist_across_reopen() {
     let m = store(&dir);
     assert_eq!(m.list_members().unwrap().len(), 1);
     assert_eq!(m.list_pg_table().unwrap().len(), 1);
+}
+
+#[test]
+fn pg_migration_begin_and_finalize() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.seed_pg_table(&[(
+        0,
+        PgPlacement {
+            node_ids: vec!["n0".to_string(), "n1".to_string()],
+            target: Vec::new(),
+            generation: 1,
+        },
+    )])
+    .unwrap();
+
+    // Begin: records the target and bumps the generation.
+    m.begin_migration(0, vec!["n1".to_string(), "n2".to_string()])
+        .unwrap();
+    let p = m.pg_placement(0).unwrap().unwrap();
+    assert!(p.is_migrating());
+    assert_eq!(p.target, vec!["n1".to_string(), "n2".to_string()]);
+    assert_eq!(p.node_ids, vec!["n0".to_string(), "n1".to_string()]); // acting unchanged
+    assert_eq!(p.generation, 2);
+
+    // Finalize: target becomes acting, migration clears.
+    m.finalize_migration(0).unwrap();
+    let p = m.pg_placement(0).unwrap().unwrap();
+    assert!(!p.is_migrating());
+    assert_eq!(p.node_ids, vec!["n1".to_string(), "n2".to_string()]);
+    assert_eq!(p.generation, 3);
+
+    // Finalize again is a no-op (not migrating).
+    m.finalize_migration(0).unwrap();
+    assert_eq!(m.pg_placement(0).unwrap().unwrap().generation, 3);
+}
+
+#[test]
+fn list_object_ids_returns_committed_objects() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b", BucketOpts::default()).unwrap();
+    m.put_object("b", "k1", put(10, 0, 3, "e1"), PutCondition::None)
+        .unwrap();
+    m.put_object("b", "k2", put(20, 0, 3, "e2"), PutCondition::None)
+        .unwrap();
+    let mut ids = m.list_object_ids().unwrap();
+    ids.sort();
+    assert_eq!(ids, vec![10, 20]);
 }

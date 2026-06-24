@@ -75,7 +75,7 @@ impl StorageBackend for ReplicatedBackend {
     fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
         let mut acks = 0;
         let mut last_err = None;
-        for node in self.placement.nodes_for(object_id) {
+        for node in self.placement.write_nodes(object_id) {
             match node.put(object_id, data) {
                 Ok(()) => acks += 1,
                 Err(e) => last_err = Some(e),
@@ -94,7 +94,7 @@ impl StorageBackend for ReplicatedBackend {
     }
 
     fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
-        let replicas = self.placement.nodes_for(object_id);
+        let replicas = self.placement.read_nodes(object_id);
 
         // Ranged reads: fail over to the first replica that has the bytes; no
         // repair (we don't hold the full object to rewrite).
@@ -136,7 +136,7 @@ impl StorageBackend for ReplicatedBackend {
     fn delete(&self, object_id: ObjectId) -> Result<()> {
         let mut acks = 0;
         let mut last_err = None;
-        for node in self.placement.nodes_for(object_id) {
+        for node in self.placement.write_nodes(object_id) {
             match node.delete(object_id) {
                 Ok(()) => acks += 1,
                 Err(e) => last_err = Some(e),

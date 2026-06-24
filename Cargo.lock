@@ -2647,6 +2647,7 @@ dependencies = [
 name = "soma-cluster"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "postcard",
  "prost",
  "reed-solomon-simd",

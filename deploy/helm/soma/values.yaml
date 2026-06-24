@@ -29,6 +29,18 @@ ports:
 replication:
   factor: 3
   writeQuorum: 2
+  # How often (seconds) the gateway refreshes placement so node joins and PG
+  # migrations are picked up live.
+  placementRefreshSecs: 10
+
+# Online rebalance controller (meta role). The mover is throttled so migration
+# uses spare bandwidth and never disturbs foreground throughput.
+rebalance:
+  enabled: true
+  intervalSecs: 30
+  # Minimum seconds a PG migrates before finalize (>= placementRefreshSecs).
+  settleSecs: 30
+  maxCopiesPerPass: 64
 
 erasure:
   enabled: false

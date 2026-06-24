@@ -16,8 +16,8 @@ use soma_backend::{
     StorageBackend,
 };
 use soma_cluster::{
-    serve_meta, serve_storage, ErasureCodedBackend, MetaClient, Placement, ReplicatedBackend,
-    DEFAULT_PG_COUNT,
+    serve_meta, serve_storage, ErasureCodedBackend, MetaClient, Placement, RebalanceController,
+    ReplicatedBackend, DEFAULT_PG_COUNT,
 };
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, QosPolicy, S3Service};
@@ -203,6 +203,23 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
             .await?;
     let node_count = placement.node_count();
 
+    // Refresh placement periodically so node joins and PG migrations are picked up
+    // live (membership + PG table). The backend shares this view (Arc).
+    {
+        let refresher = placement.clone();
+        let meta_for_refresh = meta_client.clone();
+        let refresh_secs = cfg.placement_refresh_secs.max(1);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = refresher.refresh(&meta_for_refresh, now_secs()).await {
+                    tracing::debug!(error = %e, "placement refresh failed");
+                }
+            }
+        });
+    }
+
     let storage: Arc<dyn StorageBackend> = if cfg.erasure.enabled {
         Arc::new(ErasureCodedBackend::from_placement(
             placement,
@@ -243,12 +260,36 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     serve_s3_and_admin(&cfg, service, metrics, "gateway").await
 }
 
-/// Metadata node: serves `MetadataStore` over gRPC.
+/// Metadata node: serves `MetadataStore` over gRPC, plus the rebalance controller.
 async fn run_meta(cfg: Config) -> Result<(), BoxError> {
-    let store = open_meta(&cfg)?;
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let store = Arc::new(RedbMetaStore::open(format!("{}/meta.redb", cfg.data_dir))?);
+
+    // The rebalance controller reconciles placement toward live membership and
+    // moves data for migrating PGs (throttled). It needs the concrete store.
+    if cfg.rebalance.enabled {
+        let controller = RebalanceController::new(
+            store.clone(),
+            cfg.replication_factor,
+            DEFAULT_PG_COUNT,
+            std::time::Duration::from_secs(cfg.rebalance.settle_secs),
+            cfg.rebalance.max_copies_per_pass,
+        );
+        tracing::info!(
+            interval_secs = cfg.rebalance.interval_secs,
+            settle_secs = cfg.rebalance.settle_secs,
+            max_copies_per_pass = cfg.rebalance.max_copies_per_pass,
+            "rebalance controller enabled"
+        );
+        tokio::spawn(controller.run(std::time::Duration::from_secs(
+            cfg.rebalance.interval_secs.max(1),
+        )));
+    }
+
     let addr: SocketAddr = cfg.listen.parse()?;
+    let serving: Arc<dyn MetadataStore> = store;
     tracing::info!(listen = %addr, data_dir = %cfg.data_dir, "soma meta node listening");
-    serve_meta(addr, store).await?;
+    serve_meta(addr, serving).await?;
     Ok(())
 }
 

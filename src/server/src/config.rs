@@ -72,6 +72,11 @@ pub struct Config {
     pub replication_factor: usize,
     /// Replicas that must durably ack a write to succeed.
     pub write_quorum: usize,
+    /// Gateway: how often (seconds) to refresh placement (membership + PG table)
+    /// so node joins and migrations are picked up live.
+    pub placement_refresh_secs: u64,
+    /// Rebalance controller tuning (meta role).
+    pub rebalance: RebalanceConfig,
     /// Storage tuning.
     pub storage: StorageConfig,
     /// Read-cache tuning.
@@ -102,6 +107,33 @@ pub struct TenantConfig {
     pub rate_limit_rps: f64,
     /// Token-bucket burst capacity in requests (defaults to `rate_limit_rps`).
     pub rate_limit_burst: f64,
+}
+
+/// Rebalance controller tuning (meta role). The mover is throttled so migration
+/// uses spare bandwidth and never disturbs foreground throughput.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RebalanceConfig {
+    /// Whether the controller runs (meta role).
+    pub enabled: bool,
+    /// Reconcile interval in seconds.
+    pub interval_secs: u64,
+    /// Minimum seconds a PG migrates before it may finalize (≥ the gateway
+    /// `placement_refresh_secs`, so all gateways are dual-writing first).
+    pub settle_secs: u64,
+    /// Max object copies the mover performs per reconcile pass (the throttle).
+    pub max_copies_per_pass: usize,
+}
+
+impl Default for RebalanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 30,
+            settle_secs: 30,
+            max_copies_per_pass: 64,
+        }
+    }
 }
 
 /// Storage tuning.
@@ -191,6 +223,8 @@ impl Default for Config {
             advertise_endpoint: String::new(),
             replication_factor: 3,
             write_quorum: 2,
+            placement_refresh_secs: 10,
+            rebalance: RebalanceConfig::default(),
             storage: StorageConfig::default(),
             cache: CacheConfig::default(),
             erasure: ErasureConfig::default(),
