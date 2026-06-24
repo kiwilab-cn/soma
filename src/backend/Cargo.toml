@@ -13,6 +13,8 @@ soma-core.workspace = true
 crc32c.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
+bytes.workspace = true
+foyer.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

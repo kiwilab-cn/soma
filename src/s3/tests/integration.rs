@@ -14,7 +14,7 @@ use object_store::{MultipartUpload, ObjectStore, PutMode, PutOptions, PutPayload
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-use soma_backend::{BackendConfig, LocalFsBackend, StorageBackend};
+use soma_backend::{BackendConfig, CachingBackend, LocalFsBackend, StorageBackend};
 use soma_meta::{BucketOpts, MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -30,6 +30,27 @@ async fn serve(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) {
     let backend = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
     let meta: Arc<dyn MetadataStore> = meta;
     let backend: Arc<dyn StorageBackend> = backend;
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    (port, handle)
+}
+
+/// Like [`serve`], but the storage backend is wrapped in the in-memory cache, so
+/// the full S3 stack runs through `CachingBackend`.
+async fn serve_cached(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) {
+    let meta = Arc::new(RedbMetaStore::open(dir.join("meta.redb")).unwrap());
+    if create_bucket {
+        meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    }
+    let fs = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
+    let meta: Arc<dyn MetadataStore> = meta;
+    let backend: Arc<dyn StorageBackend> =
+        Arc::new(CachingBackend::new(fs, 16 * 1024 * 1024, 1024 * 1024));
     let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -167,6 +188,52 @@ async fn object_store_multipart() {
     expected.extend_from_slice(&part2);
     assert_eq!(got.len(), expected.len());
     assert_eq!(got.as_ref(), expected.as_slice());
+
+    stop(handle).await;
+}
+
+#[tokio::test]
+async fn object_store_roundtrip_through_cache() {
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve_cached(dir.path(), true).await;
+    let store = client(port);
+
+    let key = OPath::from("cached.txt");
+    let payload = b"served from the cache on the second read";
+    store
+        .put(&key, PutPayload::from_static(payload))
+        .await
+        .unwrap();
+
+    // Two reads through the caching backend return identical bytes; the second
+    // is served from memory.
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+    // A range read of the cached small object is also correct.
+    assert_eq!(
+        store.get_range(&key, 7u64..11).await.unwrap().as_ref(),
+        &payload[7..11] // "from"
+    );
 
     stop(handle).await;
 }
