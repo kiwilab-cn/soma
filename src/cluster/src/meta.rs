@@ -9,8 +9,8 @@ use tonic::{Request, Response, Status};
 
 use soma_core::ObjectId;
 use soma_meta::{
-    BucketMeta, BucketOpts, Error, ListRequest, ListResult, MetadataStore, NodeInfo, ObjectMeta,
-    ObjectPut, PgPlacement, PutCondition, Result, TenantUsage, Version,
+    BucketMeta, BucketOpts, Error, ListRequest, ListResult, MetadataStore, NodeInfo, NodeState,
+    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Result, TenantUsage, Version,
 };
 
 use crate::bridge::Bridge;
@@ -85,6 +85,9 @@ fn dispatch(
         MetaRequest::Heartbeat { node_id, now } => {
             store.heartbeat(&node_id, now).map(|()| MetaReply::Unit)
         }
+        MetaRequest::SetNodeState { node_id, state } => store
+            .set_node_state(&node_id, state)
+            .map(|()| MetaReply::Unit),
         MetaRequest::ListMembers => store.list_members().map(MetaReply::Members),
         MetaRequest::SeedPgTable { entries } => {
             store.seed_pg_table(&entries).map(MetaReply::Seeded)
@@ -272,6 +275,16 @@ impl MetadataStore for MetaClient {
         match self.call(MetaRequest::Heartbeat {
             node_id: node_id.to_string(),
             now,
+        })? {
+            MetaReply::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn set_node_state(&self, node_id: &str, state: NodeState) -> Result<()> {
+        match self.call(MetaRequest::SetNodeState {
+            node_id: node_id.to_string(),
+            state,
         })? {
             MetaReply::Unit => Ok(()),
             _ => Err(unexpected()),

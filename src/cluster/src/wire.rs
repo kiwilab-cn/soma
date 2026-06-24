@@ -52,6 +52,10 @@ pub(crate) enum MetaRequest {
         node_id: String,
         now: u64,
     },
+    SetNodeState {
+        node_id: String,
+        state: soma_meta::NodeState,
+    },
     ListMembers,
     SeedPgTable {
         entries: Vec<(u32, PgPlacement)>,

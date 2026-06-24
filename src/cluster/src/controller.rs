@@ -1,19 +1,26 @@
-//! Rebalance controller (M3b): reconciles the stored PG table toward the target
-//! placement implied by live membership, and moves data for migrating PGs.
+//! Rebalance + self-heal controller (M3b/M3c): reconciles the stored PG table
+//! toward the target placement implied by live membership, and moves data for
+//! migrating PGs.
 //!
 //! It runs in the **meta** role, holding the concrete metadata store (direct, no
 //! RPC) and a `StorageClient` per node. The mover is **throttled** — a bounded
 //! number of object copies per pass — so rebalance bleeds in using spare bandwidth
 //! and never disturbs foreground S3 throughput (the project's constraint).
 //!
-//! Protocol (replication; erasure reconstruction is M3d):
+//! Each reconcile first sweeps liveness: a node whose heartbeat is stale is marked
+//! `Down` (explicit, observable state). Only `Active` nodes are placement targets,
+//! so a `Down` or `Draining` node's PGs migrate off it — node-loss re-replication
+//! and graceful drain are the same machinery as scale-out (M3c).
+//!
+//! Migration protocol (replication; erasure reconstruction is M3d):
 //! 1. For a PG whose acting set ≠ target, `begin_migration` records the target.
 //!    Gateways pick this up on refresh and start dual-writing (`acting ∪ target`).
 //! 2. The mover copies each of the PG's objects from an acting node to the new
 //!    target nodes, a few per pass.
 //! 3. Once every object is present on the target **and** the PG has been migrating
 //!    longer than `settle` (so all gateways have refreshed and are dual-writing),
-//!    `finalize_migration` flips the acting set to the target.
+//!    `finalize_migration` flips the acting set to the target and stale replicas on
+//!    dropped nodes are reclaimed (best-effort).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use soma_backend::{Error as BackendError, StorageBackend};
-use soma_meta::{MetadataStore, RedbMetaStore};
+use soma_meta::{MetadataStore, NodeState, RedbMetaStore};
 
-use crate::placement::{compute_pg_table, member_is_live};
+use crate::placement::compute_pg_table;
 use crate::ring::hash64;
 use crate::StorageClient;
 
@@ -50,6 +57,7 @@ struct Inner {
     pg_count: u32,
     settle: Duration,
     max_copies_per_pass: usize,
+    down_after_secs: u64,
 }
 
 /// Drives PG migration to match live membership. Cheap to clone (shared state).
@@ -63,12 +71,14 @@ impl RebalanceController {
     /// replica factor; `settle` is the minimum time a PG migrates before it may
     /// finalize (≥ the gateway refresh interval); `max_copies_per_pass` throttles
     /// the mover.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<RedbMetaStore>,
         width: usize,
         pg_count: u32,
         settle: Duration,
         max_copies_per_pass: usize,
+        down_after_secs: u64,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -79,6 +89,7 @@ impl RebalanceController {
                 pg_count,
                 settle,
                 max_copies_per_pass,
+                down_after_secs,
             }),
         }
     }
@@ -119,15 +130,35 @@ impl RebalanceController {
     /// batch of data, and finalize PGs whose data has landed and settled.
     pub async fn reconcile_once(&self, now: u64) -> Result<ReconcileReport, BoxError> {
         let store = self.inner.store.clone();
-        let members = tokio::task::spawn_blocking(move || store.list_members()).await??;
-        let live: Vec<_> = members
-            .into_iter()
-            .filter(|n| member_is_live(n, now))
-            .collect();
-        for m in &live {
+        let mut members = tokio::task::spawn_blocking(move || store.list_members()).await??;
+
+        // Liveness sweep: mark a node Down once its heartbeat is stale. This is the
+        // explicit, observable state a future admin UI reads — placement targets
+        // then exclude it and its PGs re-replicate (self-heal).
+        for m in &mut members {
+            let stale = now.saturating_sub(m.last_heartbeat) > self.inner.down_after_secs;
+            if stale && m.state != NodeState::Down {
+                let s = self.inner.store.clone();
+                let id = m.node_id.clone();
+                tokio::task::spawn_blocking(move || s.set_node_state(&id, NodeState::Down))
+                    .await??;
+                m.state = NodeState::Down;
+            }
+        }
+
+        // Connect to every reachable node (Active sources/targets and Draining
+        // sources). Down nodes are unreachable; the mover routes around them.
+        for m in members.iter().filter(|m| m.state != NodeState::Down) {
             self.ensure_client(&m.node_id, &m.endpoint).await?;
         }
-        let mut node_ids: Vec<String> = live.iter().map(|n| n.node_id.clone()).collect();
+
+        // Target-eligible nodes are Active only — Down and Draining are excluded so
+        // their data migrates off them.
+        let mut node_ids: Vec<String> = members
+            .iter()
+            .filter(|m| m.state == NodeState::Active)
+            .map(|m| m.node_id.clone())
+            .collect();
         node_ids.sort();
 
         let this = self.clone();
@@ -185,6 +216,16 @@ impl RebalanceController {
             if done && settled {
                 inner.store.finalize_migration(*pg)?;
                 inner.started.lock().remove(pg);
+                // Reclaim stale replicas on nodes dropped from the acting set
+                // (best-effort; a Down node is unreachable and reclaimed by GC).
+                cleanup_stale(
+                    *pg,
+                    &placement.node_ids,
+                    &placement.target,
+                    &object_ids,
+                    &clients,
+                    inner.pg_count,
+                );
                 report.finalized += 1;
                 report.migrating -= 1;
             }
@@ -259,6 +300,31 @@ fn migrate_pg(
         }
     }
     Ok((all_present, copied))
+}
+
+/// Delete a PG's objects from nodes dropped from the acting set (best-effort).
+fn cleanup_stale(
+    pg: u32,
+    old_acting: &[String],
+    target: &[String],
+    object_ids: &[u64],
+    clients: &HashMap<String, Arc<dyn StorageBackend>>,
+    pg_count: u32,
+) {
+    let dropped: Vec<&String> = old_acting.iter().filter(|a| !target.contains(a)).collect();
+    if dropped.is_empty() {
+        return;
+    }
+    for &oid in object_ids {
+        if (hash64(&oid) % pg_count.max(1) as u64) as u32 != pg {
+            continue;
+        }
+        for node in &dropped {
+            if let Some(c) = clients.get(*node) {
+                let _ = c.delete(oid);
+            }
+        }
+    }
 }
 
 /// Read an object from the first acting node that has it.

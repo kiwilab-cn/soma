@@ -1142,8 +1142,14 @@ async fn scale_out_rebalances_data_to_new_node() {
     // Scale out: register the 3rd node and drive the controller (throttled, instant
     // settle for the test), refreshing the gateway each round so it dual-writes.
     register_nodes(&meta_client, &nodes[2..3], now).await;
-    let controller =
-        RebalanceController::new(store.clone(), 2, DEFAULT_PG_COUNT, Duration::ZERO, 1000);
+    let controller = RebalanceController::new(
+        store.clone(),
+        2,
+        DEFAULT_PG_COUNT,
+        Duration::ZERO,
+        1000,
+        3600,
+    );
     let mut iters = 0;
     loop {
         placement.refresh(&meta_client, now).await.unwrap();
@@ -1174,4 +1180,234 @@ async fn scale_out_rebalances_data_to_new_node() {
         let count = backends.iter().filter(|b| b.get(oid, None).is_ok()).count();
         assert!(count >= 2, "object {oid} under-replicated ({count} copies)");
     }
+}
+
+/// Heartbeat a set of nodes at `now` (keeping them live), over gRPC.
+async fn heartbeat_nodes(meta: &Arc<soma_cluster::MetaClient>, ids: &[String], now: u64) {
+    use soma_meta::MetadataStore;
+    let c = meta.clone();
+    let ids = ids.to_vec();
+    tokio::task::spawn_blocking(move || {
+        for id in &ids {
+            c.heartbeat(id, now).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Build a 3-node membership cluster (RF=2) with objects written, returning the
+/// pieces a self-heal/drain test drives. The gateway resolves placement from
+/// membership; storage backends are handed back so the test can inspect what's at
+/// rest and kill nodes.
+struct HealFixture {
+    _dir: TempDir,
+    store: Arc<RedbMetaStore>,
+    meta_client: Arc<soma_cluster::MetaClient>,
+    placement: soma_cluster::Placement,
+    backends: Vec<Arc<dyn StorageBackend>>,
+    storage_tasks: Vec<JoinHandle<()>>,
+    api: AmazonS3,
+    object_ids: Vec<u64>,
+    n: usize,
+}
+
+async fn heal_fixture(now: u64) -> HealFixture {
+    use soma_cluster::{
+        serve_meta, serve_storage, MetaClient, Placement, ReplicatedBackend, DEFAULT_PG_COUNT,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    store.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let meta_port = free_port();
+    {
+        let s: Arc<dyn MetadataStore> = store.clone();
+        tokio::spawn(async move {
+            let _ = serve_meta(sock(meta_port), s).await;
+        });
+    }
+
+    let mut backends: Vec<Arc<dyn StorageBackend>> = Vec::new();
+    let mut storage_tasks = Vec::new();
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        let port = free_port();
+        let sdir = dir.path().join(format!("s{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFsBackend::open(&sdir, BackendConfig::default()).unwrap());
+        backends.push(backend.clone());
+        storage_tasks.push(tokio::spawn(async move {
+            let _ = serve_storage(sock(port), backend).await;
+        }));
+        nodes.push((format!("node-{i}"), format!("http://127.0.0.1:{port}")));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let meta_client = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+    register_nodes(&meta_client, &nodes, now).await;
+
+    let placement = Placement::from_membership(meta_client.clone(), 2, DEFAULT_PG_COUNT, now)
+        .await
+        .unwrap();
+    let repl: Arc<dyn StorageBackend> =
+        Arc::new(ReplicatedBackend::from_placement(placement.clone(), 1));
+    let meta_dyn: Arc<dyn MetadataStore> = meta_client.clone();
+    let svc = S3Service::new(meta_dyn, repl, Credentials::single("AK", "SK"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let s3_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    let api = client(s3_port);
+
+    let n = 24usize;
+    for i in 0..n {
+        api.put(
+            &OPath::from(format!("obj-{i}")),
+            PutPayload::from(format!("payload-{i}").into_bytes()),
+        )
+        .await
+        .unwrap();
+    }
+    let object_ids = store.list_object_ids().unwrap();
+
+    HealFixture {
+        _dir: dir,
+        store,
+        meta_client,
+        placement,
+        backends,
+        storage_tasks,
+        api,
+        object_ids,
+        n,
+    }
+}
+
+/// A `Down` node (stale heartbeat) triggers re-replication of its PGs onto the
+/// survivors — every object ends up on the replica factor of live nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_loss_re_replicates_to_survivors() {
+    use soma_cluster::{RebalanceController, DEFAULT_PG_COUNT};
+    use std::time::Duration;
+
+    let t0 = 1_000_000u64;
+    let f = heal_fixture(t0).await;
+
+    // node-2 dies: stop it and stop heartbeating it; the survivors keep beating.
+    f.storage_tasks[2].abort();
+    let later = t0 + 1000;
+    heartbeat_nodes(&f.meta_client, &["node-0".into(), "node-1".into()], later).await;
+
+    // Controller with down_after=100s: at `later`, node-2 is stale → Down.
+    let controller = RebalanceController::new(
+        f.store.clone(),
+        2,
+        DEFAULT_PG_COUNT,
+        Duration::ZERO,
+        1000,
+        100,
+    );
+    let mut iters = 0;
+    loop {
+        f.placement.refresh(&f.meta_client, later).await.unwrap();
+        let r = controller.reconcile_once(later).await.unwrap();
+        iters += 1;
+        if r.migrating == 0 && iters > 1 {
+            break;
+        }
+        assert!(iters < 80, "self-heal did not converge");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    f.placement.refresh(&f.meta_client, later).await.unwrap();
+
+    // Everything still readable, and every object lives on both survivors.
+    for i in 0..f.n {
+        let got = f
+            .api
+            .get(&OPath::from(format!("obj-{i}")))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), format!("payload-{i}").as_bytes());
+    }
+    for &oid in &f.object_ids {
+        let live = [&f.backends[0], &f.backends[1]]
+            .iter()
+            .filter(|b| b.get(oid, None).is_ok())
+            .count();
+        assert_eq!(live, 2, "object {oid} not re-replicated to both survivors");
+    }
+}
+
+/// Draining a node migrates its data off (it stays up as a source) and frees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_migrates_data_off_a_node() {
+    use soma_cluster::{RebalanceController, DEFAULT_PG_COUNT};
+    use soma_meta::{MetadataStore, NodeState};
+    use std::time::Duration;
+
+    let t0 = 1_000_000u64;
+    let f = heal_fixture(t0).await;
+
+    // Drain node-2 (as the admin endpoint would): mark it Draining.
+    {
+        let c = f.meta_client.clone();
+        tokio::task::spawn_blocking(move || {
+            c.set_node_state("node-2", NodeState::Draining).unwrap()
+        })
+        .await
+        .unwrap();
+    }
+
+    let controller = RebalanceController::new(
+        f.store.clone(),
+        2,
+        DEFAULT_PG_COUNT,
+        Duration::ZERO,
+        1000,
+        3600, // don't mark anyone Down in this test
+    );
+    let mut iters = 0;
+    loop {
+        f.placement.refresh(&f.meta_client, t0).await.unwrap();
+        let r = controller.reconcile_once(t0).await.unwrap();
+        iters += 1;
+        if r.migrating == 0 && iters > 1 {
+            break;
+        }
+        assert!(iters < 80, "drain did not converge");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    f.placement.refresh(&f.meta_client, t0).await.unwrap();
+
+    // Everything still readable, and node-2 has been emptied (stale copies reclaimed).
+    for i in 0..f.n {
+        let got = f
+            .api
+            .get(&OPath::from(format!("obj-{i}")))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), format!("payload-{i}").as_bytes());
+    }
+    let on_drained = f
+        .object_ids
+        .iter()
+        .filter(|&&o| f.backends[2].get(o, None).is_ok())
+        .count();
+    assert_eq!(
+        on_drained, 0,
+        "drained node still holds {on_drained} objects"
+    );
 }

@@ -17,3 +17,4 @@ data:
     interval_secs = {{ .Values.rebalance.intervalSecs }}
     settle_secs = {{ .Values.rebalance.settleSecs }}
     max_copies_per_pass = {{ .Values.rebalance.maxCopiesPerPass }}
+    down_after_secs = {{ .Values.rebalance.downAfterSecs }}

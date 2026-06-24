@@ -41,6 +41,8 @@ rebalance:
   # Minimum seconds a PG migrates before finalize (>= placementRefreshSecs).
   settleSecs: 30
   maxCopiesPerPass: 64
+  # Seconds without a heartbeat before a node is marked Down (self-heal trigger).
+  downAfterSecs: 90
 
 erasure:
   enabled: false

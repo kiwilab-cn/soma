@@ -332,6 +332,22 @@ impl MetadataStore for RedbMetaStore {
         Ok(())
     }
 
+    fn set_node_state(&self, node_id: &str, state: NodeState) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(MEMBERS)?;
+            let raw = match t.get(node_id)? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(Error::UnknownNode(node_id.to_string())),
+            };
+            let mut info: NodeInfo = postcard::from_bytes(&raw)?;
+            info.state = state;
+            t.insert(node_id, postcard::to_allocvec(&info)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     fn list_members(&self) -> Result<Vec<NodeInfo>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(MEMBERS)?;
