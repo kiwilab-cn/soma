@@ -39,12 +39,37 @@ index — the design lesson shared by Facebook Haystack, SeaweedFS, and CDN cach
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the full system design.
 - [`docs/MVP_DESIGN.md`](docs/MVP_DESIGN.md) — the M0 (single-node skeleton) design.
 
+## Run (M0)
+
+```sh
+cargo run --bin soma-server
+# defaults: listen 0.0.0.0:9000, data ./soma-data, key soma / soma-secret
+# override via env: SOMA_LISTEN, SOMA_DATA_DIR, SOMA_ACCESS_KEY, SOMA_SECRET_KEY
+```
+
+Point any S3 client at it (path-style, region `us-east-1`). With the Rust
+`object_store` crate:
+
+```rust
+let store = object_store::aws::AmazonS3Builder::new()
+    .with_endpoint("http://127.0.0.1:9000")
+    .with_region("us-east-1")
+    .with_bucket_name("my-bucket")
+    .with_access_key_id("soma")
+    .with_secret_access_key("soma-secret")
+    .with_allow_http(true)
+    .build()?;
+```
+
 ## Status
 
-Early development. The architecture is settled and implementation proceeds by
-milestones (M0 single-node skeleton → M1 stateless + cache → M2 distributed
-durability → M3 elastic scale → M4 hardening + AI ingest). See the milestone table
-in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#13-milestones).
+Early development. **M0 (single-node skeleton) is complete**: an S3-compatible
+endpoint (bucket lifecycle, single-part object CRUD, range reads, ListObjectsV2,
+multipart upload, conditional writes, SigV4) over the volume + needle on-disk
+format, durable across restarts — validated end-to-end with the `object_store`
+client. Implementation proceeds by milestones (M0 → M1 stateless + cache → M2
+distributed durability → M3 elastic scale → M4 hardening + AI ingest). See the
+milestone table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#13-milestones).
 
 ## License
 
