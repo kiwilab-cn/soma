@@ -126,12 +126,47 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Storage node: serves `StorageBackend` over gRPC.
+/// Storage node: serves `StorageBackend` over gRPC, with a background scrubber.
 async fn run_storage(cfg: Config) -> Result<(), BoxError> {
-    let backend = open_backend(&cfg)?;
+    let backend = Arc::new(LocalFsBackend::open(
+        &cfg.data_dir,
+        BackendConfig {
+            volume_max: cfg.volume_max_bytes(),
+        },
+    )?);
+
+    let scrub_secs = cfg.storage.scrub_interval_secs;
+    if scrub_secs > 0 {
+        let b = backend.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(scrub_secs));
+            loop {
+                ticker.tick().await;
+                let b2 = b.clone();
+                if let Ok(Ok(report)) = tokio::task::spawn_blocking(move || b2.scrub()).await {
+                    if report.corrupt.is_empty() {
+                        tracing::debug!(checked = report.checked, "scrub clean");
+                    } else {
+                        tracing::warn!(
+                            checked = report.checked,
+                            corrupt = report.corrupt.len(),
+                            "scrub detected payload corruption"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let addr: SocketAddr = cfg.listen.parse()?;
-    tracing::info!(listen = %addr, data_dir = %cfg.data_dir, "soma storage node listening");
-    serve_storage(addr, backend).await?;
+    let serving: Arc<dyn StorageBackend> = backend;
+    tracing::info!(
+        listen = %addr,
+        data_dir = %cfg.data_dir,
+        scrub_interval_secs = scrub_secs,
+        "soma storage node listening"
+    );
+    serve_storage(addr, serving).await?;
     Ok(())
 }
 

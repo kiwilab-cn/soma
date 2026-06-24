@@ -78,6 +78,8 @@ pub struct Config {
 pub struct StorageConfig {
     /// Rotate to a new volume past this size (human-readable, e.g. `"4GiB"`).
     pub volume_max: String,
+    /// Bitrot scrub interval in seconds for the storage role (0 disables).
+    pub scrub_interval_secs: u64,
 }
 
 /// Read-cache tuning.
@@ -126,6 +128,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             volume_max: "4GiB".to_string(),
+            scrub_interval_secs: 3600,
         }
     }
 }

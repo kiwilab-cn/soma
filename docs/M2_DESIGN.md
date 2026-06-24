@@ -252,6 +252,15 @@ Background, low-priority, reliability-over-speed (an explicit project constraint
 Reads during migration use the group table, which only flips to new nodes **after**
 the data is copied, so reads always find a complete replica set.
 
+> **M2c ships the two mechanisms that need no mutable placement:** a **bitrot
+> scrub** on each storage node (periodically re-verifies every needle's payload
+> CRC and reports corruption) and **read-repair** in the replicated backend (a
+> full read queries every replica and best-effort rewrites the object to any
+> replica that is up but missing it — e.g. a node that was down during the
+> write). Proactive cluster-wide **re-replication on node loss** and **scale-out
+> rebalance** depend on the mutable placement-group table and a repair
+> coordinator; they land with that table (a later step), not here.
+
 ---
 
 ## 11. What stays single-node, and the path to metadata HA

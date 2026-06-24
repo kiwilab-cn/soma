@@ -25,7 +25,7 @@ mod local;
 
 pub use cache::{CacheStats, CachingBackend};
 pub use error::{Error, Result};
-pub use local::{BackendConfig, LocalFsBackend};
+pub use local::{BackendConfig, LocalFsBackend, ScrubReport};
 
 use soma_core::ObjectId;
 

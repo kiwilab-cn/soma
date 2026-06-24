@@ -88,14 +88,45 @@ impl StorageBackend for ReplicatedBackend {
     }
 
     fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
+        let replicas = self.replicas(object_id);
+
+        // Ranged reads: fail over to the first replica that has the bytes; no
+        // repair (we don't hold the full object to rewrite).
+        if range.is_some() {
+            let mut last_err = None;
+            for &node in &replicas {
+                match self.nodes[node].get(object_id, range) {
+                    Ok(data) => return Ok(data),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            return Err(last_err.unwrap_or(Error::ObjectNotFound(object_id)));
+        }
+
+        // Full reads: query every replica so read-repair can refill any that are
+        // up but missing the object (e.g. a node that was down during the write).
+        // (This trades read amplification for self-heal; a background/async repair
+        // pass is a later optimization.)
+        let mut found: Option<Vec<u8>> = None;
+        let mut missing = Vec::new();
         let mut last_err = None;
-        for &node in &self.replicas(object_id) {
-            match self.nodes[node].get(object_id, range) {
-                Ok(data) => return Ok(data),
+        for &node in &replicas {
+            match self.nodes[node].get(object_id, None) {
+                Ok(data) => {
+                    if found.is_none() {
+                        found = Some(data);
+                    }
+                }
+                Err(Error::ObjectNotFound(_)) => missing.push(node),
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or(Error::ObjectNotFound(object_id)))
+        let data = found.ok_or_else(|| last_err.unwrap_or(Error::ObjectNotFound(object_id)))?;
+        // Read-repair: best-effort rewrite to replicas that lacked the object.
+        for &node in &missing {
+            let _ = self.nodes[node].put(object_id, &data);
+        }
+        Ok(data)
     }
 
     fn delete(&self, object_id: ObjectId) -> Result<()> {
