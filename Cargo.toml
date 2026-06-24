@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/soma-core",
-    "crates/soma-meta",
-    "crates/soma-backend",
-    "crates/soma-s3",
-    "crates/soma-server",
+    "src/core",
+    "src/meta",
+    "src/backend",
+    "src/s3",
+    "src/server",
 ]
-default-members = ["crates/soma-server"]
+default-members = ["src/server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,11 +28,11 @@ expect_used = "deny"
 panic = "deny"
 
 [workspace.dependencies]
-# Internal crates
-soma-core = { path = "crates/soma-core" }
-soma-meta = { path = "crates/soma-meta" }
-soma-backend = { path = "crates/soma-backend" }
-soma-s3 = { path = "crates/soma-s3" }
+# Internal crates (live under src/, kokedb-style)
+soma-core = { path = "src/core" }
+soma-meta = { path = "src/meta" }
+soma-backend = { path = "src/backend" }
+soma-s3 = { path = "src/s3" }
 
 # Third-party
 crc32c = "0.6"

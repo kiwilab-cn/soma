@@ -41,27 +41,37 @@ implementation; `LocalFsBackend` is joined by `ReplicatedBackend` / `ErasureCode
 
 ## 2. Cargo workspace layout
 
-A multi-crate workspace from day one, matching the rigor of the sibling Rust
-projects.
+A multi-crate workspace from day one, organized the same way as the sibling Rust
+projects (kokedb): each member crate lives under `src/<name>/`, with shared
+version, lints, and **centralized dependency versions** declared once in the root
+`[workspace.*]` tables. Each crate then lists only the dependencies it needs via
+`<dep>.workspace = true`, so dependency surfaces stay minimal and per-crate while
+versions never drift.
 
 ```
 soma/
-├── Cargo.toml                 # [workspace] — shared deps, lints, members
-├── crates/
-│   ├── soma-core/             # needle/volume codec, hot index, error types, ids
-│   ├── soma-meta/             # MetadataStore trait + redb implementation
-│   ├── soma-backend/          # StorageBackend trait + LocalFsBackend
-│   ├── soma-s3/               # S3 protocol (request/response, XML), SigV4 auth
-│   └── soma-server/           # binary: wires the above into an HTTP server
-├── docs/
-└── tests/                     # workspace-level integration tests
+├── Cargo.toml                 # [workspace] — members, [workspace.package/lints/dependencies]
+├── src/
+│   ├── core/                  # crate soma-core: needle/volume codec, hot index, ids, Error
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   ├── backend/               # crate soma-backend: StorageBackend + LocalFsBackend
+│   ├── meta/                  # crate soma-meta: MetadataStore + RedbMetaStore
+│   ├── s3/                    # crate soma-s3: S3 protocol + SigV4
+│   └── server/                # crate soma-server: binary, wires the above together
+└── docs/
 ```
 
-Dependency direction (no cycles):
+Each crate keeps its own `tests/` for integration tests. Dependency direction (no
+cycles):
 
 ```
 soma-server → soma-s3 → { soma-meta, soma-backend } → soma-core
 ```
+
+Keep the base crate light: `soma-core` pulls no async runtime and no heavy deps,
+so it stays embeddable — mirroring how kokedb forbids DataFusion deps in its base
+`common` crate.
 
 ### Crate responsibilities
 
