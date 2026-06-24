@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use soma_core::{
-    encode_needle, scan, verify_data, NeedleHeader, NeedleLoc, ObjectId, ObjectLocation, VolumeId,
-    FLAG_TOMBSTONE, HEADER_LEN,
+    encode_needle, padded_needle_len, scan, verify_data, NeedleHeader, NeedleLoc, ObjectId,
+    ObjectLocation, VolumeId, FLAG_TOMBSTONE, HEADER_LEN,
 };
 
 use crate::error::{Error, Result};
@@ -201,6 +201,14 @@ impl LocalFsBackend {
         let vols_dir = dir.join("volumes");
         std::fs::create_dir_all(&vols_dir)?;
 
+        // Discard any compaction temp left by a crash (the original is intact).
+        for entry in std::fs::read_dir(&vols_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
         let mut ids = discover_volume_ids(&vols_dir)?;
         ids.sort_unstable();
 
@@ -270,6 +278,139 @@ impl LocalFsBackend {
         }
         Ok(report)
     }
+}
+
+impl LocalFsBackend {
+    /// Compact sealed volumes, reclaiming the space of dead needles — those an
+    /// overwrite (same id), a delete (tombstone), or a migration superseded. A
+    /// volume is rewritten with only its still-live needles iff at least
+    /// `min_reclaim_ratio` of it is reclaimable (skipping near-full volumes avoids
+    /// pointless rewrites). The active append volume is never touched.
+    ///
+    /// Crash-safe: the live needles are written to a temp file and fsynced, then
+    /// atomically renamed over the volume. A crash before the rename leaves the
+    /// original intact; a crash after it leaves a smaller, correct volume that
+    /// recovery re-scans. The heavy scan/copy runs without the lock (sealed volumes
+    /// are immutable); only the swap holds it.
+    pub fn compact(&self, min_reclaim_ratio: f64) -> Result<CompactReport> {
+        let (dir, sealed) = {
+            let inner = self.inner.lock();
+            let sealed: Vec<u32> = inner
+                .volumes
+                .keys()
+                .copied()
+                .filter(|&id| id != inner.active)
+                .collect();
+            (inner.dir.clone(), sealed)
+        };
+        let mut report = CompactReport::default();
+        for vid in sealed {
+            let one = self.compact_one(&dir, vid, min_reclaim_ratio)?;
+            report.volumes_compacted += one.volumes_compacted;
+            report.bytes_reclaimed += one.bytes_reclaimed;
+            report.needles_kept += one.needles_kept;
+        }
+        Ok(report)
+    }
+
+    /// Compact a single sealed volume (see [`LocalFsBackend::compact`]).
+    fn compact_one(&self, dir: &Path, vid: u32, min_reclaim_ratio: f64) -> Result<CompactReport> {
+        let vpath = vol_path(dir, VolumeId(vid));
+
+        // Read the immutable sealed volume and decide liveness from a snapshot of
+        // the global index (re-checked under the lock at swap time).
+        let buf = std::fs::read(&vpath)?;
+        let scanned = scan(&buf, 0);
+        let snapshot = { self.inner.lock().objects.clone() };
+
+        let mut out: Vec<u8> = Vec::with_capacity(buf.len());
+        let mut kept: Vec<(ObjectId, u64, NeedleLoc)> = Vec::new();
+        for n in &scanned.needles {
+            let oid = n.header.object_id;
+            let live = matches!(
+                snapshot.get(&oid),
+                Some(loc) if loc.volume.get() == vid && loc.needle.offset == n.offset
+            );
+            if !live {
+                continue;
+            }
+            let span = padded_needle_len(n.header.data_len as usize);
+            let start = n.offset as usize;
+            let new_off = out.len() as u64;
+            out.extend_from_slice(&buf[start..start + span]);
+            kept.push((
+                oid,
+                n.offset,
+                NeedleLoc {
+                    offset: new_off,
+                    size: n.header.data_len,
+                    flags: n.header.flags,
+                },
+            ));
+        }
+
+        let reclaimed = (buf.len() - out.len()) as u64;
+        // Nothing dead, or a near-full volume not worth the rewrite → skip.
+        if reclaimed == 0 || (reclaimed as f64) < min_reclaim_ratio * buf.len() as f64 {
+            return Ok(CompactReport::default());
+        }
+
+        // Durably stage the compacted image, then swap it in atomically.
+        let tmp = vol_tmp_path(dir, VolumeId(vid));
+        {
+            let f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all_at(&out, 0)?;
+            f.sync_all()?;
+        }
+        {
+            let mut inner = self.inner.lock();
+            std::fs::rename(&tmp, &vpath)?; // atomic replace
+            let file = OpenOptions::new().read(true).write(true).open(&vpath)?;
+            let mut index = soma_core::HotIndex::new();
+            for (oid, old_off, loc) in &kept {
+                index.insert(*oid, *loc);
+                // Repoint the global index only if this object wasn't superseded
+                // (deleted/rewritten elsewhere) during the lock-free copy.
+                if let Some(cur) = inner.objects.get(oid) {
+                    if cur.volume.get() == vid && cur.needle.offset == *old_off {
+                        inner
+                            .objects
+                            .insert(*oid, ObjectLocation::new(VolumeId(vid), *loc));
+                    }
+                }
+            }
+            let vol = inner
+                .volumes
+                .get_mut(&vid)
+                .ok_or(Error::VolumeNotFound(vid))?;
+            vol.file = file;
+            vol.write_offset = out.len() as u64;
+            vol.index = index;
+        }
+        // The old checkpoint is stale; recovery re-scans the smaller volume.
+        let _ = std::fs::remove_file(idx_path(dir, VolumeId(vid)));
+
+        Ok(CompactReport {
+            volumes_compacted: 1,
+            bytes_reclaimed: reclaimed,
+            needles_kept: kept.len() as u64,
+        })
+    }
+}
+
+/// The outcome of a [`LocalFsBackend::compact`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactReport {
+    /// Number of volumes rewritten.
+    pub volumes_compacted: u64,
+    /// Bytes of dead needles reclaimed.
+    pub bytes_reclaimed: u64,
+    /// Live needles preserved.
+    pub needles_kept: u64,
 }
 
 /// The outcome of a [`LocalFsBackend::scrub`].
@@ -383,6 +524,10 @@ fn idx_path(dir: &Path, id: VolumeId) -> PathBuf {
 
 fn idx_tmp_path(dir: &Path, id: VolumeId) -> PathBuf {
     dir.join("volumes").join(format!("{id}.idx.tmp"))
+}
+
+fn vol_tmp_path(dir: &Path, id: VolumeId) -> PathBuf {
+    dir.join("volumes").join(format!("{id}.vol.tmp"))
 }
 
 /// List the volume ids present under a `volumes/` directory.

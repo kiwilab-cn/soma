@@ -317,6 +317,31 @@ async fn run_storage(cfg: Config) -> Result<(), BoxError> {
         },
     )?);
 
+    // Background compaction: reclaim dead-needle space from sealed volumes.
+    let compact_secs = cfg.storage.compact_interval_secs;
+    if compact_secs > 0 {
+        let b = backend.clone();
+        let ratio = cfg.storage.compact_min_reclaim_ratio;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(compact_secs));
+            loop {
+                ticker.tick().await;
+                let b2 = b.clone();
+                if let Ok(Ok(report)) = tokio::task::spawn_blocking(move || b2.compact(ratio)).await
+                {
+                    if report.volumes_compacted > 0 {
+                        tracing::info!(
+                            volumes = report.volumes_compacted,
+                            bytes_reclaimed = report.bytes_reclaimed,
+                            needles_kept = report.needles_kept,
+                            "compaction reclaimed space"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let scrub_secs = cfg.storage.scrub_interval_secs;
     if scrub_secs > 0 {
         let b = backend.clone();
