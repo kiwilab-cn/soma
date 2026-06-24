@@ -20,6 +20,7 @@ tokio.workspace = true
 postcard.workspace = true
 serde.workspace = true
 reed-solomon-simd.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

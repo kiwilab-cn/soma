@@ -15,7 +15,10 @@ use soma_backend::{
     BackendConfig, CachingBackend, EncryptingBackend, LocalFsBackend, StaticKeyProvider,
     StorageBackend,
 };
-use soma_cluster::{serve_meta, serve_storage, ErasureCodedBackend, MetaClient, ReplicatedBackend};
+use soma_cluster::{
+    serve_meta, serve_storage, ErasureCodedBackend, MetaClient, Placement, ReplicatedBackend,
+    DEFAULT_PG_COUNT,
+};
 use soma_meta::{MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, QosPolicy, S3Service};
 
@@ -185,34 +188,42 @@ async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
 /// Stateless gateway: S3 front-end over remote metadata + storage nodes.
 async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
-    let meta: Arc<dyn MetadataStore> =
-        Arc::new(MetaClient::connect(cfg.meta_endpoint.clone()).await?);
-    let storage: Arc<dyn StorageBackend> = if cfg.erasure.enabled {
-        Arc::new(
-            ErasureCodedBackend::connect(
-                cfg.storage_endpoints.clone(),
-                cfg.erasure.data_shards,
-                cfg.erasure.parity_shards,
-                cfg.erasure.write_quorum,
-            )
-            .await?,
-        )
+    let meta_client = Arc::new(MetaClient::connect(cfg.meta_endpoint.clone()).await?);
+
+    // Resolve placement from cluster membership: the PG width is the replica
+    // factor (replication) or k+m shards (erasure). The gateway builds its node
+    // set from the membership table, not static config.
+    let width = if cfg.erasure.enabled {
+        cfg.erasure.data_shards + cfg.erasure.parity_shards
     } else {
-        Arc::new(
-            ReplicatedBackend::connect(
-                cfg.storage_endpoints.clone(),
-                cfg.replication_factor,
-                cfg.write_quorum,
-            )
-            .await?,
-        )
+        cfg.replication_factor
     };
+    let placement =
+        Placement::from_membership(meta_client.clone(), width, DEFAULT_PG_COUNT, now_secs())
+            .await?;
+    let node_count = placement.node_count();
+
+    let storage: Arc<dyn StorageBackend> = if cfg.erasure.enabled {
+        Arc::new(ErasureCodedBackend::from_placement(
+            placement,
+            cfg.erasure.data_shards,
+            cfg.erasure.parity_shards,
+            cfg.erasure.write_quorum,
+        ))
+    } else {
+        Arc::new(ReplicatedBackend::from_placement(
+            placement,
+            cfg.write_quorum,
+        ))
+    };
+    let meta: Arc<dyn MetadataStore> = meta_client;
     let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, storage)?);
     let service = build_service(meta, backend, &cfg);
     if cfg.erasure.enabled {
         tracing::info!(
             meta = %cfg.meta_endpoint,
-            storage_nodes = cfg.storage_endpoints.len(),
+            storage_nodes = node_count,
+            pg_count = DEFAULT_PG_COUNT,
             durability = "erasure",
             data_shards = cfg.erasure.data_shards,
             parity_shards = cfg.erasure.parity_shards,
@@ -221,7 +232,8 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     } else {
         tracing::info!(
             meta = %cfg.meta_endpoint,
-            storage_nodes = cfg.storage_endpoints.len(),
+            storage_nodes = node_count,
+            pg_count = DEFAULT_PG_COUNT,
             durability = "replicated",
             replication_factor = cfg.replication_factor,
             write_quorum = cfg.write_quorum,
