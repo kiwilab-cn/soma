@@ -105,6 +105,49 @@ pub enum PutCondition {
     IfNoneMatch,
 }
 
+/// Lifecycle state of a storage node in the cluster (M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NodeState {
+    /// Registered, not yet serving placement (reserved for M3b rebalance).
+    Joining,
+    /// Live and serving.
+    #[default]
+    Active,
+    /// Being decommissioned; data migrates off before removal (M3c).
+    Draining,
+    /// Missed heartbeats past the liveness threshold.
+    Down,
+}
+
+/// Cluster membership record for one storage node (M3). Keyed by a stable
+/// `node_id` (never an array index), so adding/removing a node never renumbers
+/// the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    /// Stable node identity (e.g. the StatefulSet pod name).
+    pub node_id: String,
+    /// The address other nodes reach this node at (e.g. `http://soma-storage-0…:9200`).
+    pub endpoint: String,
+    /// Lifecycle state.
+    pub state: NodeState,
+    /// Unix seconds of the last heartbeat (or registration).
+    pub last_heartbeat: u64,
+    /// Bumped each time the node re-registers (e.g. after a restart).
+    pub generation: u64,
+}
+
+/// The set of nodes a placement group's objects live on (M3). The stored
+/// PG→nodes table is the authority for placement; the consistent-hash ring only
+/// computes the *target* mapping (see `docs/M3_DESIGN.md` §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgPlacement {
+    /// The node ids holding this PG's replicas/shards, in placement order.
+    pub node_ids: Vec<String>,
+    /// Bumped on every change to this PG's placement (the linearization point
+    /// for migration in M3b).
+    pub generation: u64,
+}
+
 /// A `ListObjectsV2`-style request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListRequest {

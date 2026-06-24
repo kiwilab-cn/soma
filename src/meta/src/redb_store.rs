@@ -17,8 +17,8 @@ use soma_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::types::{
-    BucketMeta, BucketOpts, ListRequest, ListResult, ObjectEntry, ObjectMeta, ObjectPut,
-    PutCondition, TenantUsage, Version,
+    BucketMeta, BucketOpts, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry, ObjectMeta,
+    ObjectPut, PgPlacement, PutCondition, TenantUsage, Version,
 };
 use crate::MetadataStore;
 
@@ -26,6 +26,8 @@ const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
 const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 const SEQ: TableDefinition<&str, u64> = TableDefinition::new("seq");
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_usage");
+const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
+const PG_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("pg_table");
 
 /// Counter name for the monotonic object-id sequence.
 const OBJECT_ID_SEQ: &str = "object_id";
@@ -46,6 +48,8 @@ impl RedbMetaStore {
             w.open_table(OBJECTS)?;
             w.open_table(SEQ)?;
             w.open_table(USAGE)?;
+            w.open_table(MEMBERS)?;
+            w.open_table(PG_TABLE)?;
         }
         w.commit()?;
         Ok(Self { db })
@@ -216,6 +220,88 @@ impl MetadataStore for RedbMetaStore {
         let r = self.db.begin_read()?;
         let usage = r.open_table(USAGE)?;
         read_usage(&usage, tenant)
+    }
+
+    fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(MEMBERS)?;
+            let prev_gen = match t.get(node_id)? {
+                Some(g) => postcard::from_bytes::<NodeInfo>(g.value())?.generation,
+                None => 0,
+            };
+            let info = NodeInfo {
+                node_id: node_id.to_string(),
+                endpoint: endpoint.to_string(),
+                state: NodeState::Active,
+                last_heartbeat: now,
+                generation: prev_gen + 1,
+            };
+            t.insert(node_id, postcard::to_allocvec(&info)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    fn heartbeat(&self, node_id: &str, now: u64) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(MEMBERS)?;
+            let raw = match t.get(node_id)? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(Error::UnknownNode(node_id.to_string())),
+            };
+            let mut info: NodeInfo = postcard::from_bytes(&raw)?;
+            info.last_heartbeat = now;
+            if info.state == NodeState::Down {
+                info.state = NodeState::Active;
+            }
+            t.insert(node_id, postcard::to_allocvec(&info)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    fn list_members(&self) -> Result<Vec<NodeInfo>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(MEMBERS)?;
+        let mut out = Vec::new();
+        for item in t.iter()? {
+            let (_, v) = item?;
+            out.push(postcard::from_bytes(v.value())?);
+        }
+        Ok(out)
+    }
+
+    fn seed_pg_table(&self, entries: &[(u32, PgPlacement)]) -> Result<bool> {
+        let w = self.db.begin_write()?;
+        let seeded;
+        {
+            let mut t = w.open_table(PG_TABLE)?;
+            // Seed only when empty, atomically — concurrent gateways race-free.
+            let already_populated = t.iter()?.next().is_some();
+            if already_populated {
+                seeded = false;
+            } else {
+                for (pg, placement) in entries {
+                    t.insert(*pg, postcard::to_allocvec(placement)?.as_slice())?;
+                }
+                seeded = true;
+            }
+        }
+        w.commit()?;
+        Ok(seeded)
+    }
+
+    fn list_pg_table(&self) -> Result<Vec<(u32, PgPlacement)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(PG_TABLE)?;
+        let mut out = Vec::new();
+        for item in t.iter()? {
+            let (k, v) = item?;
+            out.push((k.value(), postcard::from_bytes(v.value())?));
+        }
+        Ok(out)
     }
 
     fn list_objects(&self, bucket: &str, req: &ListRequest) -> Result<ListResult> {

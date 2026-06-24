@@ -867,3 +867,65 @@ async fn tenant_byte_quota_rejects_oversized_writes() {
 
     stop(handle).await;
 }
+
+/// Membership + PG-table operations round-trip over the real meta gRPC path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_and_pg_table_over_grpc() {
+    use soma_cluster::{serve_meta, MetaClient};
+    use soma_meta::PgPlacement;
+
+    let dir = TempDir::new().unwrap();
+    let meta_port = free_port();
+    let store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    {
+        let s = store.clone();
+        tokio::spawn(async move {
+            let _ = serve_meta(sock(meta_port), s).await;
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let client = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+
+    // Drive registration, heartbeat, and PG-table seeding entirely over gRPC.
+    let c = client.clone();
+    tokio::task::spawn_blocking(move || {
+        c.register_node("node-0", "http://node-0:9200", 10).unwrap();
+        c.register_node("node-1", "http://node-1:9200", 10).unwrap();
+        c.heartbeat("node-0", 20).unwrap();
+        assert!(matches!(
+            c.heartbeat("ghost", 20),
+            Err(soma_meta::Error::UnknownNode(_))
+        ));
+
+        let entries = vec![(
+            0u32,
+            PgPlacement {
+                node_ids: vec!["node-0".to_string(), "node-1".to_string()],
+                generation: 1,
+            },
+        )];
+        assert!(c.seed_pg_table(&entries).unwrap());
+        assert!(!c.seed_pg_table(&entries).unwrap()); // second seed is a no-op
+
+        let mut members = c.list_members().unwrap();
+        members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].node_id, "node-0");
+        assert_eq!(members[0].last_heartbeat, 20);
+
+        let table = c.list_pg_table().unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table[0].1.node_ids,
+            vec!["node-0".to_string(), "node-1".to_string()]
+        );
+    })
+    .await
+    .unwrap();
+}

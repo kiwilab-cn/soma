@@ -9,7 +9,11 @@ data:
     role = "storage"
     listen = "0.0.0.0:{{ .Values.ports.storage }}"
     data_dir = {{ .Values.config.dataDir | quote }}
+    # node_id + advertise_endpoint are injected per-pod via env (see the
+    # StatefulSet); meta_endpoint is where each node registers its membership.
+    meta_endpoint = "{{ include "soma.metaEndpoint" . }}"
 
     [storage]
     volume_max = "{{ .Values.config.volumeMax }}"
     scrub_interval_secs = {{ .Values.config.scrubIntervalSecs }}
+    heartbeat_interval_secs = {{ .Values.config.heartbeatIntervalSecs }}

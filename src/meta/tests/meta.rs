@@ -454,3 +454,116 @@ fn untenanted_puts_skip_accounting() {
         .unwrap();
     assert_eq!(m.tenant_usage("").unwrap(), TenantUsage::default());
 }
+
+// --- cluster membership + placement groups (M3a) ---------------------------
+
+use soma_meta::{NodeState, PgPlacement};
+
+#[test]
+fn register_heartbeat_and_list_members() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+
+    m.register_node("node-a", "http://a:9200", 100).unwrap();
+    m.register_node("node-b", "http://b:9200", 100).unwrap();
+
+    let members = m.list_members().unwrap();
+    assert_eq!(members.len(), 2);
+    let a = members.iter().find(|n| n.node_id == "node-a").unwrap();
+    assert_eq!(a.endpoint, "http://a:9200");
+    assert_eq!(a.state, NodeState::Active);
+    assert_eq!(a.last_heartbeat, 100);
+    assert_eq!(a.generation, 1);
+
+    // Heartbeat advances the clock without changing identity.
+    m.heartbeat("node-a", 175).unwrap();
+    let a = m
+        .list_members()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.node_id == "node-a")
+        .unwrap();
+    assert_eq!(a.last_heartbeat, 175);
+    assert_eq!(a.generation, 1);
+
+    // Re-registering (e.g. after a restart) bumps the generation.
+    m.register_node("node-a", "http://a:9200", 200).unwrap();
+    let a = m
+        .list_members()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.node_id == "node-a")
+        .unwrap();
+    assert_eq!(a.generation, 2);
+}
+
+#[test]
+fn heartbeat_for_unknown_node_errors() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    let err = m.heartbeat("ghost", 1).unwrap_err();
+    assert!(matches!(err, soma_meta::Error::UnknownNode(_)));
+}
+
+#[test]
+fn pg_table_seeds_once_and_reads_back() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+
+    let entries: Vec<(u32, PgPlacement)> = (0..4u32)
+        .map(|pg| {
+            (
+                pg,
+                PgPlacement {
+                    node_ids: vec![format!("n{}", pg % 3), format!("n{}", (pg + 1) % 3)],
+                    generation: 1,
+                },
+            )
+        })
+        .collect();
+
+    // First seed writes the table.
+    assert!(m.seed_pg_table(&entries).unwrap());
+    let table = m.list_pg_table().unwrap();
+    assert_eq!(table.len(), 4);
+    assert_eq!(table[0].0, 0);
+    assert_eq!(
+        table[0].1.node_ids,
+        vec!["n0".to_string(), "n1".to_string()]
+    );
+
+    // A second seed is a no-op (table already populated) — leaves it unchanged.
+    let other: Vec<(u32, PgPlacement)> = vec![(
+        0,
+        PgPlacement {
+            node_ids: vec!["different".to_string()],
+            generation: 9,
+        },
+    )];
+    assert!(!m.seed_pg_table(&other).unwrap());
+    assert_eq!(m.list_pg_table().unwrap().len(), 4);
+    assert_eq!(
+        m.list_pg_table().unwrap()[0].1.node_ids,
+        vec!["n0".to_string(), "n1".to_string()]
+    );
+}
+
+#[test]
+fn membership_and_pg_table_persist_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let m = store(&dir);
+        m.register_node("n1", "http://n1:9200", 50).unwrap();
+        m.seed_pg_table(&[(
+            0,
+            PgPlacement {
+                node_ids: vec!["n1".to_string()],
+                generation: 1,
+            },
+        )])
+        .unwrap();
+    }
+    let m = store(&dir);
+    assert_eq!(m.list_members().unwrap().len(), 1);
+    assert_eq!(m.list_pg_table().unwrap().len(), 1);
+}

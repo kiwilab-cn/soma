@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use soma_meta::{
-    BucketMeta, BucketOpts, ListRequest, ListResult, ObjectMeta, ObjectPut, PutCondition,
-    TenantUsage, Version,
+    BucketMeta, BucketOpts, ListRequest, ListResult, NodeInfo, ObjectMeta, ObjectPut, PgPlacement,
+    PutCondition, TenantUsage, Version,
 };
 
 /// A metadata operation (mirrors the `MetadataStore` trait).
@@ -43,6 +43,20 @@ pub(crate) enum MetaRequest {
     TenantUsage {
         tenant: String,
     },
+    RegisterNode {
+        node_id: String,
+        endpoint: String,
+        now: u64,
+    },
+    Heartbeat {
+        node_id: String,
+        now: u64,
+    },
+    ListMembers,
+    SeedPgTable {
+        entries: Vec<(u32, PgPlacement)>,
+    },
+    ListPgTable,
 }
 
 /// A metadata reply.
@@ -56,6 +70,9 @@ pub(crate) enum MetaReply {
     List(ListResult),
     ObjectId(u64),
     Usage(TenantUsage),
+    Members(Vec<NodeInfo>),
+    Seeded(bool),
+    PgTable(Vec<(u32, PgPlacement)>),
 }
 
 /// A storage operation (mirrors the `StorageBackend` trait). Ranges travel as a

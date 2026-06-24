@@ -57,10 +57,17 @@ pub struct Config {
     pub admin_listen: String,
     /// Data directory (volumes + metadata).
     pub data_dir: String,
-    /// Gateway → metadata node endpoint (e.g. `http://meta:9100`).
+    /// Gateway → metadata node endpoint (e.g. `http://meta:9100`). Also where a
+    /// storage node registers its membership.
     pub meta_endpoint: String,
     /// Gateway → storage node endpoints (e.g. `["http://storage-0:9200", ...]`).
     pub storage_endpoints: Vec<String>,
+    /// Stable node identity for the storage role (e.g. the StatefulSet pod name).
+    /// Empty defaults to the listen address.
+    pub node_id: String,
+    /// The address other nodes reach this storage node at (e.g.
+    /// `http://soma-storage-0…:9200`). Empty defaults to `http://{listen}`.
+    pub advertise_endpoint: String,
     /// Number of replicas per object.
     pub replication_factor: usize,
     /// Replicas that must durably ack a write to succeed.
@@ -105,6 +112,9 @@ pub struct StorageConfig {
     pub volume_max: String,
     /// Bitrot scrub interval in seconds for the storage role (0 disables).
     pub scrub_interval_secs: u64,
+    /// Membership heartbeat interval in seconds for the storage role (0 disables
+    /// registration).
+    pub heartbeat_interval_secs: u64,
 }
 
 /// Erasure-coding tuning. Opt-in: when `enabled`, the gateway stripes each object
@@ -177,6 +187,8 @@ impl Default for Config {
             data_dir: DEFAULT_DATA_DIR.to_string(),
             meta_endpoint: "http://127.0.0.1:9100".to_string(),
             storage_endpoints: vec!["http://127.0.0.1:9200".to_string()],
+            node_id: String::new(),
+            advertise_endpoint: String::new(),
             replication_factor: 3,
             write_quorum: 2,
             storage: StorageConfig::default(),
@@ -197,6 +209,7 @@ impl Default for StorageConfig {
         Self {
             volume_max: "4GiB".to_string(),
             scrub_interval_secs: 3600,
+            heartbeat_interval_secs: 10,
         }
     }
 }
