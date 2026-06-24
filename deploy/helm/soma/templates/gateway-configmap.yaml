@@ -1,6 +1,9 @@
 {{- if and .Values.encryption.enabled (not .Values.encryption.masterKey) (not .Values.credentials.existingSecret) }}
 {{- fail "encryption.enabled requires encryption.masterKey (base64-encoded 32 bytes) or credentials.existingSecret providing SOMA_MASTER_KEY" }}
 {{- end }}
+{{- if and .Values.erasure.enabled (lt (int .Values.storage.replicaCount) (add (int .Values.erasure.dataShards) (int .Values.erasure.parityShards))) }}
+{{- fail "erasure.enabled requires storage.replicaCount >= erasure.dataShards + erasure.parityShards" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -26,6 +29,12 @@ data:
     enabled = {{ .Values.config.cache.enabled }}
     max_bytes = "{{ .Values.config.cache.maxBytes }}"
     max_object_bytes = "{{ .Values.config.cache.maxObjectBytes }}"
+
+    [erasure]
+    enabled = {{ .Values.erasure.enabled }}
+    data_shards = {{ .Values.erasure.dataShards }}
+    parity_shards = {{ .Values.erasure.parityShards }}
+    write_quorum = {{ .Values.erasure.writeQuorum }}
 
     [encryption]
     # The master key is injected at runtime via SOMA_MASTER_KEY (from the Secret),

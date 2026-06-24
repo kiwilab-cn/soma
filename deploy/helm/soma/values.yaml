@@ -22,10 +22,20 @@ ports:
   meta: 9100    # metadata gRPC
   storage: 9200 # storage gRPC
 
-# Replication policy (gateway).
+# Durability policy (gateway). By default objects are N-way replicated. Enable
+# erasure coding to stripe them as Reed-Solomon k+m instead — cheaper storage for
+# the same fault tolerance. Requires storage.replicaCount >= dataShards +
+# parityShards.
 replication:
   factor: 3
   writeQuorum: 2
+
+erasure:
+  enabled: false
+  dataShards: 4
+  parityShards: 2
+  # Shard writes that must ack (0 => dataShards + 1).
+  writeQuorum: 0
 
 # Shared object/cache config rendered into each role's soma.toml.
 config:
