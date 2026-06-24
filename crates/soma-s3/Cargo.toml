@@ -6,12 +6,29 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "S3 wire protocol and SigV4 authentication, mapping S3 operations onto the metadata store and storage backend."
+description = "S3-compatible HTTP service and SigV4 auth, mapping S3 operations onto the metadata store and storage backend."
 
 [dependencies]
 soma-core.workspace = true
 soma-meta.workspace = true
 soma-backend.workspace = true
+
+tokio.workspace = true
+axum.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+hex.workspace = true
+base64.workspace = true
+percent-encoding.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
 
 [lints]
 workspace = true
