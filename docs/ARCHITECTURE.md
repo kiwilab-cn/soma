@@ -20,22 +20,21 @@ but with one differentiator that the others structurally cannot copy:
 > Soma does not just hand back bytes — it makes the bytes *semantically
 > searchable and graph-traversable*.
 
-It is the storage substrate for the author's database products — **lethe-store**
-(the LSM + columnar engine inside the `lethe` project) and **kokedb** (a columnar
-query accelerator). Both already speak the S3 protocol through the Rust
-`object_store` crate, so Soma's primary external API is **S3-compatible**.
+It is the storage substrate for downstream database and analytics engines. These
+already speak the S3 protocol through the Rust `object_store` crate, so Soma's
+primary external API is **S3-compatible**.
 
 Where a plain object store gives a bucket of blobs, Soma gives an **AI-native data
-lake**: data lands, and a background pipeline turns it into vector / graph / full-text
-indexes via lethe-store. This is the moat. It is a hard differentiator because it
-rides on the author's existing strength in lethe-store's multi-modal indexing.
+lake**: data lands, and a background pipeline turns it into vector / graph /
+full-text indexes via a companion in-house multi-modal engine. This is the moat —
+a hard differentiator that rides on existing strength in multi-modal indexing.
 
 ### Non-goals (for now)
 
 - POSIX filesystem semantics (FUSE mount). Consumers want a blob API, not a
   filesystem. May revisit later as a gateway.
-- Being a general compute engine. Soma stores and indexes; query lives in
-  lethe / kokedb.
+- Being a general compute engine. Soma stores and indexes; query lives in the
+  downstream engines.
 
 ---
 
@@ -60,7 +59,7 @@ system: serving is stateless, truth is a small strongly-consistent core, and byt
 live behind a pluggable durability backend.
 
 ```
-                          S3 SDK (lethe-store, kokedb, aws-cli, ...)
+                          S3 SDK (downstream DB engines, object_store, aws-cli...)
                                          │
    ┌─────────────────────────────────────────────────────────────────────┐
    │  DATA PLANE  — stateless, horizontally scalable (k8s Deployment)      │
@@ -75,7 +74,7 @@ live behind a pluggable durability backend.
    │  (k8s StatefulSet, 3/5 replicas)  │   │  trait `StorageBackend`         │
    │  ───────────────────────────────  │   │  ─────────────────────────────  │
    │  openraft + embedded engine       │   │  local FS volumes               │
-   │  (redb → lethe-store)             │   │   → replication                 │
+   │  (redb → in-house LSM engine)     │   │   → replication                 │
    │  name → location, version,        │   │   → erasure coding (Reed-Solomon)│
    │  IAM, tenant quotas, EC layout    │   │  bitrot scrub · reconstruction  │
    │  CAS / If-Match in apply()        │   │  background rebalance / GC       │
@@ -83,8 +82,8 @@ live behind a pluggable durability backend.
                    ▲
    ┌───────────────┴──────────────────────────────────────────────────────┐
    │  AI INGEST PLANE — stateless workers (k8s Deployment, async)          │
-   │  durable queue → extract → embed + entity/graph → write lethe-store   │
-   │  → auto-built HNSW / graph-CSR / BM25 indexes (semantic + graph query)│
+   │  durable queue → extract → embed + entity/graph → indexing engine     │
+   │  → auto-built HNSW / graph / BM25 indexes (semantic + graph query)    │
    └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -102,7 +101,7 @@ live behind a pluggable durability backend.
 
 ### 4.1 S3-compatible API
 
-Soma exposes a practical subset of the S3 API, sized to what lethe-store / kokedb
+Soma exposes a practical subset of the S3 API, sized to what the downstream engines
 need first, then broadened:
 
 - Object: `PUT`, `GET` (incl. range), `HEAD`, `DELETE`, `List`
@@ -158,9 +157,9 @@ allocation, not its on-disk layout.
 
 ### 4.3 Large objects
 
-Objects above a threshold (aligned to consumers' SST / columnar segment sizes,
-e.g. 4–16 MB chunks) are split into chunks spread across volumes, with a chunk
-list recorded in metadata. Multipart upload maps onto this directly.
+Objects above a threshold (aligned to consumers' segment sizes, e.g. 4–16 MB
+chunks) are split into chunks spread across volumes, with a chunk list recorded in
+metadata. Multipart upload maps onto this directly.
 
 ### 4.4 In-RAM hot index — a derived cache, never an authority
 
@@ -198,29 +197,29 @@ no etcd, no TiKV to operate). It can be embedded in-process:
 openraft needs two stores — a **log store** (raft log entries) and a
 **state-machine store** (applied state). Both are satisfied by the embedded engine.
 
-### 5.2 `MetadataStore` trait — redb now, lethe-store later
+### 5.2 `MetadataStore` trait — redb now, advanced engine later
 
-The engine sits behind a `MetadataStore` trait so the project is not blocked on
-lethe-store's extraction:
+The engine sits behind a `MetadataStore` trait so the project is not coupled to any
+single backend:
 
 - **MVP: `redb`** — pure-Rust embedded ACID B-tree. It ships transactions and
   compare-and-swap out of the box, so the *semantic* layer (versioning, conditional
   writes) can be built and tested today.
-- **Later: `lethe-store`** — once extracted standalone from `../lethe`. Analysis
-  shows a strong fit: embeddable single-binary, WAL + fsync crash safety, atomic
-  `WriteBatch`, MVCC snapshots, time-travel (`HistoricalView`), and **deterministic
-  ordered-log apply** with monotonic seqnos — exactly the determinism a Raft state
-  machine wants.
+- **Later: an in-house embedded LSM engine** — once available standalone. The
+  target engine is a single-binary embeddable LSM with WAL + fsync crash safety,
+  atomic write batches, MVCC snapshots, time-travel, and **deterministic
+  ordered-log apply** with monotonic sequence numbers — exactly the determinism a
+  Raft state machine wants.
 
 ### 5.3 Conditional writes — Raft makes CAS free
 
-lethe-store has no built-in compare-and-swap. **Under Raft this is a non-issue.**
-Because every write is serialized through the leader into a single ordered log,
-`If-Match` / CAS is implemented inside the state-machine `apply()` function: read
-the current version, compare, conditionally apply. Raft's serialization point *is*
-the linearization point. So the consumers' hard requirements — strong
-read-after-write, conditional writes for atomic manifest/materialized-view
-publication, object versioning — are all satisfied.
+An embedded LSM engine may not expose built-in compare-and-swap. **Under Raft this
+is a non-issue.** Because every write is serialized through the leader into a single
+ordered log, `If-Match` / CAS is implemented inside the state-machine `apply()`
+function: read the current version, compare, conditionally apply. Raft's
+serialization point *is* the linearization point. So the consumers' hard
+requirements — strong read-after-write, conditional writes for atomic manifest /
+materialized-view publication, object versioning — are all satisfied.
 
 ### 5.4 What metadata holds
 
@@ -324,28 +323,27 @@ S3 PUT ─→ store bytes in volume ─→ commit metadata ─→ ACK   (millise
    content-type detect → extract (pdf/doc/img/text) → embed (vector)
                                           + entity / relation extraction
                                           │
-                       write content as a lethe-store MemoryEntry
+                  write content into the in-house indexing engine
                                           │
-        lethe-store Optimizer auto-builds derived indexes:
-          .lhns (HNSW vector) · .gcsr (graph CSR) · .lbm25 (BM25 full-text)
+        the engine auto-builds derived indexes:
+          HNSW (vector) · graph (relations) · BM25 (full-text)
                                           │
                        → semantic search + graph traversal
 ```
 
 Design points:
 
-- **Per-bucket toggle.** Buckets holding SST / columnar blobs are *not* vectorized;
-  document buckets are. Indexing is opt-in.
-- **Pluggable embedder.** Local model (`candle` / the sibling `rust-bert`) or a
-  remote API.
+- **Per-bucket toggle.** Buckets holding raw segment / blob data are *not*
+  vectorized; document buckets are. Indexing is opt-in.
+- **Pluggable embedder.** Local model (`candle` / `rust-bert`) or a remote API.
 - **Failure = retry.** The pipeline is at-least-once; failures retry and never
   affect object durability.
-- lethe-store's derived indexes — which are *inseparable* from its KV core and thus
-  a liability for plain metadata — are here exactly the **feature**.
+- The indexing engine's derived indexes — inseparable from its core and thus a
+  liability for plain metadata — are here exactly the **feature**.
 
-**Open product boundary** (to settle as lethe-store goes standalone): most likely
-Soma owns *blob storage + S3 + the ingest pipeline*, and lethe owns the
-*vector / graph query surface*. Clean separation, no duplicated query engine.
+**Open product boundary** (to settle later): most likely Soma owns *blob storage +
+S3 + the ingest pipeline*, and the indexing engine owns the *vector / graph query
+surface*. Clean separation, no duplicated query engine.
 
 ---
 
@@ -355,9 +353,9 @@ Soma owns *blob storage + S3 + the ingest pipeline*, and lethe owns the
 - **At rest:** envelope encryption — a per-object data key (DEK) wrapped by a KMS
   master key.
 - **AuthN:** AWS SigV4 signed requests.
-- **AuthZ + multi-tenancy:** bucket policies; hard tenant isolation (consumers
-  lethe / kokedb are themselves multi-tenant). Per-tenant quotas and QoS so one
-  tenant's scan cannot starve another's online queries.
+- **AuthZ + multi-tenancy:** bucket policies; hard tenant isolation (consumers are
+  themselves multi-tenant). Per-tenant quotas and QoS so one tenant's scan cannot
+  starve another's online queries.
 
 ---
 
@@ -403,16 +401,16 @@ that never block the foreground path.
 
 | Milestone | Scope |
 | --- | --- |
-| **M0 — single-node skeleton** | S3 subset (PUT/GET/DELETE/List/Multipart) · `MetadataStore` trait + redb · `LocalFsBackend` (volume + needle) · SigV4 · **lethe-store & kokedb connect and run today** |
+| **M0 — single-node skeleton** | S3 subset (PUT/GET/DELETE/List/Multipart) · `MetadataStore` trait + redb · `LocalFsBackend` (volume + needle) · SigV4 · **downstream engines connect and run today** |
 | **M1 — stateless + cache** | Split out stateless gateway · NVMe/memory read cache · k8s manifests (Helm / operator) |
 | **M2 — distributed durability** | Raft metadata (openraft) · replication · consistent-hash placement · failure self-heal |
 | **M3 — elastic scale** | Online scale-out + background rebalance |
 | **M4 — hardening** | Erasure coding · envelope encryption · multi-tenant QoS · AI ingest pipeline GA |
 
-The deliberate choice: get "stateless serving + cache + k8s + S3 API + both
-databases connected" working on a local-FS backend **first**, and defer the
-hardest piece (EC) — so every milestone ships something usable and each lands as
-its own reviewed branch.
+The deliberate choice: get "stateless serving + cache + k8s + S3 API + consumers
+connected" working on a local-FS backend **first**, and defer the hardest piece
+(EC) — so every milestone ships something usable and each lands as its own reviewed
+branch.
 
 ---
 
@@ -427,8 +425,7 @@ its own reviewed branch.
   - network partition
   - second failure *during* reconstruction
 - **Crash-recovery tests** for the write protocol (§6) at every step boundary.
-- **Consumer integration tests**: lethe-store and kokedb running their real
-  workloads against Soma.
+- **Consumer integration tests**: real downstream-engine workloads against Soma.
 - **Benchmarks**: small-object throughput, read latency (O(1) claim), write
   aggregation effectiveness, vs SeaweedFS / MinIO where meaningful.
 
@@ -442,11 +439,11 @@ its own reviewed branch.
 | Zero-copy buffers | `bytes` |
 | Consensus | `openraft` |
 | MVP metadata engine | `redb` |
-| Long-term metadata engine | `lethe-store` (once standalone) |
+| Long-term metadata engine | in-house embedded LSM engine (once standalone) |
 | Erasure coding | `reed-solomon-simd` |
 | TLS | `rustls` |
 | Embeddings (local) | `candle` / `rust-bert` |
-| Derived vector/graph/text indexes | `lethe-store` (HNSW / graph-CSR / BM25) |
+| Derived vector/graph/text indexes | in-house multi-modal engine (HNSW / graph / BM25) |
 
-Match the consumers' rigor: lethe and kokedb deny `unwrap` / `expect` / `panic` in
-their lint config — Soma should hold the same line.
+Hold a strict line: deny `unwrap` / `expect` / `panic` in lint config, matching the
+rigor of the sibling Rust projects.
