@@ -24,6 +24,30 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.storage.localRead.enabled }}
+      initContainers:
+        # Prepare the shared socket directory so the non-root soma process can bind
+        # the socket and co-located compute (any uid) can connect. Runs as root only
+        # to fix the hostPath directory's ownership/permissions.
+        - name: prepare-localfd-dir
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - mkdir -p {{ .Values.storage.localRead.hostPath }} && chmod 0777 {{ .Values.storage.localRead.hostPath }}
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: localfd
+              mountPath: {{ .Values.storage.localRead.hostPath }}
+      {{- end }}
       containers:
         - name: soma
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -52,6 +76,11 @@ spec:
             - name: SOMA_ZONE
               value: {{ .Values.storage.zone | quote }}
             {{- end }}
+            {{- if .Values.storage.localRead.enabled }}
+            # Bind the local short-circuit read socket on the shared hostPath.
+            - name: SOMA_LOCAL_SOCKET_PATH
+              value: "{{ .Values.storage.localRead.hostPath }}/{{ .Values.storage.localRead.socketName }}"
+            {{- end }}
           ports:
             - name: storage
               containerPort: {{ .Values.ports.storage }}
@@ -77,12 +106,24 @@ spec:
               mountPath: {{ .Values.config.dataDir }}
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.storage.localRead.enabled }}
+            - name: localfd
+              mountPath: {{ .Values.storage.localRead.hostPath }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "soma.storageName" . }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.storage.localRead.enabled }}
+        # Node-local directory holding the short-circuit socket, shared with
+        # co-located compute pods that mount the same hostPath.
+        - name: localfd
+          hostPath:
+            path: {{ .Values.storage.localRead.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

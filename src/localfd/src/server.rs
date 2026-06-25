@@ -2,6 +2,7 @@
 
 use std::io::{IoSlice, Read};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +58,11 @@ pub fn serve_local_reads(
         std::fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(&path)?;
+    // Make the socket connectable by a co-located reader running as any uid (the
+    // socket sits on a shared hostPath). This matches the single trust-domain model
+    // of short-circuit reads; per-tenant scoping (restrictive perms + per-tenant
+    // dirs) is a later milestone — see docs/LOCALITY_DESIGN.md §6.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
     listener.set_nonblocking(true)?;
 
     let stop = Arc::new(AtomicBool::new(false));

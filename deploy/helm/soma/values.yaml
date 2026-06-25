@@ -115,6 +115,20 @@ storage:
   # downward API, so set it here per nodepool (or wire an init container). Empty =
   # unknown (locality still works at host granularity).
   zone: ""
+  # Local short-circuit reads: bind a unix socket on a node-local hostPath so
+  # co-located compute pods read object bytes via a passed file descriptor,
+  # bypassing the gateway and the network (see docs/LOCALITY_DESIGN.md §2a/§4).
+  # Off by default. SINGLE-TENANT / dedicated deployments only until per-tenant
+  # socket scoping lands (§6): the socket has no auth, so any pod that mounts the
+  # hostPath can read every object on the node. Enabling it adds a hostPath mount
+  # and a root init container that prepares the socket directory.
+  localRead:
+    enabled: false
+    # Node directory holding the socket, shared with co-located compute pods. For
+    # multiple soma clusters per node, override this to a unique path.
+    hostPath: /run/soma
+    # Socket file name within hostPath.
+    socketName: storage.sock
   persistence:
     size: 100Gi
     # For data-locality (short-circuit) reads, point this at a NODE-LOCAL storage
