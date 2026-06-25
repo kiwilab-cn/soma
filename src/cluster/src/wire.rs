@@ -19,6 +19,10 @@ pub(crate) enum MetaRequest {
     GetBucket {
         name: String,
     },
+    SetBucketEncryption {
+        name: String,
+        algo: Option<soma_meta::SseAlgorithm>,
+    },
     ListBuckets,
     PutObject {
         bucket: String,

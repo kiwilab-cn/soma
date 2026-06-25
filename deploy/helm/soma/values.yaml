@@ -82,7 +82,6 @@ credentials:
 # `credentials.existingSecret`. The key is delivered through the Secret (env),
 # never written into the ConfigMap.
 encryption:
-  enabled: false
   masterKey: ""
   # Plaintext chunk size for the seekable chunked AEAD (0 = 64 KiB default).
   chunkSizeBytes: 0

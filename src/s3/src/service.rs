@@ -12,10 +12,10 @@ use bytes::Bytes;
 use md5::{Digest, Md5};
 use parking_lot::Mutex;
 
-use soma_backend::{ByteRange, StorageBackend};
+use soma_backend::{ByteRange, Crypto, StorageBackend};
 use soma_meta::{
     BucketMeta, BucketOpts, ETag, ListRequest, ListResult, MetadataStore, ObjectPut, PutCondition,
-    Version,
+    SseAlgorithm, Version,
 };
 
 use crate::error::{S3Error, S3Result};
@@ -63,6 +63,9 @@ struct MultipartUpload {
     bucket: String,
     key: String,
     parts: BTreeMap<u32, PartInfo>,
+    /// Whether parts (and the assembled object) are encrypted (decided at create
+    /// from the bucket's default SSE / the request).
+    encrypt: bool,
 }
 
 /// The S3 service: shared metadata store, storage backend, and credentials.
@@ -73,6 +76,9 @@ pub struct S3Service {
     creds: Arc<Credentials>,
     /// Multi-tenant quotas + rate limiting (empty = no limits).
     qos: Arc<QosPolicy>,
+    /// Object crypto for server-side encryption (`None` if no master key is
+    /// configured — encrypted buckets then can't be created or read).
+    crypto: Option<Arc<Crypto>>,
     /// Active multipart uploads, keyed by upload id.
     uploads: Arc<Mutex<HashMap<String, MultipartUpload>>>,
     /// Monotonic source of upload ids (unique within this process).
@@ -85,6 +91,8 @@ pub struct PutObjectOk {
     pub etag: String,
     /// The new version.
     pub version: Version,
+    /// Whether the object was stored encrypted (drives the SSE response header).
+    pub encrypted: bool,
 }
 
 /// Result of a successful `GetObject`.
@@ -99,6 +107,8 @@ pub struct GetObjectOk {
     pub created_at: u64,
     /// `Content-Range` value when this is a partial (206) response.
     pub content_range: Option<String>,
+    /// Whether the object is encrypted (drives the SSE response header).
+    pub encrypted: bool,
 }
 
 /// Result of a successful `HeadObject`.
@@ -109,6 +119,8 @@ pub struct HeadObjectOk {
     pub size: u64,
     /// Creation time (unix seconds).
     pub created_at: u64,
+    /// Whether the object is encrypted (drives the SSE response header).
+    pub encrypted: bool,
 }
 
 impl S3Service {
@@ -123,6 +135,7 @@ impl S3Service {
             backend,
             creds: Arc::new(creds),
             qos: Arc::new(QosPolicy::default()),
+            crypto: None,
             uploads: Arc::new(Mutex::new(HashMap::new())),
             upload_seq: Arc::new(AtomicU64::new(0)),
         }
@@ -132,6 +145,44 @@ impl S3Service {
     pub fn with_qos(mut self, qos: QosPolicy) -> Self {
         self.qos = Arc::new(qos);
         self
+    }
+
+    /// Attach object crypto, enabling server-side encryption for buckets that
+    /// request it.
+    pub fn with_crypto(mut self, crypto: Crypto) -> Self {
+        self.crypto = Some(Arc::new(crypto));
+        self
+    }
+
+    /// Set (or clear) a bucket's default server-side encryption.
+    pub async fn set_bucket_encryption(
+        &self,
+        bucket: String,
+        algo: Option<SseAlgorithm>,
+    ) -> S3Result<()> {
+        if algo.is_some() && self.crypto.is_none() {
+            return Err(S3Error::not_implemented(
+                "server-side encryption is not available (no master key configured)",
+            ));
+        }
+        let meta = self.meta.clone();
+        block(move || {
+            meta.set_bucket_encryption(&bucket, algo)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// A bucket's default SSE algorithm, if any.
+    pub async fn bucket_encryption(&self, bucket: String) -> S3Result<Option<SseAlgorithm>> {
+        let meta = self.meta.clone();
+        block(move || {
+            let b = meta
+                .get_bucket(&bucket)?
+                .ok_or_else(|| S3Error::no_such_bucket(&bucket))?;
+            Ok(b.default_sse)
+        })
+        .await
     }
 
     /// Verify the request's SigV4 signature, returning the authenticated access
@@ -208,7 +259,10 @@ impl S3Service {
         block(move || Ok(meta.list_objects(&bucket, &req)?)).await
     }
 
-    /// `PutObject`. Stores bytes durably, then commits metadata under `cond`.
+    /// `PutObject`. Stores bytes durably, then commits metadata under `cond`. The
+    /// object is encrypted when the request asked for SSE (`request_sse`) or the
+    /// bucket has default encryption.
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_object(
         &self,
         bucket: String,
@@ -217,17 +271,34 @@ impl S3Service {
         cond: PutCondition,
         now: u64,
         tenant: String,
+        request_sse: bool,
     ) -> S3Result<PutObjectOk> {
         let meta = self.meta.clone();
         let backend = self.backend.clone();
-        let etag = md5_hex(&body);
+        let crypto = self.crypto.clone();
+        let etag = md5_hex(&body); // ETag is the MD5 of the plaintext
         let etag_stored = etag.clone();
-        let size = body.len() as u64;
+        let size = body.len() as u64; // metadata size is the plaintext length
         let quota = self.qos.quota(&tenant);
 
-        let version = block(move || {
+        let (version, encrypted) = block(move || {
+            // Encrypt if the request or the bucket's default encryption asks for it.
+            let bucket_sse = meta
+                .get_bucket(&bucket)?
+                .map(|b| b.default_sse.is_some())
+                .unwrap_or(false);
+            let encrypt = request_sse || bucket_sse;
+
             let id = meta.next_object_id()?;
-            backend.put(id, &body)?;
+            if encrypt {
+                let crypto = crypto
+                    .as_ref()
+                    .ok_or_else(|| S3Error::internal("encryption unavailable: no master key"))?;
+                let frame = crypto.seal(&body)?;
+                backend.put(id, &frame)?;
+            } else {
+                backend.put(id, &body)?;
+            }
             let version = meta.put_object(
                 &bucket,
                 &key,
@@ -238,14 +309,19 @@ impl S3Service {
                     created_at: now,
                     tenant,
                     quota,
+                    encrypted: encrypt,
                 },
                 cond,
             )?;
-            Ok(version)
+            Ok((version, encrypt))
         })
         .await?;
 
-        Ok(PutObjectOk { etag, version })
+        Ok(PutObjectOk {
+            etag,
+            version,
+            encrypted,
+        })
     }
 
     /// `GetObject`, optionally with a `Range` header.
@@ -257,35 +333,56 @@ impl S3Service {
     ) -> S3Result<GetObjectOk> {
         let meta = self.meta.clone();
         let backend = self.backend.clone();
+        let crypto = self.crypto.clone();
         block(move || {
             let m = meta
                 .get_object(&bucket, &key)?
                 .ok_or_else(|| S3Error::no_such_key(&key))?;
-            match range_header {
+            // Decrypt encrypted objects; the metadata size/range are plaintext.
+            let crypto = if m.encrypted {
+                Some(
+                    crypto
+                        .as_ref()
+                        .ok_or_else(|| S3Error::internal("cannot decrypt: no master key"))?,
+                )
+            } else {
+                None
+            };
+            let id = m.object_id;
+            let (data, content_range) = match range_header {
                 None => {
-                    let data = backend.get(m.object_id, None)?;
-                    Ok(GetObjectOk {
-                        data,
-                        etag: m.etag.0,
-                        size: m.size,
-                        created_at: m.created_at,
-                        content_range: None,
-                    })
+                    let data = match crypto {
+                        Some(c) => c.open_full(&backend.get(id, None)?)?,
+                        None => backend.get(id, None)?,
+                    };
+                    (data, None)
                 }
                 Some(spec) => {
                     let (offset, length) = resolve_range(&spec, m.size)?;
-                    let data = backend.get(m.object_id, Some(ByteRange { offset, length }))?;
-                    let content_range =
-                        format!("bytes {}-{}/{}", offset, offset + length - 1, m.size);
-                    Ok(GetObjectOk {
-                        data,
-                        etag: m.etag.0,
-                        size: m.size,
-                        created_at: m.created_at,
-                        content_range: Some(content_range),
-                    })
+                    let data = match crypto {
+                        Some(c) => c.open_range(ByteRange { offset, length }, |off, len| {
+                            backend.get(
+                                id,
+                                Some(ByteRange {
+                                    offset: off,
+                                    length: len,
+                                }),
+                            )
+                        })?,
+                        None => backend.get(id, Some(ByteRange { offset, length }))?,
+                    };
+                    let cr = format!("bytes {}-{}/{}", offset, offset + length - 1, m.size);
+                    (data, Some(cr))
                 }
-            }
+            };
+            Ok(GetObjectOk {
+                data,
+                etag: m.etag.0,
+                size: m.size,
+                created_at: m.created_at,
+                content_range,
+                encrypted: m.encrypted,
+            })
         })
         .await
     }
@@ -299,6 +396,7 @@ impl S3Service {
                 .ok_or_else(|| S3Error::no_such_key(&key))?;
             Ok(HeadObjectOk {
                 etag: m.etag.0,
+                encrypted: m.encrypted,
                 size: m.size,
                 created_at: m.created_at,
             })
@@ -321,14 +419,26 @@ impl S3Service {
         .await
     }
 
-    /// `CreateMultipartUpload`. Registers an upload and returns its id.
-    pub async fn create_multipart(&self, bucket: String, key: String) -> S3Result<String> {
-        // The bucket must exist.
+    /// `CreateMultipartUpload`. Registers an upload and returns its id. Whether the
+    /// upload's parts and final object are encrypted is fixed here from the
+    /// request's SSE header or the bucket's default encryption.
+    pub async fn create_multipart(
+        &self,
+        bucket: String,
+        key: String,
+        request_sse: bool,
+    ) -> S3Result<String> {
+        // The bucket must exist; read its default SSE while we're here.
         let meta = self.meta.clone();
         let b = bucket.clone();
-        let exists = block(move || Ok(meta.get_bucket(&b)?.is_some())).await?;
-        if !exists {
-            return Err(S3Error::no_such_bucket(&bucket));
+        let bucket_sse =
+            block(move || Ok(meta.get_bucket(&b)?.map(|m| m.default_sse.is_some()))).await?;
+        let bucket_sse = bucket_sse.ok_or_else(|| S3Error::no_such_bucket(&bucket))?;
+        let encrypt = request_sse || bucket_sse;
+        if encrypt && self.crypto.is_none() {
+            return Err(S3Error::not_implemented(
+                "server-side encryption is not available (no master key configured)",
+            ));
         }
         let n = self.upload_seq.fetch_add(1, Ordering::Relaxed);
         let upload_id = format!("soma-{n:016x}");
@@ -338,6 +448,7 @@ impl S3Service {
                 bucket,
                 key,
                 parts: BTreeMap::new(),
+                encrypt,
             },
         );
         Ok(upload_id)
@@ -351,16 +462,25 @@ impl S3Service {
         part_number: u32,
         body: Bytes,
     ) -> S3Result<String> {
-        if !self.uploads.lock().contains_key(&upload_id) {
-            return Err(S3Error::no_such_upload(&upload_id));
-        }
+        let encrypt = match self.uploads.lock().get(&upload_id) {
+            Some(up) => up.encrypt,
+            None => return Err(S3Error::no_such_upload(&upload_id)),
+        };
         let meta = self.meta.clone();
         let backend = self.backend.clone();
-        let md5 = md5_raw(&body);
+        let crypto = self.crypto.clone();
+        let md5 = md5_raw(&body); // ETag over the plaintext part
         let etag = hex::encode(md5);
         let object_id = block(move || {
             let id = meta.next_object_id()?;
-            backend.put(id, &body)?;
+            if encrypt {
+                let crypto = crypto
+                    .as_ref()
+                    .ok_or_else(|| S3Error::internal("encryption unavailable: no master key"))?;
+                backend.put(id, &crypto.seal(&body)?)?;
+            } else {
+                backend.put(id, &body)?;
+            }
             Ok(id)
         })
         .await?;
@@ -389,7 +509,7 @@ impl S3Service {
             return Err(S3Error::invalid_argument("no parts specified"));
         }
         // Collect the part object ids (in requested order) and their MD5 digests.
-        let (part_ids, digests) = {
+        let (part_ids, digests, encrypt) = {
             let reg = self.uploads.lock();
             let up = reg
                 .get(&upload_id)
@@ -409,25 +529,43 @@ impl S3Service {
                 part_ids.push(part.object_id);
                 digests.extend_from_slice(&part.md5);
             }
-            (part_ids, digests)
+            (part_ids, digests, up.encrypt)
         };
 
         let final_etag = format!("{}-{}", md5_hex(&digests), requested.len());
 
         let meta = self.meta.clone();
         let backend = self.backend.clone();
+        let crypto = self.crypto.clone();
         let etag_stored = final_etag.clone();
         let (b, k) = (bucket.clone(), key.clone());
         let quota = self.qos.quota(&tenant);
         block(move || {
-            // Assemble part bytes in order, then write the final object.
+            // Assemble the plaintext (decrypting each part if the upload is
+            // encrypted), then store the final object — re-sealed under a fresh
+            // object key so the assembled bytes are a single coherent frame.
+            let crypto =
+                if encrypt {
+                    Some(crypto.as_ref().ok_or_else(|| {
+                        S3Error::internal("encryption unavailable: no master key")
+                    })?)
+                } else {
+                    None
+                };
             let mut assembled = Vec::new();
             for part_id in &part_ids {
-                assembled.extend_from_slice(&backend.get(*part_id, None)?);
+                let raw = backend.get(*part_id, None)?;
+                match crypto {
+                    Some(c) => assembled.extend_from_slice(&c.open_full(&raw)?),
+                    None => assembled.extend_from_slice(&raw),
+                }
             }
-            let size = assembled.len() as u64;
+            let size = assembled.len() as u64; // plaintext length
             let id = meta.next_object_id()?;
-            backend.put(id, &assembled)?;
+            match crypto {
+                Some(c) => backend.put(id, &c.seal(&assembled)?)?,
+                None => backend.put(id, &assembled)?,
+            }
             meta.put_object(
                 &b,
                 &k,
@@ -438,6 +576,7 @@ impl S3Service {
                     created_at: now,
                     tenant,
                     quota,
+                    encrypted: encrypt,
                 },
                 PutCondition::None,
             )?;

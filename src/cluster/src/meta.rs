@@ -55,6 +55,9 @@ fn dispatch(
         }
         MetaRequest::DeleteBucket { name } => store.delete_bucket(&name).map(|()| MetaReply::Unit),
         MetaRequest::GetBucket { name } => store.get_bucket(&name).map(MetaReply::Bucket),
+        MetaRequest::SetBucketEncryption { name, algo } => store
+            .set_bucket_encryption(&name, algo)
+            .map(|()| MetaReply::Unit),
         MetaRequest::ListBuckets => store.list_buckets().map(MetaReply::Buckets),
         MetaRequest::PutObject {
             bucket,
@@ -187,6 +190,20 @@ impl MetadataStore for MetaClient {
             name: name.to_string(),
         })? {
             MetaReply::Bucket(b) => Ok(b),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn set_bucket_encryption(
+        &self,
+        name: &str,
+        algo: Option<soma_meta::SseAlgorithm>,
+    ) -> Result<()> {
+        match self.call(MetaRequest::SetBucketEncryption {
+            name: name.to_string(),
+            algo,
+        })? {
+            MetaReply::Unit => Ok(()),
             _ => Err(unexpected()),
         }
     }

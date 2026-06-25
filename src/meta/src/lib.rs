@@ -18,7 +18,7 @@ pub use error::{Error, Result};
 pub use redb_store::RedbMetaStore;
 pub use types::{
     BucketMeta, BucketOpts, ETag, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry,
-    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, TenantUsage, Version,
+    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, SseAlgorithm, TenantUsage, Version,
 };
 
 use soma_core::ObjectId;
@@ -37,6 +37,11 @@ pub trait MetadataStore: Send + Sync {
 
     /// Fetch a bucket's metadata, if it exists.
     fn get_bucket(&self, name: &str) -> Result<Option<BucketMeta>>;
+
+    /// Set (or clear, with `None`) a bucket's default server-side encryption
+    /// (S3 `PutBucketEncryption` / `DeleteBucketEncryption`). Errors if the bucket
+    /// does not exist.
+    fn set_bucket_encryption(&self, name: &str, algo: Option<SseAlgorithm>) -> Result<()>;
 
     /// List all buckets (sorted by name).
     fn list_buckets(&self) -> Result<Vec<BucketMeta>>;

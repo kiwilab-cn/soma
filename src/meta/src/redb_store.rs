@@ -18,7 +18,7 @@ use soma_core::ObjectId;
 use crate::error::{Error, Result};
 use crate::types::{
     BucketMeta, BucketOpts, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry, ObjectMeta,
-    ObjectPut, PgPlacement, PutCondition, TenantUsage, Version,
+    ObjectPut, PgPlacement, PutCondition, SseAlgorithm, TenantUsage, Version,
 };
 use crate::MetadataStore;
 
@@ -169,6 +169,7 @@ impl MetadataStore for RedbMetaStore {
             let meta = BucketMeta {
                 name: name.to_string(),
                 versioning: opts.versioning,
+                default_sse: None,
             };
             t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
         }
@@ -202,6 +203,22 @@ impl MetadataStore for RedbMetaStore {
             Some(g) => Ok(Some(postcard::from_bytes(g.value())?)),
             None => Ok(None),
         }
+    }
+
+    fn set_bucket_encryption(&self, name: &str, algo: Option<SseAlgorithm>) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(BUCKETS)?;
+            let raw = match t.get(name)? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(Error::NoSuchBucket(name.to_string())),
+            };
+            let mut meta: BucketMeta = postcard::from_bytes(&raw)?;
+            meta.default_sse = algo;
+            t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
     }
 
     fn list_buckets(&self) -> Result<Vec<BucketMeta>> {
@@ -281,6 +298,7 @@ impl MetadataStore for RedbMetaStore {
                 version: new_version,
                 created_at: put.created_at,
                 tenant: put.tenant,
+                encrypted: put.encrypted,
             };
             objects.insert(ck.as_slice(), postcard::to_allocvec(&meta)?.as_slice())?;
         }

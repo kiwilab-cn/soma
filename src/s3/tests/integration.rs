@@ -15,8 +15,7 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
 use soma_backend::{
-    BackendConfig, CachingBackend, EncryptingBackend, LocalFsBackend, StaticKeyProvider,
-    StorageBackend,
+    BackendConfig, CachingBackend, Crypto, LocalFsBackend, StaticKeyProvider, StorageBackend,
 };
 use soma_meta::{BucketOpts, MetadataStore, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
@@ -64,18 +63,21 @@ async fn serve_cached(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) 
     (port, handle)
 }
 
-/// Like [`serve`], but the storage backend is wrapped in envelope encryption, so
-/// the full S3 stack runs through `EncryptingBackend` and bytes at rest are sealed.
+/// Like [`serve`], but with a master key configured and the test bucket set to
+/// default SSE-S3, so objects written to it are encrypted at rest.
 async fn serve_encrypted(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()>) {
+    use soma_meta::SseAlgorithm;
     let meta = Arc::new(RedbMetaStore::open(dir.join("meta.redb")).unwrap());
     if create_bucket {
         meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+        meta.set_bucket_encryption(BUCKET, Some(SseAlgorithm::Aes256))
+            .unwrap();
     }
     let fs = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
-    let keys = StaticKeyProvider::new([42u8; 32]);
     let meta: Arc<dyn MetadataStore> = meta;
-    let backend: Arc<dyn StorageBackend> = Arc::new(EncryptingBackend::new(fs, &keys));
-    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
+    let backend: Arc<dyn StorageBackend> = fs;
+    let crypto = Crypto::new(&StaticKeyProvider::new([42u8; 32]));
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK")).with_crypto(crypto);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -85,11 +87,16 @@ async fn serve_encrypted(dir: &Path, create_bucket: bool) -> (u16, JoinHandle<()
     (port, handle)
 }
 
-/// True if any regular file directly under `dir` contains `needle` verbatim.
+/// True if any regular file under `dir` (recursively, so it reaches `volumes/`)
+/// contains `needle` verbatim.
 fn dir_contains_bytes(dir: &Path, needle: &[u8]) -> bool {
     for entry in std::fs::read_dir(dir).unwrap() {
         let p = entry.unwrap().path();
-        if p.is_file() {
+        if p.is_dir() {
+            if dir_contains_bytes(&p, needle) {
+                return true;
+            }
+        } else if p.is_file() {
             let bytes = std::fs::read(&p).unwrap();
             if bytes.windows(needle.len()).any(|w| w == needle) {
                 return true;
@@ -1659,4 +1666,81 @@ async fn orphan_gc_reclaims_overwritten_objects() {
     }
     let got = api.get(&key).await.unwrap().bytes().await.unwrap();
     assert_eq!(got.as_ref(), b"version-3");
+}
+
+/// A bucket WITHOUT default encryption stores plaintext even when a master key is
+/// configured — encryption is strictly opt-in per bucket (the default is off).
+#[tokio::test]
+async fn default_off_bucket_stores_plaintext() {
+    let dir = TempDir::new().unwrap();
+    let meta = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta.create_bucket(BUCKET, BucketOpts::default()).unwrap(); // no PutBucketEncryption
+    let fs = Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+    let meta_dyn: Arc<dyn MetadataStore> = meta;
+    let backend: Arc<dyn StorageBackend> = fs;
+    let svc = S3Service::new(meta_dyn, backend, Credentials::single("AK", "SK"))
+        .with_crypto(Crypto::new(&StaticKeyProvider::new([42u8; 32]))); // crypto available
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+    let store = client(port);
+
+    let marker: &'static [u8] = b"PLAINTEXT-MARKER-bucket-not-encrypted";
+    store
+        .put(&OPath::from("k"), PutPayload::from_static(marker))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(&OPath::from("k"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        marker
+    );
+    // Not encrypted → the plaintext is on disk.
+    assert!(
+        dir_contains_bytes(dir.path(), marker),
+        "default-off bucket must not encrypt"
+    );
+    stop(handle).await;
+}
+
+/// Multipart upload to an encrypted bucket: parts and the assembled object are
+/// encrypted at rest, yet read back correctly.
+#[tokio::test]
+async fn multipart_into_encrypted_bucket() {
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve_encrypted(dir.path(), true).await; // BUCKET has default SSE
+    let store = client(port);
+
+    let key = OPath::from("big.bin");
+    let mut upload = store.put_multipart(&key).await.unwrap();
+    let mut marked = vec![7u8; 6 * 1024 * 1024];
+    marked[0..16].copy_from_slice(b"MP-PLAIN-MARKER!"); // a recognizable plaintext run
+    upload
+        .put_part(PutPayload::from(marked.clone()))
+        .await
+        .unwrap();
+    upload
+        .put_part(PutPayload::from(vec![9u8; 1024]))
+        .await
+        .unwrap();
+    upload.complete().await.unwrap();
+
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let mut expected = marked;
+    expected.extend_from_slice(&vec![9u8; 1024]);
+    assert_eq!(got.as_ref(), expected.as_slice());
+    // The plaintext marker is nowhere on disk (parts + final object are encrypted).
+    assert!(
+        !dir_contains_bytes(dir.path(), b"MP-PLAIN-MARKER!"),
+        "multipart parts must be encrypted"
+    );
+    stop(handle).await;
 }
