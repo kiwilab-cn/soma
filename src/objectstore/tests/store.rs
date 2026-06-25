@@ -102,3 +102,44 @@ async fn disabled_locality_uses_inner() {
     let got = store.get_range(&OPath::from("obj"), 10..42).await.unwrap();
     assert_eq!(got.as_ref(), &payload[10..42]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_object_at_nonzero_offset_range_reads() {
+    let dir = TempDir::new().unwrap();
+    let backend = Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+    // A small leading object pushes the large object's payload to a non-zero,
+    // non-page-aligned volume offset — exercising the page-align math for real.
+    backend.put(1, b"small-leading-object-to-shift-the-offset").unwrap();
+    let big: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i * 131 + 7) as u8).collect();
+    backend.put(2, &big).unwrap();
+    let reader: Arc<dyn LocalReader> = backend;
+    let server = serve_local_reads(dir.path().join("s.sock"), reader).unwrap();
+    let socket = server.path().to_string_lossy().into_owned();
+
+    let inner = Arc::new(InMemory::new()); // not hit: the locator always reports local
+    let locator = Arc::new(FakeLocator {
+        located: Some(Located {
+            object_id: 2,
+            size: big.len() as u64,
+            hosts: vec!["myhost".into()],
+        }),
+    });
+    let store = SomaStore::with_locator(inner, locator, "bkt".into(), "myhost".into(), socket);
+    let key = OPath::from("big");
+
+    // Whole-object read (CRC-verified path) of a multi-MB object at a non-zero offset.
+    let whole = store.get_range(&key, 0..big.len() as u64).await.unwrap();
+    assert_eq!(whole.as_ref(), big.as_slice());
+
+    // Ranges that start mid-object and cross page boundaries deep into the mapping.
+    let last = big.len() as u64;
+    for (s, e) in [
+        (0u64, 5000u64),
+        (4090, 4106),             // straddles a 4 KiB page boundary
+        (1_000_000, 1_050_000),   // deep, multi-page
+        (last - 1000, last),      // tail
+    ] {
+        let got = store.get_range(&key, s..e).await.unwrap();
+        assert_eq!(got.as_ref(), &big[s as usize..e as usize], "range {s}..{e}");
+    }
+}

@@ -103,6 +103,11 @@ encryption:
 
 gateway:
   replicaCount: 2
+  # Max single-part PUT body the gateway buffers in memory (human-readable). Objects
+  # larger than this must use multipart upload. Default = S3's single-PUT ceiling
+  # (5 GiB); lower it (e.g. "1GiB") to bound per-request memory. Also settable via
+  # the SOMA_MAX_REQUEST_BODY env var. See docs/OBJECT_SIZING.md.
+  maxRequestBody: "5GiB"
   service:
     type: ClusterIP
     annotations: {}

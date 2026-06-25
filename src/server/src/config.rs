@@ -22,6 +22,8 @@ const DEFAULT_VOLUME_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_MAX: u64 = 512 * 1024 * 1024;
 /// Default maximum cacheable object size (bytes).
 const DEFAULT_CACHE_OBJECT_MAX: u64 = 1024 * 1024;
+/// Default single-part request body cap (S3's single-PUT ceiling).
+const DEFAULT_MAX_REQUEST_BODY: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Configuration errors.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +56,11 @@ pub struct Config {
     pub listen: String,
     /// Admin (health + metrics) listen address (gateway/standalone).
     pub admin_listen: String,
+    /// Max bytes buffered for a single-part request body (human-readable, e.g.
+    /// `"5GiB"`). Objects larger than this must use multipart upload. Defaults to
+    /// S3's single-PUT ceiling (5 GiB); lower it (e.g. `"1GiB"`) to bound the memory
+    /// a single PUT can consume on the gateway. Env: `SOMA_MAX_REQUEST_BODY`.
+    pub max_request_body: String,
     /// Data directory (volumes + metadata).
     pub data_dir: String,
     /// Gateway → metadata node endpoint (e.g. `http://meta:9100`). Also where a
@@ -223,6 +230,7 @@ impl Default for Config {
             role: "standalone".to_string(),
             listen: DEFAULT_LISTEN.to_string(),
             admin_listen: DEFAULT_ADMIN_LISTEN.to_string(),
+            max_request_body: "5GiB".to_string(),
             data_dir: DEFAULT_DATA_DIR.to_string(),
             meta_endpoint: "http://127.0.0.1:9100".to_string(),
             storage_endpoints: vec!["http://127.0.0.1:9200".to_string()],
@@ -303,12 +311,18 @@ impl Config {
         parse_size("storage.volume_max", &self.storage.volume_max)?;
         parse_size("cache.max_bytes", &self.cache.max_bytes)?;
         parse_size("cache.max_object_bytes", &self.cache.max_object_bytes)?;
+        parse_size("max_request_body", &self.max_request_body)?;
         Ok(())
     }
 
     /// Resolved volume rotation size in bytes.
     pub fn volume_max_bytes(&self) -> u64 {
         parse_size("storage.volume_max", &self.storage.volume_max).unwrap_or(DEFAULT_VOLUME_MAX)
+    }
+
+    /// Resolved single-part request body cap in bytes.
+    pub fn max_request_body_bytes(&self) -> u64 {
+        parse_size("max_request_body", &self.max_request_body).unwrap_or(DEFAULT_MAX_REQUEST_BODY)
     }
 
     /// Resolved cache capacity in bytes.

@@ -84,7 +84,8 @@ fn build_service(
     backend: Arc<dyn StorageBackend>,
     cfg: &Config,
 ) -> Result<S3Service, BoxError> {
-    let mut service = S3Service::new(meta, backend, build_credentials(cfg));
+    let mut service = S3Service::new(meta, backend, build_credentials(cfg))
+        .with_max_body(cfg.max_request_body_bytes() as usize);
     if let Some(crypto) = maybe_crypto(cfg)? {
         service = service.with_crypto(crypto);
     }

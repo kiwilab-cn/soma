@@ -14,6 +14,9 @@ data:
     admin_listen = "0.0.0.0:{{ .Values.ports.admin }}"
     data_dir = "/tmp/soma"
     meta_endpoint = "{{ include "soma.metaEndpoint" . }}"
+    # Max single-part PUT body buffered in gateway memory (objects above it must use
+    # multipart). Default = S3's 5 GiB ceiling; lower to bound per-request memory.
+    max_request_body = "{{ .Values.gateway.maxRequestBody }}"
     replication_factor = {{ .Values.replication.factor }}
     write_quorum = {{ .Values.replication.writeQuorum }}
     # The gateway discovers its storage node set from the cluster membership
