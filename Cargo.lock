@@ -2756,6 +2756,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "soma-object-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "crc32c",
+ "futures",
+ "memmap2",
+ "object_store",
+ "page_size",
+ "parking_lot",
+ "soma-backend",
+ "soma-client",
+ "soma-localfd",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "soma-s3"
 version = "0.1.0"
 dependencies = [
