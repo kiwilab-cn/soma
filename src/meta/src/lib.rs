@@ -18,7 +18,8 @@ pub use error::{Error, Result};
 pub use redb_store::RedbMetaStore;
 pub use types::{
     BucketMeta, BucketOpts, ETag, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry,
-    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, SseAlgorithm, TenantUsage, Version,
+    BucketUsage, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit, SseAlgorithm,
+    Version,
 };
 
 use soma_core::ObjectId;
@@ -43,6 +44,12 @@ pub trait MetadataStore: Send + Sync {
     /// does not exist.
     fn set_bucket_encryption(&self, name: &str, algo: Option<SseAlgorithm>) -> Result<()>;
 
+    /// Set a bucket's storage quota (zeros = unlimited). Errors if absent.
+    fn set_bucket_quota(&self, name: &str, quota: Quota) -> Result<()>;
+
+    /// Set a bucket's request rate limit (zero rps = unlimited). Errors if absent.
+    fn set_bucket_rate_limit(&self, name: &str, limit: RateLimit) -> Result<()>;
+
     /// List all buckets (sorted by name).
     fn list_buckets(&self) -> Result<Vec<BucketMeta>>;
 
@@ -60,11 +67,11 @@ pub trait MetadataStore: Send + Sync {
     fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>>;
 
     /// Delete an object, subject to `cond`. Idempotent: deleting an absent object
-    /// succeeds unless a condition forbids it. Refunds the object's owning tenant.
+    /// succeeds unless a condition forbids it. Refunds the bucket's usage.
     fn delete_object(&self, bucket: &str, key: &str, cond: PutCondition) -> Result<()>;
 
-    /// The tracked live usage for a tenant (zero if the tenant is unknown).
-    fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage>;
+    /// The tracked live usage for a bucket (zero if unknown).
+    fn bucket_usage(&self, bucket: &str) -> Result<BucketUsage>;
 
     /// Record object ids whose bytes are now orphaned on storage nodes (e.g. the
     /// parts of a completed/aborted multipart upload), for the GC to reclaim.

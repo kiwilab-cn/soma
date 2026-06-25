@@ -18,7 +18,6 @@ mod xml;
 mod tests;
 
 pub use error::{S3Error, S3Result};
-pub use qos::{QosPolicy, TenantPolicy};
 pub use service::{Credentials, GetObjectOk, HeadObjectOk, PutObjectOk, S3Service};
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,23 +67,17 @@ async fn serve_request(svc: S3Service, req: Request) -> Response {
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or("").to_string();
 
-    let tenant = match svc.authorize(method.as_str(), &path, &query, &headers) {
-        Ok(t) => t,
-        Err(e) => return e.into_response(),
-    };
-
-    // Per-tenant rate limiting (gateway-local token bucket).
-    if !svc.allow_request(&tenant) {
-        return S3Error::slow_down().into_response();
+    // Authenticate (the access key gates access; per-bucket QoS handles limits).
+    if let Err(e) = svc.authorize(method.as_str(), &path, &query, &headers) {
+        return e.into_response();
     }
 
-    match dispatch(&svc, &method, &path, &query, &headers, body, &tenant).await {
+    match dispatch(&svc, &method, &path, &query, &headers, body).await {
         Ok(resp) => resp,
         Err(e) => e.into_response(),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     svc: &S3Service,
     method: &Method,
@@ -92,7 +85,6 @@ async fn dispatch(
     query: &str,
     headers: &HeaderMap,
     body: Body,
-    tenant: &str,
 ) -> S3Result<Response> {
     let (bucket, key) = split_path(path);
     let (bucket, key) = (bucket.as_str(), key.as_str());
@@ -108,6 +100,9 @@ async fn dispatch(
         };
     }
 
+    // Per-bucket rate limiting (token bucket; limit from the bucket's metadata).
+    svc.check_rate_limit(bucket).await?;
+
     // Object level.
     if !key.is_empty() {
         // Multipart sub-resources (distinguished by query parameters).
@@ -117,7 +112,7 @@ async fn dispatch(
         if let Some(upload_id) = qget(&q, "uploadId") {
             return match *method {
                 Method::PUT => upload_part(svc, upload_id, &q, body).await,
-                Method::POST => complete_multipart(svc, bucket, key, upload_id, body, tenant).await,
+                Method::POST => complete_multipart(svc, bucket, key, upload_id, body).await,
                 Method::DELETE => {
                     svc.abort_multipart(upload_id.to_string()).await?;
                     Ok(StatusCode::NO_CONTENT.into_response())
@@ -126,7 +121,7 @@ async fn dispatch(
             };
         }
         return match *method {
-            Method::PUT => put_object(svc, bucket, key, headers, body, tenant).await,
+            Method::PUT => put_object(svc, bucket, key, headers, body).await,
             Method::GET => get_object(svc, bucket, key, headers, false).await,
             Method::HEAD => get_object(svc, bucket, key, headers, true).await,
             Method::DELETE => delete_object(svc, bucket, key, headers).await,
@@ -223,7 +218,6 @@ async fn put_object(
     key: &str,
     headers: &HeaderMap,
     body: Body,
-    tenant: &str,
 ) -> S3Result<Response> {
     // Chunked streaming payloads are not decoded in M0.
     if let Some(h) = headers
@@ -250,7 +244,6 @@ async fn put_object(
             bytes,
             cond,
             now_secs(),
-            tenant.to_string(),
             request_sse,
         )
         .await?;
@@ -357,7 +350,6 @@ async fn complete_multipart(
     key: &str,
     upload_id: &str,
     body: Body,
-    tenant: &str,
 ) -> S3Result<Response> {
     let bytes = axum::body::to_bytes(body, MAX_BODY)
         .await
@@ -373,7 +365,6 @@ async fn complete_multipart(
             upload_id.to_string(),
             parts,
             now_secs(),
-            tenant.to_string(),
         )
         .await?;
     let body = xml::complete_multipart_result(bucket, key, &etag);

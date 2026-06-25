@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use soma_meta::{
-    BucketMeta, BucketOpts, ListRequest, ListResult, NodeInfo, ObjectMeta, ObjectPut, PgPlacement,
-    PutCondition, TenantUsage, Version,
+    BucketMeta, BucketOpts, BucketUsage, ListRequest, ListResult, NodeInfo, ObjectMeta, ObjectPut,
+    PgPlacement, PutCondition, Quota, RateLimit, Version,
 };
 
 /// A metadata operation (mirrors the `MetadataStore` trait).
@@ -22,6 +22,14 @@ pub(crate) enum MetaRequest {
     SetBucketEncryption {
         name: String,
         algo: Option<soma_meta::SseAlgorithm>,
+    },
+    SetBucketQuota {
+        name: String,
+        quota: Quota,
+    },
+    SetBucketRateLimit {
+        name: String,
+        limit: RateLimit,
     },
     ListBuckets,
     PutObject {
@@ -44,8 +52,8 @@ pub(crate) enum MetaRequest {
         req: ListRequest,
     },
     NextObjectId,
-    TenantUsage {
-        tenant: String,
+    BucketUsage {
+        bucket: String,
     },
     MarkGarbage {
         object_ids: Vec<u64>,
@@ -80,7 +88,7 @@ pub(crate) enum MetaReply {
     Object(Option<ObjectMeta>),
     List(ListResult),
     ObjectId(u64),
-    Usage(TenantUsage),
+    Usage(BucketUsage),
     Members(Vec<NodeInfo>),
     Seeded(bool),
     PgTable(Vec<(u32, PgPlacement)>),

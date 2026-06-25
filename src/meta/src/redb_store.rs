@@ -17,15 +17,15 @@ use soma_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::types::{
-    BucketMeta, BucketOpts, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry, ObjectMeta,
-    ObjectPut, PgPlacement, PutCondition, SseAlgorithm, TenantUsage, Version,
+    BucketMeta, BucketOpts, BucketUsage, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry,
+    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit, SseAlgorithm, Version,
 };
 use crate::MetadataStore;
 
 const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
 const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 const SEQ: TableDefinition<&str, u64> = TableDefinition::new("seq");
-const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_usage");
+const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("bucket_usage");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
 const PG_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("pg_table");
 /// Object ids superseded by an overwrite/delete (or an orphaned multipart part),
@@ -170,6 +170,8 @@ impl MetadataStore for RedbMetaStore {
                 name: name.to_string(),
                 versioning: opts.versioning,
                 default_sse: None,
+                quota: Quota::default(),
+                rate_limit: RateLimit::default(),
             };
             t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
         }
@@ -221,6 +223,62 @@ impl MetadataStore for RedbMetaStore {
         Ok(())
     }
 
+    fn set_bucket_quota(&self, name: &str, quota: Quota) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(BUCKETS)?;
+            let raw = match t.get(name)? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(Error::NoSuchBucket(name.to_string())),
+            };
+            let mut meta: BucketMeta = postcard::from_bytes(&raw)?;
+            meta.quota = quota;
+            t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
+        }
+        // Recompute the live usage from the actual objects, so enabling a quota on a
+        // bucket that already holds data (whose puts skipped accounting) starts from
+        // the true total rather than zero. Incremental accounting keeps it in sync
+        // thereafter while the quota stays active.
+        {
+            let objects = w.open_table(OBJECTS)?;
+            let mut bytes = 0u64;
+            let mut count = 0u64;
+            let prefix = bucket_prefix(name);
+            let end = prefix_end(&prefix);
+            let lower = Bound::Included(prefix.as_slice());
+            let upper = match &end {
+                Some(e) => Bound::Excluded(e.as_slice()),
+                None => Bound::Unbounded,
+            };
+            for item in objects.range::<&[u8]>((lower, upper))? {
+                let (_, v) = item?;
+                let o: ObjectMeta = postcard::from_bytes(v.value())?;
+                bytes += o.size;
+                count += 1;
+            }
+            let mut usage = w.open_table(USAGE)?;
+            write_usage(&mut usage, name, BucketUsage { bytes, objects: count })?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    fn set_bucket_rate_limit(&self, name: &str, limit: RateLimit) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(BUCKETS)?;
+            let raw = match t.get(name)? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(Error::NoSuchBucket(name.to_string())),
+            };
+            let mut meta: BucketMeta = postcard::from_bytes(&raw)?;
+            meta.rate_limit = limit;
+            t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     fn list_buckets(&self) -> Result<Vec<BucketMeta>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(BUCKETS)?;
@@ -242,12 +300,14 @@ impl MetadataStore for RedbMetaStore {
         let w = self.db.begin_write()?;
         let new_version;
         {
-            {
+            let bucket_meta: BucketMeta = {
                 let buckets = w.open_table(BUCKETS)?;
-                if buckets.get(bucket)?.is_none() {
-                    return Err(Error::NoSuchBucket(bucket.to_string()));
-                }
-            }
+                let raw = match buckets.get(bucket)? {
+                    Some(g) => g.value().to_vec(),
+                    None => return Err(Error::NoSuchBucket(bucket.to_string())),
+                };
+                postcard::from_bytes(&raw)?
+            };
             let mut objects = w.open_table(OBJECTS)?;
             let ck = composite_key(bucket, key);
             let current: Option<ObjectMeta> = match objects.get(ck.as_slice())? {
@@ -256,31 +316,29 @@ impl MetadataStore for RedbMetaStore {
             };
             check_condition(&cond, current.as_ref())?;
 
-            // Quota accounting, atomic with the object write. Only when the put
-            // carries a tenant; overwriting refunds the prior version's owner
-            // first, so usage tracks the live (current) object set.
-            if !put.tenant.is_empty() {
+            // Per-bucket quota accounting, atomic with the object write. An
+            // overwrite refunds the prior version first, so usage tracks the live
+            // (current) object set. The limit comes from the bucket's own quota.
+            let quota = bucket_meta.quota;
+            if quota.max_bytes > 0 || quota.max_objects > 0 {
                 let mut usage = w.open_table(USAGE)?;
-                if let Some(c) = current.as_ref().filter(|c| !c.tenant.is_empty()) {
-                    let mut prev = read_usage(&usage, &c.tenant)?;
-                    prev.bytes = prev.bytes.saturating_sub(c.size);
-                    prev.objects = prev.objects.saturating_sub(1);
-                    write_usage(&mut usage, &c.tenant, prev)?;
+                let mut u = read_usage(&usage, bucket)?;
+                if let Some(c) = current.as_ref() {
+                    u.bytes = u.bytes.saturating_sub(c.size);
+                    u.objects = u.objects.saturating_sub(1);
                 }
-                let mut u = read_usage(&usage, &put.tenant)?;
                 u.bytes += put.size;
                 u.objects += 1;
-                let q = put.quota;
-                if (q.max_bytes > 0 && u.bytes > q.max_bytes)
-                    || (q.max_objects > 0 && u.objects > q.max_objects)
+                if (quota.max_bytes > 0 && u.bytes > quota.max_bytes)
+                    || (quota.max_objects > 0 && u.objects > quota.max_objects)
                 {
                     // Returning here drops the write transaction — nothing commits.
                     return Err(Error::QuotaExceeded(format!(
-                        "tenant {} would use {} bytes / {} objects (limits {} / {})",
-                        put.tenant, u.bytes, u.objects, q.max_bytes, q.max_objects
+                        "bucket {} would use {} bytes / {} objects (limits {} / {})",
+                        bucket, u.bytes, u.objects, quota.max_bytes, quota.max_objects
                     )));
                 }
-                write_usage(&mut usage, &put.tenant, u)?;
+                write_usage(&mut usage, bucket, u)?;
             }
 
             // The overwritten version's bytes are now orphaned on storage nodes;
@@ -297,7 +355,6 @@ impl MetadataStore for RedbMetaStore {
                 etag: put.etag,
                 version: new_version,
                 created_at: put.created_at,
-                tenant: put.tenant,
                 encrypted: put.encrypted,
             };
             objects.insert(ck.as_slice(), postcard::to_allocvec(&meta)?.as_slice())?;
@@ -327,14 +384,12 @@ impl MetadataStore for RedbMetaStore {
             };
             check_condition(&cond, current.as_ref())?;
             if let Some(c) = current {
-                // Refund the owning tenant's usage before removing the object.
-                if !c.tenant.is_empty() {
-                    let mut usage = w.open_table(USAGE)?;
-                    let mut u = read_usage(&usage, &c.tenant)?;
-                    u.bytes = u.bytes.saturating_sub(c.size);
-                    u.objects = u.objects.saturating_sub(1);
-                    write_usage(&mut usage, &c.tenant, u)?;
-                }
+                // Refund the bucket's usage before removing the object.
+                let mut usage = w.open_table(USAGE)?;
+                let mut u = read_usage(&usage, bucket)?;
+                u.bytes = u.bytes.saturating_sub(c.size);
+                u.objects = u.objects.saturating_sub(1);
+                write_usage(&mut usage, bucket, u)?;
                 // The deleted object's bytes are now orphaned — hand its id to GC.
                 w.open_table(GARBAGE)?.insert(c.object_id, 0u64)?;
                 objects.remove(ck.as_slice())?;
@@ -344,10 +399,10 @@ impl MetadataStore for RedbMetaStore {
         Ok(())
     }
 
-    fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage> {
+    fn bucket_usage(&self, bucket: &str) -> Result<BucketUsage> {
         let r = self.db.begin_read()?;
         let usage = r.open_table(USAGE)?;
-        read_usage(&usage, tenant)
+        read_usage(&usage, bucket)
     }
 
     fn mark_garbage(&self, object_ids: &[ObjectId]) -> Result<()> {
@@ -570,24 +625,24 @@ fn check_condition(cond: &PutCondition, current: Option<&ObjectMeta>) -> Result<
     }
 }
 
-/// Read a tenant's usage row from the usage table (zero if absent).
+/// Read a bucket's usage row from the usage table (zero if absent).
 fn read_usage(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
-    tenant: &str,
-) -> Result<TenantUsage> {
-    match table.get(tenant)? {
+    bucket: &str,
+) -> Result<BucketUsage> {
+    match table.get(bucket)? {
         Some(g) => Ok(postcard::from_bytes(g.value())?),
-        None => Ok(TenantUsage::default()),
+        None => Ok(BucketUsage::default()),
     }
 }
 
-/// Write a tenant's usage row.
+/// Write a bucket's usage row.
 fn write_usage(
     table: &mut redb::Table<&'static str, &'static [u8]>,
-    tenant: &str,
-    usage: TenantUsage,
+    bucket: &str,
+    usage: BucketUsage,
 ) -> Result<()> {
-    table.insert(tenant, postcard::to_allocvec(&usage)?.as_slice())?;
+    table.insert(bucket, postcard::to_allocvec(&usage)?.as_slice())?;
     Ok(())
 }
 

@@ -31,7 +31,7 @@ pub enum SseAlgorithm {
 }
 
 /// Stored metadata about a bucket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BucketMeta {
     /// Bucket name.
     pub name: String,
@@ -41,6 +41,12 @@ pub struct BucketMeta {
     /// explicit SSE header (S3 `PutBucketEncryption`). `None` = not encrypted.
     #[serde(default)]
     pub default_sse: Option<SseAlgorithm>,
+    /// Per-bucket storage quota, enforced on writes (zeros = unlimited).
+    #[serde(default)]
+    pub quota: Quota,
+    /// Per-bucket request rate limit, enforced at the gateway (zero = unlimited).
+    #[serde(default)]
+    pub rate_limit: RateLimit,
 }
 
 /// Everything needed to commit an object's current version.
@@ -60,28 +66,31 @@ pub struct ObjectPut {
     /// Creation time (unix seconds), supplied by the caller (the store does no
     /// clock access). Surfaced as S3 `LastModified`.
     pub created_at: u64,
-    /// Owning tenant (the access key). Empty disables quota accounting for this
-    /// put. When set, the store charges the tenant's usage and enforces `quota`
-    /// atomically inside the commit, refunding any overwritten version's owner.
-    pub tenant: String,
-    /// The owning tenant's quota, enforced when `tenant` is non-empty.
-    pub quota: Quota,
     /// Whether the stored bytes are an encryption frame (so reads decrypt them).
     pub encrypted: bool,
 }
 
-/// A per-tenant resource quota. Zero in a dimension means unlimited.
+/// A per-bucket resource quota. Zero in a dimension means unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
-    /// Maximum total live bytes for the tenant (0 = unlimited).
+    /// Maximum total live bytes in the bucket (0 = unlimited).
     pub max_bytes: u64,
-    /// Maximum live object count for the tenant (0 = unlimited).
+    /// Maximum live object count in the bucket (0 = unlimited).
     pub max_objects: u64,
 }
 
-/// A tenant's tracked live usage (current object versions only).
+/// A per-bucket request rate limit (token bucket). Zero `rps` = no limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimit {
+    /// Sustained requests per second (0 = no limit).
+    pub rps: f64,
+    /// Token-bucket burst capacity (requests).
+    pub burst: f64,
+}
+
+/// A bucket's tracked live usage (current object versions only).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TenantUsage {
+pub struct BucketUsage {
     /// Total live bytes.
     pub bytes: u64,
     /// Total live object count.
@@ -102,9 +111,6 @@ pub struct ObjectMeta {
     pub version: Version,
     /// Creation time (unix seconds).
     pub created_at: u64,
-    /// Owning tenant (the access key), used to refund quota on overwrite/delete.
-    /// Empty when the object was written without QoS.
-    pub tenant: String,
     /// Whether the stored bytes are an encryption frame (so reads decrypt them).
     #[serde(default)]
     pub encrypted: bool,

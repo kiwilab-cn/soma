@@ -1,4 +1,4 @@
-# Soma M4 Design — Hardening: Erasure Coding, Encryption at Rest, Multi-Tenant QoS
+# Soma M4 Design — Hardening: Erasure Coding, Encryption at Rest, Per-Bucket QoS
 
 > Detailed design for milestone **M4**.
 > Parent: [`ARCHITECTURE.md`](./ARCHITECTURE.md). Builds on M2 (distributed
@@ -14,7 +14,7 @@ pillars**:
 1. **Erasure coding** — Reed-Solomon `k+m` storage, an efficient alternative to
    N-way replication.
 2. **Envelope encryption at rest** — per-object data keys wrapped by a master key.
-3. **Multi-tenant QoS** — per-tenant quotas and rate limiting.
+3. **Per-bucket QoS** — per-bucket quotas and rate limiting (MinIO `mc quota` style).
 
 ### AI ingest is deferred
 
@@ -31,7 +31,7 @@ a pluggable `IndexSink` boundary so the blob/S3/ingest framework needs no rework
 | --- | --- |
 | **M4a — encryption** | `EncryptingBackend` decorator: per-object DEK, AES-256-GCM, master-key envelope. |
 | **M4b — erasure coding** | `ErasureCodedBackend`: Reed-Solomon `k+m` shards placed across nodes; degraded reads + reconstruction. |
-| **M4c — multi-tenant QoS** | per-tenant quotas (bytes/objects) + request rate limiting at the gateway. |
+| **M4c — per-bucket QoS** | per-bucket quotas (bytes/objects) + request rate limiting, set via the admin API. |
 
 Each phase is an independent, reviewed branch (encryption and EC are both
 `StorageBackend` decorators; QoS is gateway-side), tested — with fault injection
@@ -153,39 +153,54 @@ the decorator is not inserted.
 
 ---
 
-## 4. Multi-tenant QoS
+## 4. Per-bucket QoS
 
-Soma's consumers are multi-tenant; one tenant must not exhaust capacity or starve
-another.
+QoS is configured **per bucket**, following MinIO's model (`mc quota set`): a
+bucket's storage quota and request rate limit live in its metadata and are set or
+changed at any time via the admin API. Defaults are **off** (unlimited) — QoS is
+fully opt-in and adds nothing to the hot path for unconfigured buckets. Access keys
+remain for authentication only; they carry no limits.
 
-### Tenant identity
+### Configuration
 
-A **tenant** is identified by its access key: the credential set maps each
-`access_key → tenant_id`. (Bucket→tenant ownership is a later refinement.) The
-gateway resolves the tenant from the SigV4 access key already parsed during auth.
+Admin endpoints on the admin port (separate from the S3 endpoint):
+
+- `PUT /admin/quota?bucket=<name>&max_bytes=<size>&max_objects=<n>` — set the
+  storage quota (`max_bytes` accepts a human-readable size like `10GiB` or a raw
+  byte count; `0`/omitted = unlimited in that dimension).
+- `PUT /admin/ratelimit?bucket=<name>&rps=<f>&burst=<f>` — set the request rate
+  (`rps` `0`/omitted = no limit; `burst` defaults to `rps`).
+- `GET /admin/quota?bucket=<name>` — report the configured quota + rate limit and
+  the bucket's current live usage.
+
+The limits are stored in `BucketMeta`, so they survive restarts and are visible to
+every gateway over the metadata RPC.
 
 ### Quotas
 
-Per-tenant limits enforced at write time:
+Per-bucket limits enforced at write time:
 
-- **storage bytes** and **object count** — tracked per tenant in the metadata
-  store (a small counters table, updated transactionally with `put_object` /
-  `delete_object`). A `PUT` that would exceed the quota is rejected with an S3
-  `QuotaExceeded` (HTTP 403).
-- Quotas are configured per tenant (config / a tenants table); an unset quota
-  means unlimited.
+- **storage bytes** and **object count** — tracked per bucket in the metadata store
+  (a counters table, updated transactionally with `put_object` / `delete_object`).
+  A `PUT` that would exceed the quota is rejected with an S3 `QuotaExceeded`
+  (HTTP 403); the rejection and the usage update are atomic in one transaction.
+- Setting a quota on a bucket that already holds data **recomputes** usage from a
+  scan, so enabling a quota starts from the true total rather than zero. Changing a
+  quota only affects future writes; existing objects are never evicted.
 
 ### Rate limiting
 
-Per-tenant **token-bucket** rate limiting at the gateway (requests/sec, burst),
-returning S3 `SlowDown` (HTTP 503) when exhausted. In-process per gateway pod in
-M4 (each pod limits independently); a shared/global limiter is a later refinement.
+Per-bucket **token-bucket** rate limiting at the gateway (requests/sec, burst),
+returning S3 `SlowDown` (HTTP 503) when exhausted. The gateway loads the bucket's
+configured rate on the request path (the bucket is already resolved during routing)
+and keeps the token-bucket state in-process per gateway pod (each pod limits
+independently); a shared/global limiter is a later refinement.
 
 ### QoS isolation
 
 Quota tracking lives in the metadata transaction (consistent); rate limiting is
-gateway-local and cheap. Together they cap a tenant's footprint and request rate
-so one tenant's burst or scan cannot monopolize the cluster.
+gateway-local and cheap. Together they cap a bucket's footprint and request rate so
+one bucket's burst or scan cannot monopolize the cluster.
 
 ---
 
@@ -196,7 +211,7 @@ so one tenant's burst or scan cannot monopolize the cluster.
 - **EC reconstruction/rebalance coordinator** and **per-bucket durability/encryption
   policy** — refinements over the M4 cluster-wide settings.
 - **Seekable encrypted range reads**, **external KMS + key rotation**, **global
-  (cross-gateway) rate limiting**, **bucket→tenant ownership** — later refinements.
+  (cross-gateway) rate limiting** — later refinements.
 - **Metadata HA** — still delegated to a future distributed engine (from M2).
 
 ---
@@ -208,5 +223,5 @@ so one tenant's burst or scan cannot monopolize the cluster.
 | Erasure coding | `reed-solomon-simd` |
 | Symmetric encryption | `aes-gcm` (AES-256-GCM) |
 | Key wrapping | AES-256-GCM under the master key (KEK) |
-| Rate limiting | token bucket (in-process) |
-| Tenant quotas | counters in `RedbMetaStore`, updated in the put/delete transaction |
+| Rate limiting | per-bucket token bucket (in-process) |
+| Bucket quotas | counters in `RedbMetaStore`, updated in the put/delete transaction |

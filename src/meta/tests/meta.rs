@@ -3,8 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soma_meta::{
-    BucketOpts, ETag, ListRequest, MetadataStore, ObjectPut, PutCondition, Quota, RedbMetaStore,
-    TenantUsage, Version,
+    BucketOpts, BucketUsage, ETag, ListRequest, MetadataStore, ObjectPut, PutCondition, Quota,
+    RedbMetaStore, Version,
 };
 use tempfile::TempDir;
 
@@ -13,26 +13,16 @@ fn store(dir: &TempDir) -> RedbMetaStore {
 }
 
 fn put(object_id: u64, _offset: u64, size: u32, etag: &str) -> ObjectPut {
-    ObjectPut {
-        object_id,
-        size: size as u64,
-        etag: ETag(etag.to_string()),
-        created_at: 0,
-        tenant: String::new(),
-        quota: Quota::default(),
-        encrypted: false,
-    }
+    put_sized(object_id, size as u64, etag)
 }
 
-/// Like [`put`], but charged to `tenant` under `quota`.
-fn put_for(object_id: u64, size: u64, etag: &str, tenant: &str, quota: Quota) -> ObjectPut {
+/// An [`ObjectPut`] of an explicit byte size (quota is per-bucket, not per-put).
+fn put_sized(object_id: u64, size: u64, etag: &str) -> ObjectPut {
     ObjectPut {
         object_id,
         size,
         etag: ETag(etag.to_string()),
         created_at: 0,
-        tenant: tenant.to_string(),
-        quota,
         encrypted: false,
     }
 }
@@ -334,32 +324,34 @@ fn list_delimiter_paginates_without_duplicating_prefixes() {
     );
 }
 
-// --- multi-tenant quotas (M4c) ---------------------------------------------
+// --- per-bucket quotas -----------------------------------------------------
 
-const T: &str = "tenant-a";
-
-fn bucket(m: &RedbMetaStore) {
+/// Create bucket "b" with the given quota applied.
+fn bucket_with_quota(m: &RedbMetaStore, quota: Quota) {
     m.create_bucket("b", BucketOpts::default()).unwrap();
+    m.set_bucket_quota("b", quota).unwrap();
 }
 
 #[test]
 fn byte_quota_is_enforced_atomically() {
     let dir = TempDir::new().unwrap();
     let m = store(&dir);
-    bucket(&m);
-    let q = Quota {
-        max_bytes: 100,
-        max_objects: 0,
-    };
+    bucket_with_quota(
+        &m,
+        Quota {
+            max_bytes: 100,
+            max_objects: 0,
+        },
+    );
 
     // Two puts up to the limit succeed.
-    m.put_object("b", "k1", put_for(1, 60, "e1", T, q), PutCondition::None)
+    m.put_object("b", "k1", put_sized(1, 60, "e1"), PutCondition::None)
         .unwrap();
-    m.put_object("b", "k2", put_for(2, 40, "e2", T, q), PutCondition::None)
+    m.put_object("b", "k2", put_sized(2, 40, "e2"), PutCondition::None)
         .unwrap();
     assert_eq!(
-        m.tenant_usage(T).unwrap(),
-        TenantUsage {
+        m.bucket_usage("b").unwrap(),
+        BucketUsage {
             bytes: 100,
             objects: 2
         }
@@ -367,12 +359,12 @@ fn byte_quota_is_enforced_atomically() {
 
     // The next byte over the limit is rejected, and usage is unchanged (atomic).
     let err = m
-        .put_object("b", "k3", put_for(3, 1, "e3", T, q), PutCondition::None)
+        .put_object("b", "k3", put_sized(3, 1, "e3"), PutCondition::None)
         .unwrap_err();
     assert!(matches!(err, soma_meta::Error::QuotaExceeded(_)));
     assert_eq!(
-        m.tenant_usage(T).unwrap(),
-        TenantUsage {
+        m.bucket_usage("b").unwrap(),
+        BucketUsage {
             bytes: 100,
             objects: 2
         }
@@ -384,17 +376,19 @@ fn byte_quota_is_enforced_atomically() {
 fn object_count_quota_is_enforced() {
     let dir = TempDir::new().unwrap();
     let m = store(&dir);
-    bucket(&m);
-    let q = Quota {
-        max_bytes: 0,
-        max_objects: 2,
-    };
-    m.put_object("b", "k1", put_for(1, 1, "e1", T, q), PutCondition::None)
+    bucket_with_quota(
+        &m,
+        Quota {
+            max_bytes: 0,
+            max_objects: 2,
+        },
+    );
+    m.put_object("b", "k1", put_sized(1, 1, "e1"), PutCondition::None)
         .unwrap();
-    m.put_object("b", "k2", put_for(2, 1, "e2", T, q), PutCondition::None)
+    m.put_object("b", "k2", put_sized(2, 1, "e2"), PutCondition::None)
         .unwrap();
     assert!(m
-        .put_object("b", "k3", put_for(3, 1, "e3", T, q), PutCondition::None)
+        .put_object("b", "k3", put_sized(3, 1, "e3"), PutCondition::None)
         .is_err());
 }
 
@@ -402,20 +396,22 @@ fn object_count_quota_is_enforced() {
 fn overwrite_refunds_the_previous_version() {
     let dir = TempDir::new().unwrap();
     let m = store(&dir);
-    bucket(&m);
-    let q = Quota {
-        max_bytes: 100,
-        max_objects: 0,
-    };
-    m.put_object("b", "k", put_for(1, 80, "e1", T, q), PutCondition::None)
+    bucket_with_quota(
+        &m,
+        Quota {
+            max_bytes: 100,
+            max_objects: 0,
+        },
+    );
+    m.put_object("b", "k", put_sized(1, 80, "e1"), PutCondition::None)
         .unwrap();
     // Overwriting the same key with a larger object: the old 80 bytes are
     // refunded, so 90 fits under the 100-byte limit (90, not 170).
-    m.put_object("b", "k", put_for(2, 90, "e2", T, q), PutCondition::None)
+    m.put_object("b", "k", put_sized(2, 90, "e2"), PutCondition::None)
         .unwrap();
     assert_eq!(
-        m.tenant_usage(T).unwrap(),
-        TenantUsage {
+        m.bucket_usage("b").unwrap(),
+        BucketUsage {
             bytes: 90,
             objects: 1
         }
@@ -426,21 +422,23 @@ fn overwrite_refunds_the_previous_version() {
 fn delete_refunds_quota() {
     let dir = TempDir::new().unwrap();
     let m = store(&dir);
-    bucket(&m);
-    let q = Quota {
-        max_bytes: 100,
-        max_objects: 0,
-    };
-    m.put_object("b", "k", put_for(1, 70, "e1", T, q), PutCondition::None)
+    bucket_with_quota(
+        &m,
+        Quota {
+            max_bytes: 100,
+            max_objects: 0,
+        },
+    );
+    m.put_object("b", "k", put_sized(1, 70, "e1"), PutCondition::None)
         .unwrap();
     m.delete_object("b", "k", PutCondition::None).unwrap();
-    assert_eq!(m.tenant_usage(T).unwrap(), TenantUsage::default());
+    assert_eq!(m.bucket_usage("b").unwrap(), BucketUsage::default());
     // The freed space is reusable.
-    m.put_object("b", "k2", put_for(2, 90, "e2", T, q), PutCondition::None)
+    m.put_object("b", "k2", put_sized(2, 90, "e2"), PutCondition::None)
         .unwrap();
     assert_eq!(
-        m.tenant_usage(T).unwrap(),
-        TenantUsage {
+        m.bucket_usage("b").unwrap(),
+        BucketUsage {
             bytes: 90,
             objects: 1
         }
@@ -448,13 +446,38 @@ fn delete_refunds_quota() {
 }
 
 #[test]
-fn untenanted_puts_skip_accounting() {
+fn unconfigured_bucket_skips_accounting() {
     let dir = TempDir::new().unwrap();
     let m = store(&dir);
-    bucket(&m);
+    // No quota set on the bucket → unlimited, and usage accounting is skipped.
+    m.create_bucket("b", BucketOpts::default()).unwrap();
     m.put_object("b", "k", put(1, 0, 1000, "e1"), PutCondition::None)
         .unwrap();
-    assert_eq!(m.tenant_usage("").unwrap(), TenantUsage::default());
+    assert_eq!(m.bucket_usage("b").unwrap(), BucketUsage::default());
+}
+
+#[test]
+fn quota_can_be_changed_after_creation() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b", BucketOpts::default()).unwrap();
+    // Initially unlimited: a large object is accepted.
+    m.put_object("b", "k1", put_sized(1, 1000, "e1"), PutCondition::None)
+        .unwrap();
+    // Tighten the quota below current usage: further growth is rejected, but the
+    // already-stored object remains.
+    m.set_bucket_quota(
+        "b",
+        Quota {
+            max_bytes: 1000,
+            max_objects: 0,
+        },
+    )
+    .unwrap();
+    assert!(m
+        .put_object("b", "k2", put_sized(2, 1, "e2"), PutCondition::None)
+        .is_err());
+    assert!(m.get_object("b", "k1").unwrap().is_some());
 }
 
 // --- cluster membership + placement groups (M3a) ---------------------------

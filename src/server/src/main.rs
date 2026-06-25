@@ -19,7 +19,7 @@ use soma_cluster::{
     RebalanceController, ReplicatedBackend, DEFAULT_PG_COUNT,
 };
 use soma_meta::{MetadataStore, RedbMetaStore};
-use soma_s3::{router, Credentials, QosPolicy, S3Service};
+use soma_s3::{router, Credentials, S3Service};
 
 use admin::AdminState;
 use config::Config;
@@ -74,15 +74,15 @@ fn build_credentials(cfg: &Config) -> Credentials {
     creds
 }
 
-/// Assemble the S3 service with QoS and (if a master key is configured) object
-/// crypto for per-bucket server-side encryption.
+/// Assemble the S3 service with (if a master key is configured) object crypto for
+/// per-bucket server-side encryption. Per-bucket quotas and rate limits are
+/// configured via the admin API and live in each bucket's metadata.
 fn build_service(
     meta: Arc<dyn MetadataStore>,
     backend: Arc<dyn StorageBackend>,
     cfg: &Config,
 ) -> Result<S3Service, BoxError> {
-    let mut service = S3Service::new(meta, backend, build_credentials(cfg))
-        .with_qos(QosPolicy::new(cfg.tenant_policies()));
+    let mut service = S3Service::new(meta, backend, build_credentials(cfg));
     if let Some(crypto) = maybe_crypto(cfg)? {
         service = service.with_crypto(crypto);
     }
@@ -184,9 +184,11 @@ async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let meta = open_meta(&cfg)?;
     let backend = maybe_cache(&cfg, open_backend(&cfg)?);
+    let admin_meta = meta.clone(); // for per-bucket QoS admin endpoints
     let service = build_service(meta, backend, &cfg)?;
-    // Standalone is single-node: no cluster membership, so no drain endpoint.
-    serve_s3_and_admin(&cfg, service, metrics, "standalone", None).await
+    // Standalone is single-node: no cluster membership, so no drain endpoint, but
+    // the local meta store still backs the per-bucket quota / rate-limit admin API.
+    serve_s3_and_admin(&cfg, service, metrics, "standalone", Some(admin_meta)).await
 }
 
 /// Stateless gateway: S3 front-end over remote metadata + storage nodes.

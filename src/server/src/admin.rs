@@ -8,10 +8,10 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use metrics_exporter_prometheus::PrometheusHandle;
-use soma_meta::{MetadataStore, NodeState};
+use soma_meta::{MetadataStore, NodeState, Quota, RateLimit};
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -20,7 +20,8 @@ pub struct AdminState {
     pub metrics: PrometheusHandle,
     /// Set to `true` once the node is ready to serve.
     pub ready: Arc<AtomicBool>,
-    /// Metadata handle for cluster ops (drain), when this role has one (gateway).
+    /// Metadata handle for cluster ops (drain) and per-bucket QoS, when this role
+    /// has one (gateway / standalone).
     pub meta: Option<Arc<dyn MetadataStore>>,
 }
 
@@ -33,6 +34,9 @@ pub fn router(state: AdminState) -> Router {
         // Mark a node Draining (its data migrates off before removal) / undo.
         .route("/admin/drain", post(drain))
         .route("/admin/undrain", post(undrain))
+        // Per-bucket QoS: set/clear quota and rate limit, read current config+usage.
+        .route("/admin/quota", get(get_quota).put(put_quota))
+        .route("/admin/ratelimit", put(put_ratelimit))
         .with_state(state)
 }
 
@@ -90,6 +94,160 @@ async fn set_state(
         Ok(Ok(())) => (StatusCode::OK, format!("node marked {label}\n")).into_response(),
         Ok(Err(e)) => (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    }
+}
+
+/// `PUT /admin/quota?bucket=<name>&max_bytes=<size>&max_objects=<n>`: set a
+/// bucket's storage quota (MinIO `mc quota set` style). `max_bytes` accepts a
+/// human-readable size (`"10GiB"`) or a raw byte count; omit or `0` for unlimited
+/// in either dimension. Setting both to zero clears the quota.
+async fn put_quota(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(meta) = state.meta.clone() else {
+        return qos_unavailable();
+    };
+    let Some(bucket) = q.get("bucket").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing ?bucket=<name>\n").into_response();
+    };
+    let max_bytes = match parse_size_param(q.get("max_bytes")) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let max_objects = match parse_u64_param(q.get("max_objects")) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let quota = Quota {
+        max_bytes,
+        max_objects,
+    };
+    let res = tokio::task::spawn_blocking(move || meta.set_bucket_quota(&bucket, quota)).await;
+    blocking_result(res, "quota updated")
+}
+
+/// `PUT /admin/ratelimit?bucket=<name>&rps=<f>&burst=<f>`: set a bucket's request
+/// rate limit. `rps` of `0` (or omitted) clears the limit; `burst` defaults to
+/// `rps` when omitted.
+async fn put_ratelimit(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(meta) = state.meta.clone() else {
+        return qos_unavailable();
+    };
+    let Some(bucket) = q.get("bucket").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing ?bucket=<name>\n").into_response();
+    };
+    let rps = match parse_f64_param(q.get("rps")) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let burst = match parse_f64_param(q.get("burst")) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let limit = RateLimit { rps, burst };
+    let res = tokio::task::spawn_blocking(move || meta.set_bucket_rate_limit(&bucket, limit)).await;
+    blocking_result(res, "rate limit updated")
+}
+
+/// `GET /admin/quota?bucket=<name>`: report a bucket's configured quota + rate
+/// limit and its current live usage, as a small JSON object.
+async fn get_quota(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(meta) = state.meta.clone() else {
+        return qos_unavailable();
+    };
+    let Some(bucket) = q.get("bucket").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing ?bucket=<name>\n").into_response();
+    };
+    let res = tokio::task::spawn_blocking(move || {
+        let b = meta
+            .get_bucket(&bucket)?
+            .ok_or_else(|| soma_meta::Error::NoSuchBucket(bucket.clone()))?;
+        let usage = meta.bucket_usage(&bucket)?;
+        Ok::<_, soma_meta::Error>((b.quota, b.rate_limit, usage))
+    })
+    .await;
+    match res {
+        Ok(Ok((quota, rate, usage))) => {
+            let body = format!(
+                "{{\"max_bytes\":{},\"max_objects\":{},\"rps\":{},\"burst\":{},\
+                 \"used_bytes\":{},\"used_objects\":{}}}\n",
+                quota.max_bytes,
+                quota.max_objects,
+                rate.rps,
+                rate.burst,
+                usage.bytes,
+                usage.objects
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    }
+}
+
+/// Reply for QoS endpoints when this role has no metadata handle.
+fn qos_unavailable() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "per-bucket QoS not available on this role\n",
+    )
+        .into_response()
+}
+
+/// Map a `spawn_blocking` metadata result to an HTTP response.
+fn blocking_result(
+    res: Result<Result<(), soma_meta::Error>, tokio::task::JoinError>,
+    ok_msg: &str,
+) -> Response {
+    match res {
+        Ok(Ok(())) => (StatusCode::OK, format!("{ok_msg}\n")).into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    }
+}
+
+/// Parse an optional human-readable size (`"10GiB"`) or raw byte count; absent/empty
+/// → `0` (unlimited).
+fn parse_size_param(v: Option<&String>) -> Result<u64, String> {
+    match v.map(String::as_str).filter(|s| !s.is_empty()) {
+        None => Ok(0),
+        Some(s) => s
+            .parse::<bytesize::ByteSize>()
+            .map(|b| b.as_u64())
+            .map_err(|e| format!("invalid max_bytes '{s}': {e}\n")),
+    }
+}
+
+/// Parse an optional `u64` parameter; absent/empty → `0`.
+fn parse_u64_param(v: Option<&String>) -> Result<u64, String> {
+    match v.map(String::as_str).filter(|s| !s.is_empty()) {
+        None => Ok(0),
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|e| format!("invalid integer '{s}': {e}\n")),
+    }
+}
+
+/// Parse an optional non-negative `f64` parameter; absent/empty → `0.0`.
+fn parse_f64_param(v: Option<&String>) -> Result<f64, String> {
+    match v.map(String::as_str).filter(|s| !s.is_empty()) {
+        None => Ok(0.0),
+        Some(s) => match s.parse::<f64>() {
+            Ok(f) if f >= 0.0 && f.is_finite() => Ok(f),
+            _ => Err(format!("invalid rate '{s}': must be a non-negative number\n")),
+        },
     }
 }
 

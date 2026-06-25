@@ -106,14 +106,21 @@ fn dir_contains_bytes(dir: &Path, needle: &[u8]) -> bool {
     false
 }
 
-/// Serve the full S3 stack with a multi-tenant QoS policy attached.
-async fn serve_with_qos(dir: &Path, qos: soma_s3::QosPolicy) -> (u16, JoinHandle<()>) {
+/// Serve the full S3 stack with a per-bucket quota / rate limit applied to the
+/// default bucket (zeros = unlimited).
+async fn serve_with_qos(
+    dir: &Path,
+    quota: soma_meta::Quota,
+    rate_limit: soma_meta::RateLimit,
+) -> (u16, JoinHandle<()>) {
     let meta = Arc::new(RedbMetaStore::open(dir.join("meta.redb")).unwrap());
     meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    meta.set_bucket_quota(BUCKET, quota).unwrap();
+    meta.set_bucket_rate_limit(BUCKET, rate_limit).unwrap();
     let fs = Arc::new(LocalFsBackend::open(dir, BackendConfig::default()).unwrap());
     let meta: Arc<dyn MetadataStore> = meta;
     let backend: Arc<dyn StorageBackend> = fs;
-    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK")).with_qos(qos);
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -138,6 +145,26 @@ fn client(port: u16) -> AmazonS3 {
         .with_secret_access_key("SK")
         .with_allow_http(true)
         .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()
+        .unwrap()
+}
+
+/// Like [`client`], but with retries disabled so a `503 SlowDown` surfaces to the
+/// caller immediately instead of being retried after a backoff (which would refill
+/// the rate-limit token bucket and mask the throttle).
+fn client_no_retry(port: u16) -> AmazonS3 {
+    AmazonS3Builder::new()
+        .with_endpoint(format!("http://127.0.0.1:{port}"))
+        .with_region("us-east-1")
+        .with_bucket_name(BUCKET)
+        .with_access_key_id("AK")
+        .with_secret_access_key("SK")
+        .with_allow_http(true)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_retry(object_store::RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        })
         .build()
         .unwrap()
 }
@@ -842,25 +869,16 @@ async fn encrypted_roundtrip_and_ciphertext_at_rest() {
     stop(handle).await;
 }
 
-/// A tenant's byte quota rejects the write that would exceed it (full S3 stack),
+/// A bucket's byte quota rejects the write that would exceed it (full S3 stack),
 /// and a delete frees the space for a subsequent write.
 #[tokio::test]
-async fn tenant_byte_quota_rejects_oversized_writes() {
-    use soma_s3::{QosPolicy, TenantPolicy};
-    use std::collections::HashMap;
-
+async fn bucket_byte_quota_rejects_oversized_writes() {
     let dir = TempDir::new().unwrap();
-    let mut tenants = HashMap::new();
-    tenants.insert(
-        "AK".to_string(),
-        TenantPolicy {
-            max_bytes: 20,
-            max_objects: 0,
-            rps: 0.0,
-            burst: 0.0,
-        },
-    );
-    let (port, handle) = serve_with_qos(dir.path(), QosPolicy::new(tenants)).await;
+    let quota = soma_meta::Quota {
+        max_bytes: 20,
+        max_objects: 0,
+    };
+    let (port, handle) = serve_with_qos(dir.path(), quota, soma_meta::RateLimit::default()).await;
     let store = client(port);
 
     let fifteen = PutPayload::from_static(b"123456789012345"); // 15 bytes
@@ -871,6 +889,29 @@ async fn tenant_byte_quota_rejects_oversized_writes() {
     // Deleting the first frees its bytes, so the second now fits.
     store.delete(&OPath::from("a")).await.unwrap();
     store.put(&OPath::from("b"), fifteen).await.unwrap();
+
+    stop(handle).await;
+}
+
+/// A bucket's request rate limit throttles writes once the burst is drained
+/// (full S3 stack), surfacing as a retryable error to the client.
+#[tokio::test]
+async fn bucket_rate_limit_throttles_burst() {
+    let dir = TempDir::new().unwrap();
+    // 1 req/s sustained, burst of 2: the first two writes pass, the third (fired
+    // immediately) is over the rate.
+    let rate = soma_meta::RateLimit {
+        rps: 1.0,
+        burst: 2.0,
+    };
+    let (port, handle) = serve_with_qos(dir.path(), soma_meta::Quota::default(), rate).await;
+    let store = client_no_retry(port);
+
+    let payload = PutPayload::from_static(b"x");
+    store.put(&OPath::from("a"), payload.clone()).await.unwrap();
+    store.put(&OPath::from("b"), payload.clone()).await.unwrap();
+    // The burst is now drained; an immediate third request is throttled.
+    assert!(store.put(&OPath::from("c"), payload).await.is_err());
 
     stop(handle).await;
 }
