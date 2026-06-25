@@ -18,7 +18,7 @@ mod xml;
 mod tests;
 
 pub use error::{S3Error, S3Result};
-pub use service::{Credentials, GetObjectOk, HeadObjectOk, PutObjectOk, S3Service};
+pub use service::{Access, Credentials, GetObjectOk, HeadObjectOk, PutObjectOk, S3Service};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,12 +67,13 @@ async fn serve_request(svc: S3Service, req: Request) -> Response {
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or("").to_string();
 
-    // Authenticate (the access key gates access; per-bucket QoS handles limits).
-    if let Err(e) = svc.authorize(method.as_str(), &path, &query, &headers) {
-        return e.into_response();
-    }
+    // Authenticate; the access key (the principal) gates per-bucket authorization.
+    let principal = match svc.authorize(method.as_str(), &path, &query, &headers) {
+        Ok(k) => k,
+        Err(e) => return e.into_response(),
+    };
 
-    match dispatch(&svc, &method, &path, &query, &headers, body).await {
+    match dispatch(&svc, &method, &path, &query, &headers, body, &principal).await {
         Ok(resp) => resp,
         Err(e) => e.into_response(),
     }
@@ -85,23 +86,27 @@ async fn dispatch(
     query: &str,
     headers: &HeaderMap,
     body: Body,
+    principal: &str,
 ) -> S3Result<Response> {
     let (bucket, key) = split_path(path);
     let (bucket, key) = (bucket.as_str(), key.as_str());
     let q = parse_query(query);
 
-    // Service level: GET / -> ListBuckets.
+    // Service level: GET / -> ListBuckets (filtered to the principal's buckets).
     if bucket.is_empty() {
         return match *method {
-            Method::GET => list_buckets(svc).await,
+            Method::GET => list_buckets(svc, principal).await,
             _ => Err(S3Error::not_implemented(
                 "unsupported service-level operation",
             )),
         };
     }
 
-    // Per-bucket rate limiting (token bucket; limit from the bucket's metadata).
-    svc.check_rate_limit(bucket).await?;
+    // Per-bucket authorization + rate limiting (one metadata read). `CreateBucket`
+    // has no pre-check — the creating key becomes the owner (create→own).
+    if let Some(access) = required_access(method, key, &q) {
+        svc.check_bucket_access(principal, bucket, access).await?;
+    }
 
     // Object level.
     if !key.is_empty() {
@@ -152,7 +157,8 @@ async fn dispatch(
     }
     match *method {
         Method::PUT => {
-            svc.create_bucket(bucket.to_string()).await?;
+            svc.create_bucket(bucket.to_string(), principal.to_string())
+                .await?;
             Ok(([(header::LOCATION, format!("/{bucket}"))], StatusCode::OK).into_response())
         }
         Method::DELETE => {
@@ -171,10 +177,42 @@ async fn dispatch(
     }
 }
 
-async fn list_buckets(svc: &S3Service) -> S3Result<Response> {
+async fn list_buckets(svc: &S3Service, principal: &str) -> S3Result<Response> {
     let buckets = svc.list_buckets().await?;
-    let body = xml::list_all_buckets(&buckets, now_secs());
+    // A tenant only sees buckets it may read (its own, public, shared, or unowned).
+    let visible: Vec<_> = buckets
+        .into_iter()
+        .filter(|b| b.can_read(principal))
+        .collect();
+    let body = xml::list_all_buckets(&visible, now_secs());
     Ok(xml_response(StatusCode::OK, body))
+}
+
+/// The access an operation needs on `bucket`, or `None` when there is nothing to
+/// pre-authorize (service-level, or `CreateBucket` which is create→own). Mirrors
+/// the routing in [`dispatch`].
+fn required_access(method: &Method, object_key: &str, q: &[(String, String)]) -> Option<Access> {
+    if !object_key.is_empty() {
+        // Object level: GET/HEAD read, everything else (PUT/POST/DELETE) writes.
+        return Some(match *method {
+            Method::GET | Method::HEAD => Access::Read,
+            _ => Access::Write,
+        });
+    }
+    // Bucket level.
+    if qhas(q, "encryption") {
+        return Some(if *method == Method::GET {
+            Access::Read
+        } else {
+            Access::Write
+        });
+    }
+    match *method {
+        Method::PUT => None, // CreateBucket — create→own, nothing to pre-authorize
+        Method::DELETE => Some(Access::Write),
+        Method::GET | Method::HEAD => Some(Access::Read),
+        _ => None,
+    }
 }
 
 async fn list_objects(svc: &S3Service, bucket: &str, q: &[(String, String)]) -> S3Result<Response> {

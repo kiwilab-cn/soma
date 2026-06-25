@@ -35,8 +35,14 @@ fn bucket_lifecycle() {
     assert!(m.get_bucket("b1").unwrap().is_some());
     // Duplicate create errors.
     assert!(m.create_bucket("b1", BucketOpts::default()).is_err());
-    m.create_bucket("b2", BucketOpts { versioning: true })
-        .unwrap();
+    m.create_bucket(
+        "b2",
+        BucketOpts {
+            versioning: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let names: Vec<_> = m
         .list_buckets()
@@ -50,6 +56,43 @@ fn bucket_lifecycle() {
     assert!(m.get_bucket("b1").unwrap().is_none());
     // Deleting a missing bucket errors.
     assert!(m.delete_bucket("b1").is_err());
+}
+
+#[test]
+fn bucket_ownership_and_policy() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+
+    // create→own: the owner is recorded from BucketOpts.
+    m.create_bucket(
+        "owned",
+        BucketOpts {
+            owner: "AK".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let b = m.get_bucket("owned").unwrap().unwrap();
+    assert_eq!(b.owner, "AK");
+    assert!(b.can_read("AK") && b.can_write("AK"));
+    assert!(!b.can_read("BK") && !b.can_write("BK")); // private, owner-only
+
+    // Make it public-read with an extra reader; writes stay owner-only.
+    m.set_bucket_policy("owned", "AK", true, vec!["CK".to_string()])
+        .unwrap();
+    let b = m.get_bucket("owned").unwrap().unwrap();
+    assert!(b.can_read("BK")); // public_read
+    assert!(b.can_read("CK")); // explicit reader
+    assert!(!b.can_write("BK") && !b.can_write("CK")); // still owner-only
+    assert!(b.can_write("AK"));
+
+    // Unowned bucket is open to everyone (back-compat / single-tenant default).
+    m.create_bucket("open", BucketOpts::default()).unwrap();
+    let o = m.get_bucket("open").unwrap().unwrap();
+    assert!(o.can_read("anyone") && o.can_write("anyone"));
+
+    // Policy on a missing bucket errors.
+    assert!(m.set_bucket_policy("ghost", "X", false, vec![]).is_err());
 }
 
 #[test]

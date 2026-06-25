@@ -22,6 +22,24 @@ use crate::error::{S3Error, S3Result};
 use crate::qos::RateLimiter;
 use crate::sigv4::{self, AuthError};
 
+/// The kind of access an operation needs on a bucket, for authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Reading objects/metadata (GET/HEAD/List/`?location`).
+    Read,
+    /// Mutating the bucket or its objects (PUT/POST/DELETE).
+    Write,
+}
+
+impl Access {
+    fn verb(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Write => "write",
+        }
+    }
+}
+
 /// Maps access key ids to secret keys.
 #[derive(Debug, Clone, Default)]
 pub struct Credentials(HashMap<String, String>);
@@ -291,28 +309,55 @@ impl S3Service {
     /// configured limit and consumes a token; returns `SlowDown` if over the rate.
     /// Buckets with no configured limit (the default) are always allowed. An absent
     /// bucket is treated as unlimited (the operation itself surfaces `NoSuchBucket`).
-    pub async fn check_rate_limit(&self, bucket: &str) -> S3Result<()> {
+    pub async fn check_bucket_access(
+        &self,
+        principal: &str,
+        bucket: &str,
+        access: Access,
+    ) -> S3Result<()> {
         let meta = self.meta.clone();
         let bucket_owned = bucket.to_string();
+        let principal_owned = principal.to_string();
+        // One metadata read covers both authorization and the rate limit. A missing
+        // bucket has no policy/limit — the operation itself surfaces `NoSuchBucket`.
         let limit = block(move || {
-            Ok(meta
-                .get_bucket(&bucket_owned)?
-                .map(|b| b.rate_limit)
-                .unwrap_or_default())
+            let Some(bm) = meta.get_bucket(&bucket_owned)? else {
+                return Ok(None);
+            };
+            let allowed = match access {
+                Access::Read => bm.can_read(&principal_owned),
+                Access::Write => bm.can_write(&principal_owned),
+            };
+            if !allowed {
+                return Err(S3Error::access_denied(format!(
+                    "access key is not authorized to {} bucket '{bucket_owned}'",
+                    access.verb()
+                )));
+            }
+            Ok(Some(bm.rate_limit))
         })
         .await?;
-        if self.rate_limiter.allow(bucket, limit) {
-            Ok(())
-        } else {
-            Err(S3Error::slow_down())
+
+        if let Some(limit) = limit {
+            if !self.rate_limiter.allow(bucket, limit) {
+                return Err(S3Error::slow_down());
+            }
         }
+        Ok(())
     }
 
     /// `CreateBucket`.
-    pub async fn create_bucket(&self, bucket: String) -> S3Result<()> {
+    pub async fn create_bucket(&self, bucket: String, owner: String) -> S3Result<()> {
         let meta = self.meta.clone();
         block(move || {
-            meta.create_bucket(&bucket, BucketOpts::default())?;
+            // create→own: the creating access key owns the bucket.
+            meta.create_bucket(
+                &bucket,
+                BucketOpts {
+                    versioning: false,
+                    owner,
+                },
+            )?;
             Ok(())
         })
         .await

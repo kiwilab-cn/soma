@@ -1870,3 +1870,77 @@ async fn object_location_reports_holding_nodes() {
 
     stop(handle).await;
 }
+
+// --- per-bucket authorization ----------------------------------------------
+
+/// An object_store client for a given bucket + credentials.
+fn client_for(port: u16, bucket: &str, ak: &str, sk: &str) -> AmazonS3 {
+    AmazonS3Builder::new()
+        .with_endpoint(format!("http://127.0.0.1:{port}"))
+        .with_region("us-east-1")
+        .with_bucket_name(bucket)
+        .with_access_key_id(ak)
+        .with_secret_access_key(sk)
+        .with_allow_http(true)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()
+        .unwrap()
+}
+
+/// Bucket ownership is enforced end-to-end over SigV4: the owner reads/writes its
+/// bucket, other tenants are denied (403), `public_read` opens reads but not writes,
+/// and an unowned bucket is open to all.
+#[tokio::test]
+async fn per_bucket_authz_enforced() {
+    let dir = TempDir::new().unwrap();
+    let meta = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    // "owned" belongs to AK; "open" is unowned.
+    meta.create_bucket(
+        "owned",
+        BucketOpts {
+            owner: "AK".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    meta.create_bucket("open", BucketOpts::default()).unwrap();
+    let backend = Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+
+    let meta_dyn: Arc<dyn MetadataStore> = meta.clone();
+    let backend_dyn: Arc<dyn StorageBackend> = backend;
+    let mut creds = Credentials::new();
+    creds.add("AK", "sk-a");
+    creds.add("BK", "sk-b");
+    let svc = S3Service::new(meta_dyn, backend_dyn, creds);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(svc)).await;
+    });
+
+    let ak_owned = client_for(port, "owned", "AK", "sk-a");
+    let bk_owned = client_for(port, "owned", "BK", "sk-b");
+    let ak_open = client_for(port, "open", "AK", "sk-a");
+    let bk_open = client_for(port, "open", "BK", "sk-b");
+    let p = PutPayload::from_static(b"data");
+
+    // Owner reads/writes its private bucket; the other tenant is denied (403).
+    ak_owned.put(&OPath::from("k"), p.clone()).await.unwrap();
+    assert!(bk_owned.put(&OPath::from("k2"), p.clone()).await.is_err());
+    ak_owned.get(&OPath::from("k")).await.unwrap();
+    assert!(bk_owned.get(&OPath::from("k")).await.is_err());
+
+    // public_read opens reads to BK, but writes stay owner-only.
+    meta.set_bucket_policy("owned", "AK", true, vec![]).unwrap();
+    bk_owned.get(&OPath::from("k")).await.unwrap();
+    assert!(bk_owned.put(&OPath::from("k3"), p.clone()).await.is_err());
+
+    // Unowned bucket: both tenants read and write freely.
+    ak_open.put(&OPath::from("a"), p.clone()).await.unwrap();
+    bk_open.put(&OPath::from("b"), p.clone()).await.unwrap();
+    ak_open.get(&OPath::from("b")).await.unwrap();
+    bk_open.get(&OPath::from("a")).await.unwrap();
+
+    stop(handle).await;
+}

@@ -65,6 +65,14 @@ fn dispatch(
         MetaRequest::SetBucketRateLimit { name, limit } => store
             .set_bucket_rate_limit(&name, limit)
             .map(|()| MetaReply::Unit),
+        MetaRequest::SetBucketPolicy {
+            name,
+            owner,
+            public_read,
+            readers,
+        } => store
+            .set_bucket_policy(&name, &owner, public_read, readers)
+            .map(|()| MetaReply::Unit),
         MetaRequest::ListBuckets => store.list_buckets().map(MetaReply::Buckets),
         MetaRequest::PutObject {
             bucket,
@@ -231,6 +239,24 @@ impl MetadataStore for MetaClient {
         match self.call(MetaRequest::SetBucketRateLimit {
             name: name.to_string(),
             limit,
+        })? {
+            MetaReply::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn set_bucket_policy(
+        &self,
+        name: &str,
+        owner: &str,
+        public_read: bool,
+        readers: Vec<String>,
+    ) -> Result<()> {
+        match self.call(MetaRequest::SetBucketPolicy {
+            name: name.to_string(),
+            owner: owner.to_string(),
+            public_read,
+            readers,
         })? {
             MetaReply::Unit => Ok(()),
             _ => Err(unexpected()),

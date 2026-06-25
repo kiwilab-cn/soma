@@ -173,7 +173,34 @@ impl MetadataStore for RedbMetaStore {
                 default_sse: None,
                 quota: Quota::default(),
                 rate_limit: RateLimit::default(),
+                owner: opts.owner,
+                public_read: false,
+                readers: Vec::new(),
             };
+            t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    fn set_bucket_policy(
+        &self,
+        name: &str,
+        owner: &str,
+        public_read: bool,
+        readers: Vec<String>,
+    ) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(BUCKETS)?;
+            let raw = match t.get(name)? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(Error::NoSuchBucket(name.to_string())),
+            };
+            let mut meta: BucketMeta = postcard::from_bytes(&raw)?;
+            meta.owner = owner.to_string();
+            meta.public_read = public_read;
+            meta.readers = readers;
             t.insert(name, postcard::to_allocvec(&meta)?.as_slice())?;
         }
         w.commit()?;

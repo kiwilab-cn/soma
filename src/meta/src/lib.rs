@@ -50,6 +50,16 @@ pub trait MetadataStore: Send + Sync {
     /// Set a bucket's request rate limit (zero rps = unlimited). Errors if absent.
     fn set_bucket_rate_limit(&self, name: &str, limit: RateLimit) -> Result<()>;
 
+    /// Set a bucket's access policy: `owner` (empty = unowned/open), whether reads
+    /// are public, and the extra reader keys. Errors if the bucket is absent.
+    fn set_bucket_policy(
+        &self,
+        name: &str,
+        owner: &str,
+        public_read: bool,
+        readers: Vec<String>,
+    ) -> Result<()>;
+
     /// List all buckets (sorted by name).
     fn list_buckets(&self) -> Result<Vec<BucketMeta>>;
 
