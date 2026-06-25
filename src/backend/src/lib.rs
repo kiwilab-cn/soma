@@ -27,7 +27,7 @@ mod local;
 pub use cache::{CacheStats, CachingBackend};
 pub use encrypt::{Crypto, KeyProvider, StaticKeyProvider};
 pub use error::{Error, Result};
-pub use local::{BackendConfig, CompactReport, LocalFsBackend, ScrubReport};
+pub use local::{BackendConfig, CompactReport, Durability, LocalFsBackend, ScrubReport};
 
 use std::os::fd::OwnedFd;
 

@@ -13,7 +13,7 @@ fn open(dir: &TempDir) -> LocalFsBackend {
 }
 
 fn open_with(dir: &TempDir, volume_max: u64) -> LocalFsBackend {
-    LocalFsBackend::open(dir.path(), BackendConfig { volume_max }).unwrap()
+    LocalFsBackend::open(dir.path(), BackendConfig { volume_max, ..Default::default() }).unwrap()
 }
 
 fn vol_count(dir: &TempDir) -> usize {
@@ -315,4 +315,74 @@ fn compacted_volumes_survive_reopen() {
     // And the backend keeps working after compaction + reopen.
     be.put(99, b"after compaction").unwrap();
     assert_eq!(be.get(99, None).unwrap(), b"after compaction");
+}
+
+#[test]
+fn durability_modes_roundtrip_and_persist() {
+    use soma_backend::Durability;
+    for mode in [
+        Durability::PerWrite,
+        Durability::GroupCommit,
+        Durability::Async,
+    ] {
+        let dir = TempDir::new().unwrap();
+        {
+            let b = LocalFsBackend::open(
+                dir.path(),
+                BackendConfig {
+                    durability: mode,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            b.put(1, b"hello").unwrap();
+            b.put(2, b"world").unwrap();
+            b.sync().unwrap(); // explicit barrier (matters for Async before reopen)
+        }
+        // Reopen from disk: the writes survived.
+        let b = open(&dir);
+        assert_eq!(b.get(1, None).unwrap(), b"hello", "mode {mode:?}");
+        assert_eq!(b.get(2, None).unwrap(), b"world", "mode {mode:?}");
+    }
+}
+
+#[test]
+fn group_commit_concurrent_writes() {
+    use soma_backend::Durability;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let b = Arc::new(
+        LocalFsBackend::open(
+            dir.path(),
+            BackendConfig {
+                durability: Durability::GroupCommit,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    // 8 threads × 50 puts each, hammering the group-commit coordinator concurrently.
+    let mut handles = Vec::new();
+    for t in 0..8u64 {
+        let b = b.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..50u64 {
+                let id = t * 1000 + i;
+                b.put(id, format!("obj-{id}").as_bytes()).unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Every write is durable and readable — no lost writes, no deadlock.
+    for t in 0..8u64 {
+        for i in 0..50u64 {
+            let id = t * 1000 + i;
+            assert_eq!(b.get(id, None).unwrap(), format!("obj-{id}").as_bytes());
+        }
+    }
 }

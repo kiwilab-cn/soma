@@ -15,6 +15,7 @@ data:
 
     [storage]
     volume_max = "{{ .Values.config.volumeMax }}"
+    durability = {{ .Values.config.durability | quote }}
     scrub_interval_secs = {{ .Values.config.scrubIntervalSecs }}
     heartbeat_interval_secs = {{ .Values.config.heartbeatIntervalSecs }}
     compact_interval_secs = {{ .Values.config.compactIntervalSecs }}

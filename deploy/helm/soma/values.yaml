@@ -57,6 +57,11 @@ erasure:
 config:
   dataDir: /var/lib/soma
   volumeMax: "4GiB"
+  # Storage-node write durability (when bytes are fsynced). See docs/STORAGE_MODEL.md.
+  #   per_write    — fsync inline before each put returns (strictest single-node).
+  #   group_commit — coalesced shared fsync; durable on return, high concurrency (default).
+  #   async        — no fsync on the write path; durability via erasure coding/replication.
+  durability: group_commit
   scrubIntervalSecs: 3600
   # Storage-node membership heartbeat interval (0 disables registration).
   heartbeatIntervalSecs: 10
