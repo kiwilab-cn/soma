@@ -198,6 +198,9 @@ pub struct EncryptionConfig {
     /// Base64-encoded 32-byte master key (KEK). Typically injected from a
     /// Kubernetes Secret via `SOMA_MASTER_KEY`; keep it out of plaintext config.
     pub master_key: String,
+    /// Plaintext chunk size in bytes for the seekable chunked AEAD (0 = default,
+    /// 64 KiB). Smaller = finer range granularity, more per-chunk tag overhead.
+    pub chunk_size_bytes: usize,
 }
 
 /// Read-cache tuning.

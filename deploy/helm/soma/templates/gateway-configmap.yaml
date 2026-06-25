@@ -39,6 +39,7 @@ data:
     # The master key is injected at runtime via SOMA_MASTER_KEY (from the Secret),
     # never rendered here.
     enabled = {{ .Values.encryption.enabled }}
+    chunk_size_bytes = {{ .Values.encryption.chunkSizeBytes }}
     {{- range .Values.tenants }}
 
     [[tenants]]
