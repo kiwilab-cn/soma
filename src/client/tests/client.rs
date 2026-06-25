@@ -55,7 +55,7 @@ fn short_circuits_to_local_when_co_located() {
     let client = SomaClient::with_remote(remote, "myhost".into(), socket);
 
     // Co-located with a holder → bytes come from the local descriptor, not remote.
-    assert_eq!(client.get("b", "k").unwrap(), payload);
+    assert_eq!(client.get("b", "k").unwrap().as_ref(), payload.as_slice());
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn falls_back_to_remote_when_local_object_missing() {
         remote_bytes: REMOTE_SENTINEL.to_vec(),
     });
     let client = SomaClient::with_remote(remote, "myhost".into(), socket);
-    assert_eq!(client.get("b", "k").unwrap(), REMOTE_SENTINEL);
+    assert_eq!(client.get("b", "k").unwrap().as_ref(), REMOTE_SENTINEL);
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn reads_remote_when_not_co_located() {
         remote_bytes: REMOTE_SENTINEL.to_vec(),
     });
     let client = SomaClient::with_remote(remote, "myhost".into(), socket);
-    assert_eq!(client.get("b", "k").unwrap(), REMOTE_SENTINEL);
+    assert_eq!(client.get("b", "k").unwrap().as_ref(), REMOTE_SENTINEL);
 }
 
 #[test]
@@ -107,7 +107,35 @@ fn no_locality_config_reads_remote() {
         remote_bytes: REMOTE_SENTINEL.to_vec(),
     });
     let client = SomaClient::with_remote(remote, String::new(), String::new());
-    assert_eq!(client.get("b", "k").unwrap(), REMOTE_SENTINEL);
+    assert_eq!(client.get("b", "k").unwrap().as_ref(), REMOTE_SENTINEL);
+}
+
+#[test]
+fn large_object_takes_the_mmap_path() {
+    let dir = TempDir::new().unwrap();
+    let backend = Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+    // A payload well above the 64 KiB mmap threshold, with a varied pattern so the
+    // CRC check is meaningful and the offset math is exercised.
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i * 7 + 3) as u8).collect();
+    backend.put(1, &payload).unwrap();
+    let reader: Arc<dyn LocalReader> = backend;
+    let server = serve_local_reads(dir.path().join("s.sock"), reader).unwrap();
+    let socket = server.path().to_string_lossy().into_owned();
+
+    let remote = Box::new(FakeRemote {
+        located: Some(Located {
+            object_id: 1,
+            size: payload.len() as u64,
+            hosts: vec!["myhost".into()],
+        }),
+        remote_bytes: REMOTE_SENTINEL.to_vec(),
+    });
+    let client = SomaClient::with_remote(remote, "myhost".into(), socket);
+
+    // Zero-copy mmap read returns the exact bytes (CRC-verified) from the descriptor.
+    let got = client.get("b", "k").unwrap();
+    assert_eq!(got.len(), payload.len());
+    assert_eq!(got.as_ref(), payload.as_slice());
 }
 
 // --- real signed GET against a running s3 server ---------------------------
@@ -161,13 +189,14 @@ async fn remote_get_over_real_gateway() {
             region: "us-east-1".into(),
             my_host: String::new(),
             local_socket_path: String::new(),
+            ..Default::default()
         });
         client.get("bkt", "obj")
     })
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(got, body_clone);
+    assert_eq!(got.as_ref(), body_clone.as_slice());
 
     handle.abort();
 }
