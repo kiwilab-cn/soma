@@ -8,6 +8,7 @@ members = [
     "src/cluster",
     "src/s3",
     "src/client",
+    "src/objectstore",
     "src/server",
 ]
 default-members = ["src/server"]
@@ -39,9 +40,11 @@ soma-localfd = { path = "src/localfd" }
 soma-cluster = { path = "src/cluster" }
 soma-s3 = { path = "src/s3" }
 soma-client = { path = "src/client" }
+soma-object-store = { path = "src/objectstore" }
 
 # Third-party
 crc32c = "0.6"
+async-trait = "0.1"
 # Blocking HTTP for the soma-client gateway fallback (http only, no TLS pulled in).
 ureq = { version = "2", default-features = false }
 serde_json = "1"

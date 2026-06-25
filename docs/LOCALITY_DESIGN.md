@@ -86,6 +86,25 @@ boundary below the (unaligned) needle payload and indexes in; the mapping is saf
 its lifetime because soma never truncates a live volume and compaction copies to a
 new file (the held descriptor pins the old inode).
 
+## 2c. The `object_store` adapter (`soma-object-store`)
+
+For consumers built on the [`object_store`](https://crates.io/crates/object_store)
+crate (the de-facto Rust object-store trait, used by Parquet/columnar engines),
+`SomaStore` is a drop-in `ObjectStore` that adds the local short-circuit on top of a
+standard S3 backend: it **delegates** every operation to an inner store (an
+`AmazonS3` pointed at the soma gateway) **except `get_range` / `get_ranges`**, which
+first try the local path (`?location` → fd → `mmap` the requested byte range,
+zero-copy) and fall back to the inner store on any miss. A consumer swaps its
+`AmazonS3` for `SomaStore` and gets locality with **no read-path rewrite** — the hot
+columnar pattern (footer + row-group range reads) is exactly what gets accelerated.
+
+Range reads return `bytes::Bytes` backed by the mmap (zero-copy via `Bytes::from_owner`).
+Because the localfd CRC covers a whole needle, a *whole-object* range read is
+CRC-verified while *partial* ranges are not — partial-range integrity relies on
+soma's background scrub and the consumer's own format-level checks (e.g. Parquet/
+block CRCs). Full-object `get` (with metadata) is served by the inner store; the
+zero-copy path is the range API.
+
 ## 3. The locations oracle (P1)
 
 ### Topology
