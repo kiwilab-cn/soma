@@ -1,0 +1,88 @@
+# Example: co-locating a compute workload with soma storage for short-circuit reads.
+#
+# This is NOT part of the soma chart — the compute engine is your own. It shows the
+# three things a co-located reader needs so the soma client library can short-circuit
+# to local storage (and fall back to the gateway for non-local objects):
+#
+#   1. land on a node that runs a soma storage pod  (podAffinity, hostname topology)
+#   2. mount the same node-local socket directory    (hostPath, matching the chart's
+#      storage.localRead.hostPath)
+#   3. know its own host + where the socket is        (env -> the client's config)
+#
+# Prerequisite: install the chart with `storage.localRead.enabled=true` and a
+# NODE-LOCAL storage class (see docs/LOCALITY_DESIGN.md §5). Short-circuit reads are
+# for single-tenant / dedicated deployments until per-tenant socket scoping lands
+# (§6): any pod mounting the hostPath can read every object on the node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-compute
+  labels:
+    app: my-compute
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-compute
+  template:
+    metadata:
+      labels:
+        app: my-compute
+    spec:
+      affinity:
+        podAffinity:
+          # Prefer nodes already running a soma storage pod, so the local socket is
+          # present. `preferred` (not `required`) keeps the workload schedulable when
+          # there are more compute replicas than storage nodes; the client falls back
+          # to the gateway on nodes without local data. Adjust the instance label to
+          # your Helm release name.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: soma
+                    app.kubernetes.io/instance: soma
+                    app.kubernetes.io/component: storage
+      containers:
+        - name: compute
+          image: your-compute-engine:latest # <- your engine linking the soma client
+          env:
+            # This pod's host (k8s node name): the client compares it to the holder
+            # hosts the gateway's `?location` oracle reports, to decide local vs remote.
+            - name: SOMA_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # The co-located node's short-circuit socket (matches the chart's
+            # storage.localRead hostPath + socketName).
+            - name: SOMA_LOCAL_SOCKET_PATH
+              value: /run/soma/storage.sock
+            # Gateway endpoint + credentials for location lookups and the remote
+            # fallback GET. (Use a Secret for the keys in production.)
+            - name: SOMA_GATEWAY_ENDPOINT
+              value: http://soma-gateway:9000
+            - name: SOMA_ACCESS_KEY
+              value: soma
+            - name: SOMA_SECRET_KEY
+              value: soma-secret
+          # The engine wires these into the soma client, e.g.:
+          #   SomaClient::new(ClientConfig {
+          #       gateway_endpoint: $SOMA_GATEWAY_ENDPOINT,
+          #       access_key: $SOMA_ACCESS_KEY, secret_key: $SOMA_SECRET_KEY,
+          #       region: "us-east-1",
+          #       my_host: $SOMA_HOST,
+          #       local_socket_path: $SOMA_LOCAL_SOCKET_PATH,
+          #   })
+          volumeMounts:
+            - name: soma-localfd
+              # Read-write: connecting to the unix socket needs write permission on
+              # the socket file.
+              mountPath: /run/soma
+      volumes:
+        # The same node-local directory the storage pod binds its socket in.
+        - name: soma-localfd
+          hostPath:
+            path: /run/soma
+            type: Directory

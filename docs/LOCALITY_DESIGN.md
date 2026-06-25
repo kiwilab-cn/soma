@@ -29,7 +29,7 @@ mapping, (2) **topology** so a scheduler can tell "local" from "remote", and (3)
 | **P1 — locations oracle + topology** | `GET object?location` reports the holding nodes, their zone/host, and the data layout; `NodeInfo` carries `zone`/`host`. | **done** |
 | **P2 — local data API** | storage node serves reads over a host-local unix socket, passing the volume **file descriptor** (`SCM_RIGHTS`). | **done** |
 | **P3 — client reader** | `soma-client`: short-circuits to the local socket when co-located, falls back to a signed gateway GET otherwise (transparent). | **done** |
-| **P4 — deployment** | Helm wiring (host socket dir, co-location affinity) + operator docs. | planned |
+| **P4 — deployment** | Helm wiring (storage `localRead` hostPath socket + init container) and a co-location example for the compute side. | **done** |
 | **P5 — zero-copy** | `mmap` the passed fd for GB-scale scans (the protocol already carries the framing; the reader chooses `pread` or `mmap`). | planned |
 | **P6 — multi-tenant isolation** | per-bucket volume partitioning + per-tenant sockets, so short-circuit reads are safe in a shared multi-tenant deployment (§6). | planned |
 
@@ -195,6 +195,29 @@ node, owning that node's disk) is a simpler pure-node-local model — compute th
 plain node affinity. It changes the identity model (node id per node rather than per
 StatefulSet ordinal), so the current design keeps **StatefulSet + local PV**; the
 DaemonSet model is recorded as a viable alternative.
+
+### Enabling it in the chart (P4)
+
+Short-circuit reads are **off by default**. Setting `storage.localRead.enabled=true`
+makes the storage StatefulSet:
+
+- mount a node-local `hostPath` (`storage.localRead.hostPath`, default `/run/soma`),
+- run a small **root init container** that prepares that directory (so the non-root
+  soma process can bind the socket there), and
+- set `SOMA_LOCAL_SOCKET_PATH` so the storage role binds the socket on bind, which the
+  server then `chmod`s to `0666` so a co-located reader of any uid can connect.
+
+The compute side is **not** part of the chart (it is your engine). `deploy/examples/
+compute-colocation.yaml` shows the three things it needs: a `podAffinity` to storage
+pods (hostname topology), a `hostPath` mount of the same socket directory, and the
+env that feeds the client's config (`SOMA_HOST` from `spec.nodeName`, the socket path,
+the gateway endpoint + keys). The reader short-circuits when co-located and falls back
+to the gateway otherwise, so over-/under-provisioning compute replicas is safe.
+
+Caveats (consistent with §5/§6): this needs a **shared-kernel runtime** and a root
+init container (so it does not satisfy the `restricted` Pod Security Standard — gate
+it behind the opt-in), and the unscoped `0666` socket means it is for **single-tenant
+/ dedicated** deployments until per-tenant socket scoping (§6) lands.
 
 ## 6. Multi-tenant isolation (P6 — planned)
 
