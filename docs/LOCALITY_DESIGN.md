@@ -28,7 +28,7 @@ mapping, (2) **topology** so a scheduler can tell "local" from "remote", and (3)
 | --- | --- | --- |
 | **P1 — locations oracle + topology** | `GET object?location` reports the holding nodes, their zone/host, and the data layout; `NodeInfo` carries `zone`/`host`. | **done** |
 | **P2 — local data API** | storage node serves reads over a host-local unix socket, passing the volume **file descriptor** (`SCM_RIGHTS`). | **done** |
-| **P3 — client reader** | a reader that short-circuits to the local socket when co-located, and falls back to the gateway otherwise (transparent). | planned |
+| **P3 — client reader** | `soma-client`: short-circuits to the local socket when co-located, falls back to a signed gateway GET otherwise (transparent). | **done** |
 | **P4 — deployment** | Helm wiring (host socket dir, co-location affinity) + operator docs. | planned |
 | **P5 — zero-copy** | `mmap` the passed fd for GB-scale scans (the protocol already carries the framing; the reader chooses `pread` or `mmap`). | planned |
 
@@ -53,6 +53,25 @@ Two properties hold by construction (see §5): the server reads only the 32-byte
 needle header (never the payload), so integrity is the reader's job (it checks the
 CRC); and because compaction is copy-to-new + atomic rename, a held descriptor pins
 the old inode and reads a consistent snapshot even across a compaction.
+
+## 2b. The client reader (P3)
+
+`soma-client` is the drop-in reader a compute engine links. `SomaClient::get(bucket,
+key)` is **transparent**: configured with this process's host and the path to the
+co-located node's socket, it
+
+1. resolves the object's holders via the gateway's `?location` oracle;
+2. if a holder is on **this** host, reads the bytes through the local socket
+   (passed descriptor, `pread`, CRC-verified) — no gateway, no network;
+3. otherwise — or on *any* local miss (not co-located, no oracle, a raced/missing
+   id, a socket hiccup) — falls back to a **signed S3 GET** against the gateway.
+
+The fallback means reads always succeed if the object exists, so the same client
+works on- and off-cluster; locality is a pure optimization. The local socket
+connection is reused across reads (reconnected on error). The gateway calls are a
+self-contained blocking HTTP + SigV4 signer that mirrors the gateway's verifier
+(no AWS SDK dependency). Short-circuiting is disabled by leaving the host or socket
+path empty, making `SomaClient` a plain S3 reader.
 
 ## 3. The locations oracle (P1)
 
