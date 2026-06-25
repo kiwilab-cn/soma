@@ -105,6 +105,11 @@ soma's background scrub and the consumer's own format-level checks (e.g. Parquet
 block CRCs). Full-object `get` (with metadata) is served by the inner store; the
 zero-copy path is the range API.
 
+**Integration reference:** [`src/objectstore/README.md`](../src/objectstore/README.md)
+— the public API (`SomaStore::new(inner, LocalityConfig{…})`), a copy-paste wiring
+example, what's accelerated vs delegated, and the deployment prerequisites for the
+local path to engage.
+
 ## 3. The locations oracle (P1)
 
 ### Topology
