@@ -252,6 +252,77 @@ async fn object_store_conditional_create() {
     stop(handle).await;
 }
 
+/// The manifest-commit pattern: optimistic concurrency via conditional update
+/// (`If-Match`). Read the current etag, write only if it is still current; two
+/// writers that both observed the same version → exactly one wins, the loser gets a
+/// precondition failure (no corruption, retry). See `docs/CONDITIONAL_WRITES.md`.
+#[tokio::test]
+async fn object_store_conditional_update_cas() {
+    use object_store::UpdateVersion;
+
+    let dir = TempDir::new().unwrap();
+    let (port, handle) = serve(dir.path(), true).await;
+    let store = client(port);
+    let key = OPath::from("manifest");
+
+    // v0: create-if-absent establishes the object and its first etag.
+    let r0 = store
+        .put_opts(
+            &key,
+            PutPayload::from_static(b"v0"),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let e0 = r0.e_tag.clone().expect("etag returned");
+
+    let update_if = |etag: String, body: &'static [u8]| {
+        let store = &store;
+        let key = key.clone();
+        async move {
+            store
+                .put_opts(
+                    &key,
+                    PutPayload::from_static(body),
+                    PutOptions {
+                        mode: PutMode::Update(UpdateVersion {
+                            e_tag: Some(etag),
+                            version: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    };
+
+    // Update with the current etag succeeds and advances the version.
+    let r1 = update_if(e0.clone(), b"v1").await.unwrap();
+    let e1 = r1.e_tag.clone().expect("etag returned");
+    assert_ne!(e0, e1);
+
+    // A second writer that still holds the stale e0 loses: precondition failed.
+    let stale = update_if(e0.clone(), b"v2").await;
+    assert!(
+        matches!(stale, Err(object_store::Error::Precondition { .. })),
+        "stale-etag update must fail with a precondition error, got {stale:?}"
+    );
+
+    // The committed value is the winner's (v1), uncorrupted.
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), b"v1");
+
+    // And a fresh read-then-update with the new etag commits again.
+    update_if(e1, b"v3").await.unwrap();
+    let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.as_ref(), b"v3");
+
+    stop(handle).await;
+}
+
 #[tokio::test]
 async fn object_store_multipart() {
     let dir = TempDir::new().unwrap();
