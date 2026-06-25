@@ -9,8 +9,8 @@ use tonic::{Request, Response, Status};
 
 use soma_core::ObjectId;
 use soma_meta::{
-    BucketMeta, BucketOpts, Error, ListRequest, ListResult, MetadataStore, NodeInfo, NodeState,
-    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Result, TenantUsage, Version,
+    BucketMeta, BucketOpts, BucketUsage, Error, ListRequest, ListResult, MetadataStore, NodeInfo,
+    NodeState, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit, Result, Version,
 };
 
 use crate::bridge::Bridge;
@@ -58,6 +58,12 @@ fn dispatch(
         MetaRequest::SetBucketEncryption { name, algo } => store
             .set_bucket_encryption(&name, algo)
             .map(|()| MetaReply::Unit),
+        MetaRequest::SetBucketQuota { name, quota } => store
+            .set_bucket_quota(&name, quota)
+            .map(|()| MetaReply::Unit),
+        MetaRequest::SetBucketRateLimit { name, limit } => store
+            .set_bucket_rate_limit(&name, limit)
+            .map(|()| MetaReply::Unit),
         MetaRequest::ListBuckets => store.list_buckets().map(MetaReply::Buckets),
         MetaRequest::PutObject {
             bucket,
@@ -77,7 +83,7 @@ fn dispatch(
             store.list_objects(&bucket, &req).map(MetaReply::List)
         }
         MetaRequest::NextObjectId => store.next_object_id().map(MetaReply::ObjectId),
-        MetaRequest::TenantUsage { tenant } => store.tenant_usage(&tenant).map(MetaReply::Usage),
+        MetaRequest::BucketUsage { bucket } => store.bucket_usage(&bucket).map(MetaReply::Usage),
         MetaRequest::MarkGarbage { object_ids } => {
             store.mark_garbage(&object_ids).map(|()| MetaReply::Unit)
         }
@@ -208,6 +214,26 @@ impl MetadataStore for MetaClient {
         }
     }
 
+    fn set_bucket_quota(&self, name: &str, quota: Quota) -> Result<()> {
+        match self.call(MetaRequest::SetBucketQuota {
+            name: name.to_string(),
+            quota,
+        })? {
+            MetaReply::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn set_bucket_rate_limit(&self, name: &str, limit: RateLimit) -> Result<()> {
+        match self.call(MetaRequest::SetBucketRateLimit {
+            name: name.to_string(),
+            limit,
+        })? {
+            MetaReply::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
     fn list_buckets(&self) -> Result<Vec<BucketMeta>> {
         match self.call(MetaRequest::ListBuckets)? {
             MetaReply::Buckets(b) => Ok(b),
@@ -271,9 +297,9 @@ impl MetadataStore for MetaClient {
         }
     }
 
-    fn tenant_usage(&self, tenant: &str) -> Result<TenantUsage> {
-        match self.call(MetaRequest::TenantUsage {
-            tenant: tenant.to_string(),
+    fn bucket_usage(&self, bucket: &str) -> Result<BucketUsage> {
+        match self.call(MetaRequest::BucketUsage {
+            bucket: bucket.to_string(),
         })? {
             MetaReply::Usage(u) => Ok(u),
             _ => Err(unexpected()),

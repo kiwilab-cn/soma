@@ -1,90 +1,63 @@
-//! Multi-tenant QoS (M4c): per-tenant quotas and request rate limiting.
+//! Per-bucket request rate limiting.
 //!
-//! A **tenant** is identified by its access key. [`QosPolicy`] holds each tenant's
-//! configured limits and the live token-bucket state for rate limiting. Quotas
-//! (bytes / object count) are *enforced* in the metadata transaction — this type
-//! only supplies the per-tenant [`Quota`] to attach to a write. Rate limiting is
-//! gateway-local: a token bucket per tenant, refilled at `rps` up to `burst`.
+//! Rate limits live in each bucket's [`soma_meta::BucketMeta::rate_limit`] (set via
+//! the admin API, default off). The S3 layer already loads the bucket's metadata on
+//! the request path, so it passes the [`RateLimit`] in; this type only holds the
+//! live token-bucket state, keyed by bucket name. Storage quotas are enforced in the
+//! metadata transaction (see [`soma_meta`]), not here.
 //!
-//! Tenants without configured limits are unlimited (the default), so QoS is fully
-//! opt-in and adds nothing to the hot path when unconfigured.
+//! Buckets without a configured rate (`rps == 0`) are unlimited, so rate limiting is
+//! fully opt-in and adds nothing to the hot path when unconfigured.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use soma_meta::Quota;
+use soma_meta::RateLimit;
 
-/// A single tenant's limits.
-#[derive(Debug, Clone, Copy)]
-pub struct TenantPolicy {
-    /// Max live bytes (0 = unlimited).
-    pub max_bytes: u64,
-    /// Max live object count (0 = unlimited).
-    pub max_objects: u64,
-    /// Sustained request rate per second (0 = no rate limit).
-    pub rps: f64,
-    /// Token-bucket burst capacity (requests).
-    pub burst: f64,
-}
-
-/// Live token-bucket state for one tenant.
+/// Live token-bucket state for one bucket.
 struct Bucket {
     tokens: f64,
     last: Instant,
 }
 
-/// Per-tenant quota lookup + rate limiting. Empty by default (no limits).
+/// Per-bucket token-bucket rate limiter. Empty by default (no state until a
+/// rate-limited bucket is first hit).
 #[derive(Default)]
-pub struct QosPolicy {
-    tenants: HashMap<String, TenantPolicy>,
+pub struct RateLimiter {
     buckets: Mutex<HashMap<String, Bucket>>,
 }
 
-impl QosPolicy {
-    /// Build from a map of access key → limits.
-    pub fn new(tenants: HashMap<String, TenantPolicy>) -> Self {
-        Self {
-            tenants,
-            buckets: Mutex::new(HashMap::new()),
+impl RateLimiter {
+    /// A fresh, empty limiter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one request token for `bucket`, given its configured `limit`.
+    /// Returns `true` if allowed, `false` if the bucket is currently over its rate.
+    /// Buckets with no configured rate (`rps <= 0`) are always allowed and keep no
+    /// state.
+    pub fn allow(&self, bucket: &str, limit: RateLimit) -> bool {
+        if limit.rps <= 0.0 {
+            return true;
         }
-    }
-
-    /// Whether any tenant has limits configured (lets callers skip QoS work).
-    pub fn is_empty(&self) -> bool {
-        self.tenants.is_empty()
-    }
-
-    /// The quota to attach to a write for `tenant` (zeros = unlimited).
-    pub fn quota(&self, tenant: &str) -> Quota {
-        self.tenants
-            .get(tenant)
-            .map(|p| Quota {
-                max_bytes: p.max_bytes,
-                max_objects: p.max_objects,
-            })
-            .unwrap_or_default()
-    }
-
-    /// Consume one request token for `tenant`. Returns `true` if allowed, `false`
-    /// if the tenant is currently over its rate limit. Tenants with no configured
-    /// rate (`rps == 0`) are always allowed.
-    pub fn allow_request(&self, tenant: &str) -> bool {
-        let policy = match self.tenants.get(tenant) {
-            Some(p) if p.rps > 0.0 => *p,
-            _ => return true,
+        let burst = if limit.burst > 0.0 {
+            limit.burst
+        } else {
+            limit.rps
         };
         let now = Instant::now();
         let mut buckets = self.buckets.lock();
-        let bucket = buckets.entry(tenant.to_string()).or_insert(Bucket {
-            tokens: policy.burst,
+        let b = buckets.entry(bucket.to_string()).or_insert(Bucket {
+            tokens: burst,
             last: now,
         });
-        let elapsed = now.duration_since(bucket.last).as_secs_f64();
-        bucket.last = now;
-        bucket.tokens = (bucket.tokens + elapsed * policy.rps).min(policy.burst);
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        let elapsed = now.duration_since(b.last).as_secs_f64();
+        b.last = now;
+        b.tokens = (b.tokens + elapsed * limit.rps).min(burst);
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
             true
         } else {
             false
@@ -97,58 +70,46 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    fn policy(rps: f64, burst: f64) -> QosPolicy {
-        let mut m = HashMap::new();
-        m.insert(
-            "t".to_string(),
-            TenantPolicy {
-                max_bytes: 1000,
-                max_objects: 5,
-                rps,
-                burst,
-            },
-        );
-        QosPolicy::new(m)
-    }
-
-    #[test]
-    fn quota_lookup() {
-        let q = policy(0.0, 0.0);
-        assert_eq!(
-            q.quota("t"),
-            Quota {
-                max_bytes: 1000,
-                max_objects: 5
-            }
-        );
-        // Unknown tenant → unlimited.
-        assert_eq!(q.quota("other"), Quota::default());
+    fn limit(rps: f64, burst: f64) -> RateLimit {
+        RateLimit { rps, burst }
     }
 
     #[test]
     fn burst_then_throttle() {
-        let q = policy(1.0, 3.0); // 3 burst, 1/s refill
-                                  // The first three requests drain the burst.
-        assert!(q.allow_request("t"));
-        assert!(q.allow_request("t"));
-        assert!(q.allow_request("t"));
+        let rl = RateLimiter::new();
+        let l = limit(1.0, 3.0); // 3 burst, 1/s refill
+                                 // The first three requests drain the burst.
+        assert!(rl.allow("b", l));
+        assert!(rl.allow("b", l));
+        assert!(rl.allow("b", l));
         // The fourth (immediately) is throttled.
-        assert!(!q.allow_request("t"));
-    }
-
-    #[test]
-    fn unconfigured_tenant_is_unlimited() {
-        let q = policy(1.0, 1.0);
-        for _ in 0..100 {
-            assert!(q.allow_request("nobody")); // no policy → always allowed
-        }
+        assert!(!rl.allow("b", l));
     }
 
     #[test]
     fn zero_rps_is_unlimited() {
-        let q = policy(0.0, 0.0); // quota set, but no rate limit
+        let rl = RateLimiter::new();
+        let l = limit(0.0, 0.0);
         for _ in 0..100 {
-            assert!(q.allow_request("t"));
+            assert!(rl.allow("b", l));
         }
+    }
+
+    #[test]
+    fn buckets_are_independent() {
+        let rl = RateLimiter::new();
+        let l = limit(1.0, 1.0);
+        assert!(rl.allow("a", l));
+        assert!(!rl.allow("a", l)); // a is now drained
+        assert!(rl.allow("b", l)); // b has its own bucket
+    }
+
+    #[test]
+    fn missing_burst_defaults_to_rps() {
+        let rl = RateLimiter::new();
+        let l = limit(2.0, 0.0); // burst unset → defaults to rps (2)
+        assert!(rl.allow("b", l));
+        assert!(rl.allow("b", l));
+        assert!(!rl.allow("b", l));
     }
 }

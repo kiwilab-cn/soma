@@ -86,14 +86,12 @@ encryption:
   # Plaintext chunk size for the seekable chunked AEAD (0 = 64 KiB default).
   chunkSizeBytes: 0
 
-# Per-tenant QoS (quotas + rate limits), applied at the gateway and keyed by
-# access key. Empty = no limits. Each entry:
-#   - accessKey: the credential the policy applies to
-#     maxBytes: max live bytes, human-readable ("10GiB"); "" = unlimited
-#     maxObjects: max live object count; 0 = unlimited
-#     rateLimitRps: sustained requests/sec; 0 = no rate limit
-#     rateLimitBurst: token-bucket burst (defaults to rateLimitRps)
-tenants: []
+# Per-bucket QoS (storage quota + request rate limit) is configured at runtime via
+# the admin API, not in this chart — defaults are off (unlimited). Set a quota with
+#   PUT /admin/quota?bucket=<name>&max_bytes=10GiB&max_objects=0
+# and a rate limit with
+#   PUT /admin/ratelimit?bucket=<name>&rps=500&burst=1000
+# on the admin port; read current config + usage with GET /admin/quota?bucket=<name>.
 
 gateway:
   replicaCount: 2

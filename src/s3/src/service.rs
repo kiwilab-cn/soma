@@ -14,12 +14,12 @@ use parking_lot::Mutex;
 
 use soma_backend::{ByteRange, Crypto, StorageBackend};
 use soma_meta::{
-    BucketMeta, BucketOpts, ETag, ListRequest, ListResult, MetadataStore, ObjectPut, PutCondition,
-    SseAlgorithm, Version,
+    BucketMeta, BucketOpts, BucketUsage, ETag, ListRequest, ListResult, MetadataStore, ObjectPut,
+    PutCondition, Quota, RateLimit, SseAlgorithm, Version,
 };
 
 use crate::error::{S3Error, S3Result};
-use crate::qos::QosPolicy;
+use crate::qos::RateLimiter;
 use crate::sigv4::{self, AuthError};
 
 /// Maps access key ids to secret keys.
@@ -74,8 +74,9 @@ pub struct S3Service {
     meta: Arc<dyn MetadataStore>,
     backend: Arc<dyn StorageBackend>,
     creds: Arc<Credentials>,
-    /// Multi-tenant quotas + rate limiting (empty = no limits).
-    qos: Arc<QosPolicy>,
+    /// Per-bucket request rate limiter (token-bucket state; limits come from each
+    /// bucket's metadata). Quotas are enforced in the metadata transaction.
+    rate_limiter: Arc<RateLimiter>,
     /// Object crypto for server-side encryption (`None` if no master key is
     /// configured — encrypted buckets then can't be created or read).
     crypto: Option<Arc<Crypto>>,
@@ -134,17 +135,11 @@ impl S3Service {
             meta,
             backend,
             creds: Arc::new(creds),
-            qos: Arc::new(QosPolicy::default()),
+            rate_limiter: Arc::new(RateLimiter::new()),
             crypto: None,
             uploads: Arc::new(Mutex::new(HashMap::new())),
             upload_seq: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    /// Attach a multi-tenant QoS policy (quotas + rate limiting).
-    pub fn with_qos(mut self, qos: QosPolicy) -> Self {
-        self.qos = Arc::new(qos);
-        self
     }
 
     /// Attach object crypto, enabling server-side encryption for buckets that
@@ -185,6 +180,40 @@ impl S3Service {
         .await
     }
 
+    /// Set a bucket's storage quota (zeros = unlimited). Errors if absent.
+    pub async fn set_bucket_quota(&self, bucket: String, quota: Quota) -> S3Result<()> {
+        let meta = self.meta.clone();
+        block(move || {
+            meta.set_bucket_quota(&bucket, quota)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Set a bucket's request rate limit (zero rps = unlimited). Errors if absent.
+    pub async fn set_bucket_rate_limit(&self, bucket: String, limit: RateLimit) -> S3Result<()> {
+        let meta = self.meta.clone();
+        block(move || {
+            meta.set_bucket_rate_limit(&bucket, limit)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// A bucket's configured quota and rate limit, plus its current live usage.
+    /// Errors if the bucket is absent.
+    pub async fn bucket_qos(&self, bucket: String) -> S3Result<(Quota, RateLimit, BucketUsage)> {
+        let meta = self.meta.clone();
+        block(move || {
+            let b = meta
+                .get_bucket(&bucket)?
+                .ok_or_else(|| S3Error::no_such_bucket(&bucket))?;
+            let usage = meta.bucket_usage(&bucket)?;
+            Ok((b.quota, b.rate_limit, usage))
+        })
+        .await
+    }
+
     /// Verify the request's SigV4 signature, returning the authenticated access
     /// key (the tenant). Pure CPU; no IO.
     pub fn authorize(
@@ -221,10 +250,25 @@ impl S3Service {
         Ok(auth.access_key)
     }
 
-    /// Whether `tenant` may make another request now (rate limiting). `false`
-    /// means the tenant is over its configured rate; reply with `SlowDown`.
-    pub fn allow_request(&self, tenant: &str) -> bool {
-        self.qos.allow_request(tenant)
+    /// Enforce the bucket's request rate limit (token bucket). Loads the bucket's
+    /// configured limit and consumes a token; returns `SlowDown` if over the rate.
+    /// Buckets with no configured limit (the default) are always allowed. An absent
+    /// bucket is treated as unlimited (the operation itself surfaces `NoSuchBucket`).
+    pub async fn check_rate_limit(&self, bucket: &str) -> S3Result<()> {
+        let meta = self.meta.clone();
+        let bucket_owned = bucket.to_string();
+        let limit = block(move || {
+            Ok(meta
+                .get_bucket(&bucket_owned)?
+                .map(|b| b.rate_limit)
+                .unwrap_or_default())
+        })
+        .await?;
+        if self.rate_limiter.allow(bucket, limit) {
+            Ok(())
+        } else {
+            Err(S3Error::slow_down())
+        }
     }
 
     /// `CreateBucket`.
@@ -262,7 +306,6 @@ impl S3Service {
     /// `PutObject`. Stores bytes durably, then commits metadata under `cond`. The
     /// object is encrypted when the request asked for SSE (`request_sse`) or the
     /// bucket has default encryption.
-    #[allow(clippy::too_many_arguments)]
     pub async fn put_object(
         &self,
         bucket: String,
@@ -270,7 +313,6 @@ impl S3Service {
         body: Bytes,
         cond: PutCondition,
         now: u64,
-        tenant: String,
         request_sse: bool,
     ) -> S3Result<PutObjectOk> {
         let meta = self.meta.clone();
@@ -279,7 +321,6 @@ impl S3Service {
         let etag = md5_hex(&body); // ETag is the MD5 of the plaintext
         let etag_stored = etag.clone();
         let size = body.len() as u64; // metadata size is the plaintext length
-        let quota = self.qos.quota(&tenant);
 
         let (version, encrypted) = block(move || {
             // Encrypt if the request or the bucket's default encryption asks for it.
@@ -307,8 +348,6 @@ impl S3Service {
                     size,
                     etag: ETag(etag_stored),
                     created_at: now,
-                    tenant,
-                    quota,
                     encrypted: encrypt,
                 },
                 cond,
@@ -503,7 +542,6 @@ impl S3Service {
         upload_id: String,
         requested: Vec<(u32, String)>,
         now: u64,
-        tenant: String,
     ) -> S3Result<String> {
         if requested.is_empty() {
             return Err(S3Error::invalid_argument("no parts specified"));
@@ -539,7 +577,6 @@ impl S3Service {
         let crypto = self.crypto.clone();
         let etag_stored = final_etag.clone();
         let (b, k) = (bucket.clone(), key.clone());
-        let quota = self.qos.quota(&tenant);
         block(move || {
             // Assemble the plaintext (decrypting each part if the upload is
             // encrypted), then store the final object — re-sealed under a fresh
@@ -574,8 +611,6 @@ impl S3Service {
                     size,
                     etag: ETag(etag_stored),
                     created_at: now,
-                    tenant,
-                    quota,
                     encrypted: encrypt,
                 },
                 PutCondition::None,
