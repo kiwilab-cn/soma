@@ -125,6 +125,16 @@ impl S3Error {
         Self::new("NotImplemented", StatusCode::NOT_IMPLEMENTED, msg)
     }
 
+    /// `ServerSideEncryptionConfigurationNotFoundError` (404) — the bucket has no
+    /// default encryption configured.
+    pub fn no_encryption_config() -> Self {
+        Self::new(
+            "ServerSideEncryptionConfigurationNotFoundError",
+            StatusCode::NOT_FOUND,
+            "The server side encryption configuration was not found",
+        )
+    }
+
     /// `QuotaExceeded` (403) — the tenant's storage quota would be exceeded.
     pub fn quota_exceeded(msg: impl Into<String>) -> Self {
         Self::new("QuotaExceeded", StatusCode::FORBIDDEN, msg)

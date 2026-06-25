@@ -22,6 +22,14 @@ pub struct BucketOpts {
     pub versioning: bool,
 }
 
+/// Server-side encryption algorithm for a bucket's default encryption (S3 SSE).
+/// Only SSE-S3 (`AES256`, server-managed key) is supported; SSE-KMS/SSE-C are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SseAlgorithm {
+    /// SSE-S3: AES-256 under the cluster's server-managed master key.
+    Aes256,
+}
+
 /// Stored metadata about a bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketMeta {
@@ -29,6 +37,10 @@ pub struct BucketMeta {
     pub name: String,
     /// Whether versioning is enabled.
     pub versioning: bool,
+    /// Default server-side encryption applied to objects written without an
+    /// explicit SSE header (S3 `PutBucketEncryption`). `None` = not encrypted.
+    #[serde(default)]
+    pub default_sse: Option<SseAlgorithm>,
 }
 
 /// Everything needed to commit an object's current version.
@@ -54,6 +66,8 @@ pub struct ObjectPut {
     pub tenant: String,
     /// The owning tenant's quota, enforced when `tenant` is non-empty.
     pub quota: Quota,
+    /// Whether the stored bytes are an encryption frame (so reads decrypt them).
+    pub encrypted: bool,
 }
 
 /// A per-tenant resource quota. Zero in a dimension means unlimited.
@@ -91,6 +105,9 @@ pub struct ObjectMeta {
     /// Owning tenant (the access key), used to refund quota on overwrite/delete.
     /// Empty when the object was written without QoS.
     pub tenant: String,
+    /// Whether the stored bytes are an encryption frame (so reads decrypt them).
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 /// Condition under which a put/delete is allowed (S3 conditional writes).

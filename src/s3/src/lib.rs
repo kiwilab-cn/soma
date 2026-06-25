@@ -112,7 +112,7 @@ async fn dispatch(
     if !key.is_empty() {
         // Multipart sub-resources (distinguished by query parameters).
         if *method == Method::POST && qhas(&q, "uploads") {
-            return create_multipart(svc, bucket, key).await;
+            return create_multipart(svc, bucket, key, headers).await;
         }
         if let Some(upload_id) = qget(&q, "uploadId") {
             return match *method {
@@ -135,6 +135,18 @@ async fn dispatch(
     }
 
     // Bucket level.
+    // `?encryption` sub-resource: default bucket encryption (S3 SSE).
+    if qhas(&q, "encryption") {
+        return match *method {
+            Method::PUT => put_bucket_encryption(svc, bucket, body).await,
+            Method::GET => get_bucket_encryption(svc, bucket).await,
+            Method::DELETE => {
+                svc.set_bucket_encryption(bucket.to_string(), None).await?;
+                Ok(StatusCode::NO_CONTENT.into_response())
+            }
+            _ => Err(S3Error::not_implemented("unsupported encryption operation")),
+        };
+    }
     match *method {
         Method::PUT => {
             svc.create_bucket(bucket.to_string()).await?;
@@ -226,6 +238,7 @@ async fn put_object(
     }
 
     let cond = put_condition(headers)?;
+    let request_sse = requested_sse(headers)?;
     let bytes = axum::body::to_bytes(body, MAX_BODY)
         .await
         .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
@@ -238,20 +251,82 @@ async fn put_object(
             cond,
             now_secs(),
             tenant.to_string(),
+            request_sse,
         )
         .await?;
 
     let mut h = HeaderMap::new();
     h.insert(header::ETAG, hv(&format!("\"{}\"", ok.etag)));
+    if ok.encrypted {
+        h.insert("x-amz-server-side-encryption", hv("AES256"));
+    }
     Ok((StatusCode::OK, h).into_response())
 }
 
-async fn create_multipart(svc: &S3Service, bucket: &str, key: &str) -> S3Result<Response> {
+/// Whether the request asked for server-side encryption. Only SSE-S3 (`AES256`)
+/// is supported; SSE-KMS/SSE-C are rejected.
+fn requested_sse(headers: &HeaderMap) -> S3Result<bool> {
+    match headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok())
+    {
+        None => Ok(false),
+        Some("AES256") => Ok(true),
+        Some(other) => Err(S3Error::not_implemented(format!(
+            "unsupported server-side encryption '{other}' (only AES256 is supported)"
+        ))),
+    }
+}
+
+async fn create_multipart(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> S3Result<Response> {
     let upload_id = svc
-        .create_multipart(bucket.to_string(), key.to_string())
+        .create_multipart(bucket.to_string(), key.to_string(), requested_sse(headers)?)
         .await?;
     let body = xml::initiate_multipart_result(bucket, key, &upload_id);
     Ok(xml_response(StatusCode::OK, body))
+}
+
+/// `PutBucketEncryption`: set the bucket's default SSE. Only SSE-S3 (`AES256`) is
+/// accepted; SSE-KMS is rejected.
+async fn put_bucket_encryption(svc: &S3Service, bucket: &str, body: Body) -> S3Result<Response> {
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| S3Error::invalid_argument("body is not valid utf-8"))?;
+    if text.contains("aws:kms") {
+        return Err(S3Error::not_implemented(
+            "SSE-KMS is not supported (only AES256)",
+        ));
+    }
+    if !text.contains("AES256") {
+        return Err(S3Error::invalid_argument(
+            "expected an SSEAlgorithm of AES256",
+        ));
+    }
+    svc.set_bucket_encryption(bucket.to_string(), Some(soma_meta::SseAlgorithm::Aes256))
+        .await?;
+    Ok(StatusCode::OK.into_response())
+}
+
+/// `GetBucketEncryption`: render the bucket's default SSE config, or 404.
+async fn get_bucket_encryption(svc: &S3Service, bucket: &str) -> S3Result<Response> {
+    match svc.bucket_encryption(bucket.to_string()).await? {
+        Some(soma_meta::SseAlgorithm::Aes256) => Ok(xml_response(
+            StatusCode::OK,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <ServerSideEncryptionConfiguration><Rule>\
+             <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+             </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+                .to_string(),
+        )),
+        None => Err(S3Error::no_encryption_config()),
+    }
 }
 
 async fn upload_part(
@@ -316,6 +391,9 @@ async fn get_object(
         let m = svc.head_object(bucket.to_string(), key.to_string()).await?;
         let mut h = object_headers(&m.etag, m.size, m.created_at);
         h.insert(header::CONTENT_LENGTH, hv(&m.size.to_string()));
+        if m.encrypted {
+            h.insert("x-amz-server-side-encryption", hv("AES256"));
+        }
         return Ok((StatusCode::OK, h).into_response());
     }
 
@@ -330,6 +408,9 @@ async fn get_object(
 
     let mut h = object_headers(&obj.etag, obj.size, obj.created_at);
     h.insert(header::CONTENT_LENGTH, hv(&obj.data.len().to_string()));
+    if obj.encrypted {
+        h.insert("x-amz-server-side-encryption", hv("AES256"));
+    }
     let status = match (&obj.content_range, partial) {
         (Some(cr), _) => {
             h.insert(header::CONTENT_RANGE, hv(cr));

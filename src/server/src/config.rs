@@ -188,15 +188,14 @@ impl Default for ErasureConfig {
     }
 }
 
-/// Encryption-at-rest tuning. Opt-in: when `enabled`, the gateway/standalone
-/// backend is wrapped in envelope encryption under `master_key`.
+/// Server-side encryption tuning. A `master_key` makes SSE *available*; individual
+/// buckets opt in via `PutBucketEncryption` (the default is no encryption).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct EncryptionConfig {
-    /// Whether envelope encryption at rest is enabled.
-    pub enabled: bool,
     /// Base64-encoded 32-byte master key (KEK). Typically injected from a
     /// Kubernetes Secret via `SOMA_MASTER_KEY`; keep it out of plaintext config.
+    /// Empty = SSE unavailable (encrypted buckets can't be created or read).
     pub master_key: String,
     /// Plaintext chunk size in bytes for the seekable chunked AEAD (0 = default,
     /// 64 KiB). Smaller = finer range granularity, more per-chunk tag overhead.

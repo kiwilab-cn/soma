@@ -20,6 +20,7 @@ fn put(object_id: u64, _offset: u64, size: u32, etag: &str) -> ObjectPut {
         created_at: 0,
         tenant: String::new(),
         quota: Quota::default(),
+        encrypted: false,
     }
 }
 
@@ -32,6 +33,7 @@ fn put_for(object_id: u64, size: u64, etag: &str, tenant: &str, quota: Quota) ->
         created_at: 0,
         tenant: tenant.to_string(),
         quota,
+        encrypted: false,
     }
 }
 
@@ -658,4 +660,29 @@ fn mark_garbage_and_limit() {
     assert_eq!(m.list_garbage(100).unwrap().len(), 3);
     m.remove_garbage(&[10, 20, 30]).unwrap();
     assert!(m.list_garbage(100).unwrap().is_empty());
+}
+
+#[test]
+fn bucket_default_encryption_set_get_clear() {
+    use soma_meta::SseAlgorithm;
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b", BucketOpts::default()).unwrap();
+    assert!(m.get_bucket("b").unwrap().unwrap().default_sse.is_none()); // default off
+
+    m.set_bucket_encryption("b", Some(SseAlgorithm::Aes256))
+        .unwrap();
+    assert_eq!(
+        m.get_bucket("b").unwrap().unwrap().default_sse,
+        Some(SseAlgorithm::Aes256)
+    );
+
+    m.set_bucket_encryption("b", None).unwrap();
+    assert!(m.get_bucket("b").unwrap().unwrap().default_sse.is_none());
+
+    // Missing bucket errors.
+    assert!(matches!(
+        m.set_bucket_encryption("nope", Some(SseAlgorithm::Aes256)),
+        Err(soma_meta::Error::NoSuchBucket(_))
+    ));
 }

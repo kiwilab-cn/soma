@@ -12,8 +12,7 @@ use std::sync::Arc;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use soma_backend::{
-    BackendConfig, CachingBackend, EncryptingBackend, LocalFsBackend, StaticKeyProvider,
-    StorageBackend,
+    BackendConfig, CachingBackend, Crypto, LocalFsBackend, StaticKeyProvider, StorageBackend,
 };
 use soma_cluster::{
     serve_meta, serve_storage, Durability, ErasureCodedBackend, MetaClient, Placement,
@@ -75,33 +74,33 @@ fn build_credentials(cfg: &Config) -> Credentials {
     creds
 }
 
-/// Assemble the S3 service with the configured multi-tenant QoS policy.
+/// Assemble the S3 service with QoS and (if a master key is configured) object
+/// crypto for per-bucket server-side encryption.
 fn build_service(
     meta: Arc<dyn MetadataStore>,
     backend: Arc<dyn StorageBackend>,
     cfg: &Config,
-) -> S3Service {
-    S3Service::new(meta, backend, build_credentials(cfg))
-        .with_qos(QosPolicy::new(cfg.tenant_policies()))
+) -> Result<S3Service, BoxError> {
+    let mut service = S3Service::new(meta, backend, build_credentials(cfg))
+        .with_qos(QosPolicy::new(cfg.tenant_policies()));
+    if let Some(crypto) = maybe_crypto(cfg)? {
+        service = service.with_crypto(crypto);
+    }
+    Ok(service)
 }
 
-/// Wrap a backend in envelope encryption if enabled. Encryption sits **below** the
-/// cache (so the cache holds plaintext) and **above** replication/storage (so
-/// nodes only ever see ciphertext). Fails fast on a missing/invalid master key.
-fn maybe_encrypt(
-    cfg: &Config,
-    backend: Arc<dyn StorageBackend>,
-) -> Result<Arc<dyn StorageBackend>, BoxError> {
-    if cfg.encryption.enabled {
-        let keys = StaticKeyProvider::from_base64(&cfg.encryption.master_key)?;
-        let mut enc = EncryptingBackend::new(backend, &keys);
-        if cfg.encryption.chunk_size_bytes > 0 {
-            enc = enc.with_chunk_size(cfg.encryption.chunk_size_bytes);
-        }
-        Ok(Arc::new(enc))
-    } else {
-        Ok(backend)
+/// Build object crypto from the configured master key, if any. Buckets opt into
+/// encryption via `PutBucketEncryption`; without a master key, those calls fail.
+fn maybe_crypto(cfg: &Config) -> Result<Option<Crypto>, BoxError> {
+    if cfg.encryption.master_key.is_empty() {
+        return Ok(None);
     }
+    let keys = StaticKeyProvider::from_base64(&cfg.encryption.master_key)?;
+    let mut crypto = Crypto::new(&keys);
+    if cfg.encryption.chunk_size_bytes > 0 {
+        crypto = crypto.with_chunk_size(cfg.encryption.chunk_size_bytes);
+    }
+    Ok(Some(crypto))
 }
 
 /// Wrap a backend in the read cache if enabled.
@@ -184,8 +183,8 @@ async fn run_membership(
 async fn run_standalone(cfg: Config) -> Result<(), BoxError> {
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let meta = open_meta(&cfg)?;
-    let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, open_backend(&cfg)?)?);
-    let service = build_service(meta, backend, &cfg);
+    let backend = maybe_cache(&cfg, open_backend(&cfg)?);
+    let service = build_service(meta, backend, &cfg)?;
     // Standalone is single-node: no cluster membership, so no drain endpoint.
     serve_s3_and_admin(&cfg, service, metrics, "standalone", None).await
 }
@@ -240,8 +239,8 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     };
     let meta: Arc<dyn MetadataStore> = meta_client;
     let admin_meta = meta.clone(); // for the drain endpoint
-    let backend = maybe_cache(&cfg, maybe_encrypt(&cfg, storage)?);
-    let service = build_service(meta, backend, &cfg);
+    let backend = maybe_cache(&cfg, storage);
+    let service = build_service(meta, backend, &cfg)?;
     if cfg.erasure.enabled {
         tracing::info!(
             meta = %cfg.meta_endpoint,
@@ -430,7 +429,7 @@ async fn serve_s3_and_admin(
         admin_listen = %cfg.admin_listen,
         credentials = cfg.credentials.len(),
         cache_enabled = cfg.cache.enabled,
-        encryption_enabled = cfg.encryption.enabled,
+        encryption_available = !cfg.encryption.master_key.is_empty(),
         "soma-server listening"
     );
 

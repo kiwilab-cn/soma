@@ -1,6 +1,3 @@
-{{- if and .Values.encryption.enabled (not .Values.encryption.masterKey) (not .Values.credentials.existingSecret) }}
-{{- fail "encryption.enabled requires encryption.masterKey (base64-encoded 32 bytes) or credentials.existingSecret providing SOMA_MASTER_KEY" }}
-{{- end }}
 {{- if and .Values.erasure.enabled (lt (int .Values.storage.replicaCount) (add (int .Values.erasure.dataShards) (int .Values.erasure.parityShards))) }}
 {{- fail "erasure.enabled requires storage.replicaCount >= erasure.dataShards + erasure.parityShards" }}
 {{- end }}
@@ -38,7 +35,6 @@ data:
     [encryption]
     # The master key is injected at runtime via SOMA_MASTER_KEY (from the Secret),
     # never rendered here.
-    enabled = {{ .Values.encryption.enabled }}
     chunk_size_bytes = {{ .Values.encryption.chunkSizeBytes }}
     {{- range .Values.tenants }}
 
