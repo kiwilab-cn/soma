@@ -943,8 +943,10 @@ async fn membership_and_pg_table_over_grpc() {
     // Drive registration, heartbeat, and PG-table seeding entirely over gRPC.
     let c = client.clone();
     tokio::task::spawn_blocking(move || {
-        c.register_node("node-0", "http://node-0:9200", 10).unwrap();
-        c.register_node("node-1", "http://node-1:9200", 10).unwrap();
+        c.register_node("node-0", "http://node-0:9200", Default::default(), 10)
+            .unwrap();
+        c.register_node("node-1", "http://node-1:9200", Default::default(), 10)
+            .unwrap();
         c.heartbeat("node-0", 20).unwrap();
         assert!(matches!(
             c.heartbeat("ghost", 20),
@@ -1027,7 +1029,7 @@ async fn membership_cluster(num_storage: usize, rf: usize, wq: usize) -> Cluster
         let regs = nodes.clone();
         tokio::task::spawn_blocking(move || {
             for (id, ep) in &regs {
-                c.register_node(id, ep, now).unwrap();
+                c.register_node(id, ep, Default::default(), now).unwrap();
             }
         })
         .await
@@ -1083,12 +1085,12 @@ async fn register_nodes(
     nodes: &[(String, String)],
     now: u64,
 ) {
-    use soma_meta::MetadataStore;
+    use soma_meta::{MetadataStore, NodeTopology};
     let c = meta.clone();
     let ns = nodes.to_vec();
     tokio::task::spawn_blocking(move || {
         for (id, ep) in &ns {
-            c.register_node(id, ep, now).unwrap();
+            c.register_node(id, ep, NodeTopology::default(), now).unwrap();
         }
     })
     .await
@@ -1783,5 +1785,88 @@ async fn multipart_into_encrypted_bucket() {
         !dir_contains_bytes(dir.path(), b"MP-PLAIN-MARKER!"),
         "multipart parts must be encrypted"
     );
+    stop(handle).await;
+}
+
+// --- data-locality oracle (?location) --------------------------------------
+
+/// With no locality oracle (single-node deployment), `object_locations` reports
+/// nothing — the `?location` endpoint then answers `501`.
+#[tokio::test]
+async fn object_location_without_oracle_is_none() {
+    let dir = TempDir::new().unwrap();
+    let meta = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let backend = Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+    let meta: Arc<dyn MetadataStore> = meta;
+    let backend: Arc<dyn StorageBackend> = backend;
+    let svc = S3Service::new(meta, backend, Credentials::single("AK", "SK"));
+
+    assert!(svc
+        .object_locations(BUCKET.to_string(), "k".to_string())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// With a locality oracle attached, `object_locations` resolves a stored object to
+/// the nodes holding it, with layout and per-node role — the data a co-located
+/// scheduler needs.
+#[tokio::test]
+async fn object_location_reports_holding_nodes() {
+    use soma_cluster::{Placement, PlacementOracle, DEFAULT_PG_COUNT};
+    use soma_meta::{DataLayout, ShardRole};
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let meta = Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta.create_bucket(BUCKET, BucketOpts::default()).unwrap();
+    let fs = Arc::new(LocalFsBackend::open(dir.path(), BackendConfig::default()).unwrap());
+    let meta_dyn: Arc<dyn MetadataStore> = meta.clone();
+    let backend: Arc<dyn StorageBackend> = fs.clone();
+
+    // A single-node placement: every object lives on "n0".
+    let mut clients: HashMap<String, Arc<dyn StorageBackend>> = HashMap::new();
+    clients.insert("n0".to_string(), fs.clone());
+    let placement = Placement::local(clients, 1, DEFAULT_PG_COUNT);
+    let oracle = Arc::new(PlacementOracle::new(
+        placement,
+        DataLayout::Replicated { width: 1 },
+    ));
+
+    let svc =
+        S3Service::new(meta_dyn, backend, Credentials::single("AK", "SK")).with_oracle(oracle);
+
+    // Serve a clone so an object can be PUT over the wire, then query the retained
+    // handle directly (both share the same metadata store).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = svc.clone();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(served)).await;
+    });
+    let store = client(port);
+    store
+        .put(&OPath::from("k"), PutPayload::from_static(b"hello"))
+        .await
+        .unwrap();
+
+    let loc = svc
+        .object_locations(BUCKET.to_string(), "k".to_string())
+        .await
+        .unwrap()
+        .expect("oracle present → locations resolved");
+    assert_eq!(loc.size, 5);
+    assert!(matches!(loc.layout, DataLayout::Replicated { width: 1 }));
+    assert_eq!(loc.nodes.len(), 1);
+    assert_eq!(loc.nodes[0].node_id, "n0");
+    assert!(matches!(loc.nodes[0].role, ShardRole::Replica));
+
+    // A missing key surfaces as an error, not an empty location.
+    assert!(svc
+        .object_locations(BUCKET.to_string(), "missing".to_string())
+        .await
+        .is_err());
+
     stop(handle).await;
 }

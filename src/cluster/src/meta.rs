@@ -10,7 +10,8 @@ use tonic::{Request, Response, Status};
 use soma_core::ObjectId;
 use soma_meta::{
     BucketMeta, BucketOpts, BucketUsage, Error, ListRequest, ListResult, MetadataStore, NodeInfo,
-    NodeState, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit, Result, Version,
+    NodeState, NodeTopology, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit,
+    Result, Version,
 };
 
 use crate::bridge::Bridge;
@@ -90,9 +91,11 @@ fn dispatch(
         MetaRequest::RegisterNode {
             node_id,
             endpoint,
+            zone,
+            host,
             now,
         } => store
-            .register_node(&node_id, &endpoint, now)
+            .register_node(&node_id, &endpoint, NodeTopology { zone, host }, now)
             .map(|()| MetaReply::Unit),
         MetaRequest::Heartbeat { node_id, now } => {
             store.heartbeat(&node_id, now).map(|()| MetaReply::Unit)
@@ -315,10 +318,18 @@ impl MetadataStore for MetaClient {
         }
     }
 
-    fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()> {
+    fn register_node(
+        &self,
+        node_id: &str,
+        endpoint: &str,
+        topology: NodeTopology,
+        now: u64,
+    ) -> Result<()> {
         match self.call(MetaRequest::RegisterNode {
             node_id: node_id.to_string(),
             endpoint: endpoint.to_string(),
+            zone: topology.zone,
+            host: topology.host,
             now,
         })? {
             MetaReply::Unit => Ok(()),

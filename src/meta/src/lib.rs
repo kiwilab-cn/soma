@@ -17,9 +17,9 @@ mod types;
 pub use error::{Error, Result};
 pub use redb_store::RedbMetaStore;
 pub use types::{
-    BucketMeta, BucketOpts, ETag, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry,
-    BucketUsage, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit, SseAlgorithm,
-    Version,
+    BucketMeta, BucketOpts, BucketUsage, DataLayout, ETag, ListRequest, ListResult, NodeInfo,
+    NodeLocation, NodeState, NodeTopology, ObjectEntry, ObjectLocations, ObjectMeta, ObjectPut,
+    PgPlacement, PutCondition, Quota, RateLimit, ShardRole, SseAlgorithm, Version,
 };
 
 use soma_core::ObjectId;
@@ -82,8 +82,16 @@ pub trait MetadataStore: Send + Sync {
     // --- cluster membership + placement (M3) -------------------------------
 
     /// Register (or re-register) a storage node, marking it `Active` and bumping
-    /// its generation. `now` is the caller-supplied unix-seconds clock.
-    fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()>;
+    /// its generation. `topology` records the node's failure domain / host for
+    /// data-locality decisions (empty fields = unknown). `now` is the
+    /// caller-supplied unix-seconds clock.
+    fn register_node(
+        &self,
+        node_id: &str,
+        endpoint: &str,
+        topology: NodeTopology,
+        now: u64,
+    ) -> Result<()>;
 
     /// Record a heartbeat for a registered node. Errors with [`Error::UnknownNode`]
     /// if the node is not registered (so it re-registers).
@@ -110,4 +118,15 @@ pub trait MetadataStore: Send + Sync {
 
     /// Allocate the next monotonic object id.
     fn next_object_id(&self) -> Result<ObjectId>;
+}
+
+/// Resolves an object id to the nodes that physically hold its bytes, with the
+/// topology a scheduler needs for data-locality (HDFS `getFileBlockLocations`
+/// analogue). Implemented by the gateway's placement view; absent in single-node
+/// deployments (where there is nothing to schedule across).
+pub trait LocationOracle: Send + Sync {
+    /// The nodes holding `object_id` and how its bytes are laid out, or `None` if
+    /// the object's placement group is currently unresolvable (no live nodes).
+    /// `size` is supplied by the caller (the object's metadata).
+    fn locate(&self, object_id: ObjectId, size: u64) -> Option<ObjectLocations>;
 }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use soma_backend::StorageBackend;
-use soma_meta::{MetadataStore, NodeState, PgPlacement};
+use soma_meta::{MetadataStore, NodeInfo, NodeState, PgPlacement};
 
 use crate::ring::{hash64, Ring};
 use crate::{MetaClient, StorageClient};
@@ -40,6 +40,9 @@ struct PgRoute {
 struct Inner {
     clients: HashMap<String, Arc<dyn StorageBackend>>,
     pg_table: HashMap<u32, PgRoute>,
+    /// Membership topology (endpoint + zone/host), kept so the gateway can answer
+    /// "which nodes hold object X, and where" for data-locality scheduling.
+    members: HashMap<String, NodeInfo>,
 }
 
 /// Resolved, live-refreshable placement. Cheap to clone (shares one `RwLock`), so
@@ -140,7 +143,33 @@ impl Placement {
                 )
             })
             .collect();
-        Self::from_inner(Inner { clients, pg_table }, pg_count)
+        // No membership records in the local/no-metadata path: synthesize minimal
+        // ones (id only) so locality answers carry the node id without topology.
+        let members = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    NodeInfo {
+                        node_id: id.clone(),
+                        endpoint: String::new(),
+                        state: NodeState::Active,
+                        last_heartbeat: 0,
+                        generation: 0,
+                        zone: String::new(),
+                        host: String::new(),
+                    },
+                )
+            })
+            .collect();
+        Self::from_inner(
+            Inner {
+                clients,
+                pg_table,
+                members,
+            },
+            pg_count,
+        )
     }
 
     /// Build the gateway's placement from cluster membership: wait for at least
@@ -153,7 +182,7 @@ impl Placement {
         now: u64,
     ) -> Result<Self, BoxError> {
         let members = wait_for_members(&meta, width, now).await?;
-        let (clients, ids) = connect_clients(&HashMap::new(), &members).await?;
+        let (clients, ids, topo) = connect_clients(&HashMap::new(), &members).await?;
 
         // Seed the table if empty (first gateway wins atomically), then read the
         // authoritative table back (another gateway may have seeded it).
@@ -162,7 +191,14 @@ impl Placement {
         tokio::task::spawn_blocking(move || m2.seed_pg_table(&computed)).await??;
         let pg_table = load_pg_table(&meta).await?;
 
-        Ok(Self::from_inner(Inner { clients, pg_table }, pg_count))
+        Ok(Self::from_inner(
+            Inner {
+                clients,
+                pg_table,
+                members: topo,
+            },
+            pg_count,
+        ))
     }
 
     /// Re-read membership + the PG table and swap the live view. Picks up newly
@@ -176,13 +212,30 @@ impl Placement {
                 .collect::<Vec<_>>()
         };
         let existing = self.inner.read().clients.clone();
-        let (clients, _ids) = connect_clients(&existing, &members).await?;
+        let (clients, _ids, topo) = connect_clients(&existing, &members).await?;
         let pg_table = load_pg_table(meta).await?;
 
         let mut w = self.inner.write();
         w.clients = clients;
         w.pg_table = pg_table;
+        w.members = topo;
         Ok(())
+    }
+
+    /// The acting-set node ids for an object, in placement order (shard `i` is on
+    /// the `i`-th id). Empty if the PG is unresolved.
+    pub fn acting_ids(&self, object_id: u64) -> Vec<String> {
+        let inner = self.inner.read();
+        inner
+            .pg_table
+            .get(&self.pg_of(object_id))
+            .map(|r| r.acting.clone())
+            .unwrap_or_default()
+    }
+
+    /// The membership record (endpoint + topology) for a node id, if known.
+    pub fn member(&self, node_id: &str) -> Option<NodeInfo> {
+        self.inner.read().members.get(node_id).cloned()
     }
 }
 
@@ -196,12 +249,22 @@ fn resolve(
         .collect()
 }
 
-/// Connect a client to each member, reusing any already-connected client.
+/// Connect a client to each member, reusing any already-connected client. Also
+/// returns the membership topology keyed by node id (for locality answers).
+#[allow(clippy::type_complexity)]
 async fn connect_clients(
     existing: &HashMap<String, Arc<dyn StorageBackend>>,
-    members: &[soma_meta::NodeInfo],
-) -> Result<(HashMap<String, Arc<dyn StorageBackend>>, Vec<String>), BoxError> {
+    members: &[NodeInfo],
+) -> Result<
+    (
+        HashMap<String, Arc<dyn StorageBackend>>,
+        Vec<String>,
+        HashMap<String, NodeInfo>,
+    ),
+    BoxError,
+> {
     let mut clients: HashMap<String, Arc<dyn StorageBackend>> = HashMap::new();
+    let mut topo: HashMap<String, NodeInfo> = HashMap::new();
     let mut ids = Vec::new();
     for m in members {
         let client = match existing.get(&m.node_id) {
@@ -209,10 +272,11 @@ async fn connect_clients(
             None => Arc::new(StorageClient::connect(m.endpoint.clone()).await?),
         };
         clients.insert(m.node_id.clone(), client);
+        topo.insert(m.node_id.clone(), m.clone());
         ids.push(m.node_id.clone());
     }
     ids.sort();
-    Ok((clients, ids))
+    Ok((clients, ids, topo))
 }
 
 /// Load the PG table from metadata into routes.

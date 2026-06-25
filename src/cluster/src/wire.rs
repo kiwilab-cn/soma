@@ -61,6 +61,8 @@ pub(crate) enum MetaRequest {
     RegisterNode {
         node_id: String,
         endpoint: String,
+        zone: String,
+        host: String,
         now: u64,
     },
     Heartbeat {

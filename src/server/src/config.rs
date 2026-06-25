@@ -67,6 +67,14 @@ pub struct Config {
     /// The address other nodes reach this storage node at (e.g.
     /// `http://soma-storage-0…:9200`). Empty defaults to `http://{listen}`.
     pub advertise_endpoint: String,
+    /// Storage node's failure domain (availability zone / rack), for data-locality
+    /// scheduling. Typically injected from the Kubernetes downward API
+    /// (`topology.kubernetes.io/zone`) via `SOMA_ZONE`. Empty = unknown.
+    pub zone: String,
+    /// Storage node's physical host — the unit at which a co-located reader can
+    /// short-circuit to local storage. Typically `kubernetes.io/hostname` via
+    /// `SOMA_HOST`. Empty = unknown.
+    pub host: String,
     /// Number of replicas per object.
     pub replication_factor: usize,
     /// Replicas that must durably ack a write to succeed.
@@ -214,6 +222,8 @@ impl Default for Config {
             storage_endpoints: vec!["http://127.0.0.1:9200".to_string()],
             node_id: String::new(),
             advertise_endpoint: String::new(),
+            zone: String::new(),
+            host: String::new(),
             replication_factor: 3,
             write_quorum: 2,
             placement_refresh_secs: 10,

@@ -105,6 +105,14 @@ async fn dispatch(
 
     // Object level.
     if !key.is_empty() {
+        // `?location` sub-resource: report which nodes hold the object's bytes
+        // (data-locality oracle, a soma extension — see docs/M4_DESIGN.md).
+        if qhas(&q, "location") {
+            return match *method {
+                Method::GET => get_object_locations(svc, bucket, key).await,
+                _ => Err(S3Error::not_implemented("unsupported location operation")),
+            };
+        }
         // Multipart sub-resources (distinguished by query parameters).
         if *method == Method::POST && qhas(&q, "uploads") {
             return create_multipart(svc, bucket, key, headers).await;
@@ -210,6 +218,82 @@ async fn list_objects(svc: &S3Service, bucket: &str, q: &[(String, String)]) -> 
         common_prefixes: &result.common_prefixes,
     });
     Ok(xml_response(StatusCode::OK, body))
+}
+
+/// `GET object?location` — report the nodes holding the object's bytes and their
+/// topology, as a soma-specific JSON document (HDFS `getFileBlockLocations`
+/// analogue). Returns `501` when this deployment has no locality oracle (single
+/// node, nothing to schedule across).
+async fn get_object_locations(svc: &S3Service, bucket: &str, key: &str) -> S3Result<Response> {
+    let Some(loc) = svc
+        .object_locations(bucket.to_string(), key.to_string())
+        .await?
+    else {
+        return Err(S3Error::not_implemented(
+            "object location API requires a clustered deployment",
+        ));
+    };
+    Ok(json_response(StatusCode::OK, render_locations(key, &loc)))
+}
+
+/// Render [`ObjectLocations`] as the `?location` JSON body.
+fn render_locations(key: &str, loc: &soma_meta::ObjectLocations) -> String {
+    use soma_meta::{DataLayout, ShardRole};
+    let layout = match loc.layout {
+        DataLayout::Replicated { width } => {
+            format!("{{\"type\":\"replicated\",\"width\":{width}}}")
+        }
+        DataLayout::Erasure {
+            data_shards,
+            parity_shards,
+        } => format!(
+            "{{\"type\":\"erasure\",\"data_shards\":{data_shards},\"parity_shards\":{parity_shards}}}"
+        ),
+    };
+    let nodes: Vec<String> = loc
+        .nodes
+        .iter()
+        .map(|n| {
+            let role = match n.role {
+                ShardRole::Replica => "replica".to_string(),
+                ShardRole::DataShard { index } => format!("data:{index}"),
+                ShardRole::ParityShard { index } => format!("parity:{index}"),
+            };
+            format!(
+                "{{\"node_id\":\"{}\",\"endpoint\":\"{}\",\"zone\":\"{}\",\"host\":\"{}\",\"role\":\"{}\"}}",
+                json_escape(&n.node_id),
+                json_escape(&n.endpoint),
+                json_escape(&n.zone),
+                json_escape(&n.host),
+                role,
+            )
+        })
+        .collect();
+    format!(
+        "{{\"key\":\"{}\",\"object_id\":{},\"size\":{},\"layout\":{},\"nodes\":[{}]}}\n",
+        json_escape(key),
+        loc.object_id,
+        loc.size,
+        layout,
+        nodes.join(",")
+    )
+}
+
+/// Minimal JSON string escaping (quotes, backslashes, control chars).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 async fn put_object(
@@ -458,6 +542,15 @@ fn object_headers(etag: &str, _size: u64, created_at: u64) -> HeaderMap {
 
 fn xml_response(status: StatusCode, body: String) -> Response {
     (status, [(header::CONTENT_TYPE, "application/xml")], body).into_response()
+}
+
+fn json_response(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// Split a request path into a (decoded bucket, decoded key) pair.

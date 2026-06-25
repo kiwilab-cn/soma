@@ -142,6 +142,20 @@ pub enum NodeState {
     Down,
 }
 
+/// A storage node's physical topology, used for data-locality decisions (which
+/// failure domain / host a replica lives on). Populated from the orchestrator
+/// (e.g. Kubernetes downward API: `topology.kubernetes.io/zone`,
+/// `kubernetes.io/hostname`). Empty fields mean "unknown" — locality is then a
+/// no-op, never an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTopology {
+    /// Failure domain (availability zone / rack). Empty = unknown.
+    pub zone: String,
+    /// Physical host the node runs on (the unit of read short-circuiting). Empty =
+    /// unknown.
+    pub host: String,
+}
+
 /// Cluster membership record for one storage node (M3). Keyed by a stable
 /// `node_id` (never an array index), so adding/removing a node never renumbers
 /// the others.
@@ -157,6 +171,71 @@ pub struct NodeInfo {
     pub last_heartbeat: u64,
     /// Bumped each time the node re-registers (e.g. after a restart).
     pub generation: u64,
+    /// Physical topology (zone / host) for data-locality scheduling. Defaulted for
+    /// records written before topology was tracked.
+    #[serde(default)]
+    pub zone: String,
+    /// Host the node runs on — the unit at which a co-located reader can
+    /// short-circuit to local storage. Defaulted for older records.
+    #[serde(default)]
+    pub host: String,
+}
+
+/// The role a node plays for one object's bytes, in a [`NodeLocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardRole {
+    /// Holds a full copy of the object (replication).
+    Replica,
+    /// Holds erasure-coded **data** shard `index` (0-based).
+    DataShard { index: usize },
+    /// Holds erasure-coded **parity** shard `index` (0-based).
+    ParityShard { index: usize },
+}
+
+/// How an object's bytes are laid out across its nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataLayout {
+    /// `width` full replicas; a read needs any one node.
+    Replicated { width: usize },
+    /// Reed-Solomon `data_shards + parity_shards`; a read needs any `data_shards`
+    /// of them (and locality is therefore weaker — see `docs/M4_DESIGN.md`).
+    Erasure {
+        /// Number of data shards (`k`).
+        data_shards: usize,
+        /// Number of parity shards (`m`).
+        parity_shards: usize,
+    },
+}
+
+/// One node holding (part of) an object, with the topology a scheduler needs to
+/// decide locality. The equivalent of an HDFS block location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLocation {
+    /// Stable node id (matches [`NodeInfo::node_id`]).
+    pub node_id: String,
+    /// The node's reachable endpoint.
+    pub endpoint: String,
+    /// Failure domain (empty = unknown).
+    pub zone: String,
+    /// Host (empty = unknown) — compare against the reader's host to decide
+    /// whether a local short-circuit read is possible.
+    pub host: String,
+    /// What this node holds for the object (replica / data / parity shard).
+    pub role: ShardRole,
+}
+
+/// Where an object's bytes live, plus how they are laid out — the answer to
+/// "which nodes hold object X" (HDFS `getFileBlockLocations` analogue).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLocations {
+    /// The object's internal id (placement is computed from it).
+    pub object_id: ObjectId,
+    /// Object size in bytes.
+    pub size: u64,
+    /// Replication or erasure layout.
+    pub layout: DataLayout,
+    /// Holding nodes in placement order.
+    pub nodes: Vec<NodeLocation>,
 }
 
 /// The set of nodes a placement group's objects live on (M3). The stored

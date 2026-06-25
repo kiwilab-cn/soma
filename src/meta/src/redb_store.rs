@@ -17,8 +17,9 @@ use soma_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::types::{
-    BucketMeta, BucketOpts, BucketUsage, ListRequest, ListResult, NodeInfo, NodeState, ObjectEntry,
-    ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit, SseAlgorithm, Version,
+    BucketMeta, BucketOpts, BucketUsage, ListRequest, ListResult, NodeInfo, NodeState,
+    NodeTopology, ObjectEntry, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit,
+    SseAlgorithm, Version,
 };
 use crate::MetadataStore;
 
@@ -417,7 +418,13 @@ impl MetadataStore for RedbMetaStore {
         Ok(())
     }
 
-    fn register_node(&self, node_id: &str, endpoint: &str, now: u64) -> Result<()> {
+    fn register_node(
+        &self,
+        node_id: &str,
+        endpoint: &str,
+        topology: NodeTopology,
+        now: u64,
+    ) -> Result<()> {
         let w = self.db.begin_write()?;
         {
             let mut t = w.open_table(MEMBERS)?;
@@ -431,6 +438,8 @@ impl MetadataStore for RedbMetaStore {
                 state: NodeState::Active,
                 last_heartbeat: now,
                 generation: prev_gen + 1,
+                zone: topology.zone,
+                host: topology.host,
             };
             t.insert(node_id, postcard::to_allocvec(&info)?.as_slice())?;
         }
