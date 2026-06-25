@@ -4,6 +4,7 @@ members = [
     "src/core",
     "src/meta",
     "src/backend",
+    "src/localfd",
     "src/cluster",
     "src/s3",
     "src/server",
@@ -33,11 +34,14 @@ panic = "deny"
 soma-core = { path = "src/core" }
 soma-meta = { path = "src/meta" }
 soma-backend = { path = "src/backend" }
+soma-localfd = { path = "src/localfd" }
 soma-cluster = { path = "src/cluster" }
 soma-s3 = { path = "src/s3" }
 
 # Third-party
 crc32c = "0.6"
+# Unix socket fd-passing (SCM_RIGHTS) for local short-circuit reads.
+nix = { version = "0.29", features = ["socket", "uio"] }
 thiserror = "2"
 bytes = "1"
 parking_lot = "0.12"

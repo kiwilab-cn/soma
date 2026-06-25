@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,7 @@ use soma_core::{
 };
 
 use crate::error::{Error, Result};
-use crate::{idxfile, ByteRange, StorageBackend};
+use crate::{idxfile, ByteRange, LocalNeedle, LocalReader, StorageBackend};
 
 /// Backend configuration.
 #[derive(Debug, Clone, Copy)]
@@ -517,6 +518,45 @@ impl StorageBackend for LocalFsBackend {
             std::fs::rename(&tmp_path, &final_path)?; // atomic on the same dir
         }
         Ok(())
+    }
+}
+
+impl LocalReader for LocalFsBackend {
+    fn locate_fd(&self, object_id: ObjectId) -> Result<LocalNeedle> {
+        let inner = self.inner.lock();
+        let loc = match inner.objects.get(&object_id) {
+            Some(loc) if !loc.is_tombstone() => *loc,
+            _ => return Err(Error::ObjectNotFound(object_id)),
+        };
+        let vol_id = loc.volume.get();
+        let v = inner
+            .volumes
+            .get(&vol_id)
+            .ok_or(Error::VolumeNotFound(vol_id))?;
+
+        // Read only the fixed header (for the CRC); the payload is never touched —
+        // the holder reads it straight from the descriptor and verifies the CRC.
+        let mut header_buf = [0u8; HEADER_LEN];
+        v.file.read_exact_at(&mut header_buf, loc.needle.offset)?;
+        let header = NeedleHeader::decode(&header_buf)?;
+        if header.data_len != loc.needle.size {
+            return Err(Error::LocationMismatch {
+                volume: vol_id,
+                offset: loc.needle.offset,
+                detail: "header data_len disagrees with indexed size",
+            });
+        }
+
+        // A dup of the volume descriptor (own inode reference). It stays valid even
+        // if compaction later atomically renames a new file over this volume — the
+        // open fd pins the old inode, so the holder reads a consistent snapshot.
+        let fd = OwnedFd::from(v.file.try_clone()?);
+        Ok(LocalNeedle {
+            fd,
+            payload_offset: loc.needle.offset + HEADER_LEN as u64,
+            len: header.data_len,
+            crc: header.data_crc,
+        })
     }
 }
 

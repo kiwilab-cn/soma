@@ -27,13 +27,32 @@ mapping, (2) **topology** so a scheduler can tell "local" from "remote", and (3)
 | Phase | Delivers | Status |
 | --- | --- | --- |
 | **P1 — locations oracle + topology** | `GET object?location` reports the holding nodes, their zone/host, and the data layout; `NodeInfo` carries `zone`/`host`. | **done** |
-| **P2 — local data API** | storage node serves reads over a host-local unix socket (fd-passing). | planned |
+| **P2 — local data API** | storage node serves reads over a host-local unix socket, passing the volume **file descriptor** (`SCM_RIGHTS`). | **done** |
 | **P3 — client reader** | a reader that short-circuits to the local socket when co-located, and falls back to the gateway otherwise (transparent). | planned |
 | **P4 — deployment** | Helm wiring (host socket dir, co-location affinity) + operator docs. | planned |
-| **P5 — zero-copy** | `mmap` the passed fd for GB-scale scans, with compaction/CRC/fd-lifetime handled. | planned |
+| **P5 — zero-copy** | `mmap` the passed fd for GB-scale scans (the protocol already carries the framing; the reader chooses `pread` or `mmap`). | planned |
 
-The transport for the local path (P2/P3) is **fd-passing + `mmap` zero-copy**, not a
-byte copy — chosen for the scan/ingest workload.
+The transport for the local path is **fd-passing** (the reader then `pread`s or
+`mmap`s the descriptor) — chosen for the scan/ingest workload. The fd is for the
+whole **volume** file (raw-fd, not a per-object copy): true zero-copy and shared
+page cache, valid for soma's trust model (§5); a per-object `memfd` mode is the
+isolation fallback if untrusted/multi-tenant compute is ever co-located.
+
+## 2a. The local data API (P2)
+
+The storage node optionally binds a unix-domain socket (`local_socket_path`,
+default off) at a node-local `hostPath`. A reader sends an object id; the node
+resolves it to a needle and replies with `{payload_offset, len, crc}` plus the
+**volume file descriptor** attached via `SCM_RIGHTS`. The reader reads the payload
+straight from the descriptor at `[payload_offset, payload_offset+len)` and verifies
+it against `crc` — **no object bytes cross the socket, only the descriptor**. The
+crate `soma-localfd` provides both the server (`serve_local_reads`) and a client
+(`LocalClient`); P3 wraps the client with gateway fallback.
+
+Two properties hold by construction (see §5): the server reads only the 32-byte
+needle header (never the payload), so integrity is the reader's job (it checks the
+CRC); and because compaction is copy-to-new + atomic rename, a held descriptor pins
+the old inode and reads a consistent snapshot even across a compaction.
 
 ## 3. The locations oracle (P1)
 
