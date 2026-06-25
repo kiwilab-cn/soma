@@ -92,6 +92,14 @@ encryption:
 # and a rate limit with
 #   PUT /admin/ratelimit?bucket=<name>&rps=500&burst=1000
 # on the admin port; read current config + usage with GET /admin/quota?bucket=<name>.
+#
+# Per-bucket access policy is also runtime + admin-API. A bucket is owned by its
+# creator's access key (create→own); the owner writes, reads follow the policy. Set
+# it with:
+#   PUT /admin/bucket-policy?bucket=<name>&owner=<key>&public_read=true|false&readers=k1,k2
+# An unowned bucket stays open (any valid key reads/writes) — the single-tenant
+# default. Mark a shared bucket public_read=true for read-all (writes stay
+# owner-only). Read it with GET /admin/bucket-policy?bucket=<name>.
 
 gateway:
   replicaCount: 2

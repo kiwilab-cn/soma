@@ -258,14 +258,19 @@ reader receives is for a volume that holds only data it is entitled to. A per-ob
 `memfd` copy stays as the fallback for environments where per-bucket partitioning is
 impractical, trading one copy for isolation.
 
-### Out of scope here: write authorization
+### Companion: write authorization (implemented)
 
-Short-circuiting is **read-only**, so this design covers cross-tenant *reads*.
-Enforcing "a tenant may write only its own bucket (and read `global`)" on the write
-path is **per-bucket write authorization** (bucket policy / IAM) at the gateway —
-soma's auth today only checks that the access key is valid, with no per-bucket
-policy. That is a separate prerequisite for the SaaS model, tracked independently of
-the locality work.
+Short-circuiting is **read-only**, so this design covers cross-tenant *reads*. The
+write side — "a tenant may write only its own bucket, and read a shared one" — is
+**per-bucket authorization** at the gateway, and is now in place: each bucket has an
+`owner` access key (set create→own), an optional `public_read` flag, and an optional
+`readers` list. The gateway authorizes every request against the bucket's policy
+(writes are owner-only; reads follow `public_read`/`readers`), `ListBuckets` is
+filtered to the caller's buckets, and an unowned bucket stays open (back-compat /
+single-tenant default). Policy is managed out-of-band via `PUT /admin/bucket-policy`
+(e.g. provision a tenant's bucket owner, or mark a shared `global` bucket
+`public_read`). This is the per-bucket authorization the partitioned-volume model
+above builds on — together they give the SaaS model both read and write isolation.
 
 ## 7. Scope boundary
 

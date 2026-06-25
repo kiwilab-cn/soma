@@ -14,12 +14,16 @@ pub struct ETag(pub String);
 pub struct Version(pub u64);
 
 /// Options chosen when a bucket is created.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BucketOpts {
     /// Whether object versioning is enabled. Stored for forward compatibility;
     /// version *history retention* is a later milestone (M0 keeps the current
     /// version only).
     pub versioning: bool,
+    /// The access key that owns the bucket (set at creation: create→own). Empty
+    /// leaves the bucket unowned (open). See [`BucketMeta::owner`].
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// Server-side encryption algorithm for a bucket's default encryption (S3 SSE).
@@ -47,6 +51,34 @@ pub struct BucketMeta {
     /// Per-bucket request rate limit, enforced at the gateway (zero = unlimited).
     #[serde(default)]
     pub rate_limit: RateLimit,
+    /// Owning access key (the tenant). Empty = unowned, which means **open**: any
+    /// authenticated key may read and write (back-compat / single-tenant default).
+    /// When set, only the owner may write; reads follow `public_read` / `readers`.
+    #[serde(default)]
+    pub owner: String,
+    /// If true, any authenticated key may read this bucket (e.g. a shared `global`
+    /// bucket). Writes are still owner-only.
+    #[serde(default)]
+    pub public_read: bool,
+    /// Additional access keys granted read access (beyond the owner).
+    #[serde(default)]
+    pub readers: Vec<String>,
+}
+
+impl BucketMeta {
+    /// Whether `key` may read this bucket. Unowned buckets are open to all.
+    pub fn can_read(&self, key: &str) -> bool {
+        self.owner.is_empty()
+            || self.owner == key
+            || self.public_read
+            || self.readers.iter().any(|r| r == key)
+    }
+
+    /// Whether `key` may write this bucket. Unowned buckets are open; otherwise
+    /// writes are owner-only.
+    pub fn can_write(&self, key: &str) -> bool {
+        self.owner.is_empty() || self.owner == key
+    }
 }
 
 /// Everything needed to commit an object's current version.

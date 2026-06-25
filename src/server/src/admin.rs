@@ -37,6 +37,11 @@ pub fn router(state: AdminState) -> Router {
         // Per-bucket QoS: set/clear quota and rate limit, read current config+usage.
         .route("/admin/quota", get(get_quota).put(put_quota))
         .route("/admin/ratelimit", put(put_ratelimit))
+        // Per-bucket access policy: owner / public-read / extra readers.
+        .route(
+            "/admin/bucket-policy",
+            get(get_bucket_policy).put(put_bucket_policy),
+        )
         .with_state(state)
 }
 
@@ -195,6 +200,84 @@ async fn get_quota(
         Ok(Err(e)) => (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
     }
+}
+
+/// `PUT /admin/bucket-policy?bucket=<name>&owner=<key>&public_read=true|false&readers=k1,k2`:
+/// set a bucket's access policy. `owner` empty = unowned (open to all). `readers`
+/// is a comma-separated key list. Omitted fields default to empty/false.
+async fn put_bucket_policy(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(meta) = state.meta.clone() else {
+        return qos_unavailable();
+    };
+    let Some(bucket) = q.get("bucket").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing ?bucket=<name>\n").into_response();
+    };
+    let owner = q.get("owner").cloned().unwrap_or_default();
+    let public_read = matches!(q.get("public_read").map(String::as_str), Some("true" | "1"));
+    let readers: Vec<String> = q
+        .get("readers")
+        .map(|s| {
+            s.split(',')
+                .filter(|x| !x.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let res = tokio::task::spawn_blocking(move || {
+        meta.set_bucket_policy(&bucket, &owner, public_read, readers)
+    })
+    .await;
+    blocking_result(res, "policy updated")
+}
+
+/// `GET /admin/bucket-policy?bucket=<name>`: report a bucket's access policy.
+async fn get_bucket_policy(
+    State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(meta) = state.meta.clone() else {
+        return qos_unavailable();
+    };
+    let Some(bucket) = q.get("bucket").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing ?bucket=<name>\n").into_response();
+    };
+    let res = tokio::task::spawn_blocking(move || {
+        meta.get_bucket(&bucket)?
+            .ok_or_else(|| soma_meta::Error::NoSuchBucket(bucket.clone()))
+    })
+    .await;
+    match res {
+        Ok(Ok(b)) => {
+            let readers = b
+                .readers
+                .iter()
+                .map(|r| format!("\"{}\"", json_escape(r)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let body = format!(
+                "{{\"owner\":\"{}\",\"public_read\":{},\"readers\":[{}]}}\n",
+                json_escape(&b.owner),
+                b.public_read,
+                readers
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    }
+}
+
+/// Minimal JSON string escaping for access-key values.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Reply for QoS endpoints when this role has no metadata handle.

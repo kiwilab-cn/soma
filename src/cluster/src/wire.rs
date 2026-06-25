@@ -31,6 +31,12 @@ pub(crate) enum MetaRequest {
         name: String,
         limit: RateLimit,
     },
+    SetBucketPolicy {
+        name: String,
+        owner: String,
+        public_read: bool,
+        readers: Vec<String>,
+    },
     ListBuckets,
     PutObject {
         bucket: String,
