@@ -14,8 +14,8 @@ use parking_lot::Mutex;
 
 use soma_backend::{ByteRange, Crypto, StorageBackend};
 use soma_meta::{
-    BucketMeta, BucketOpts, BucketUsage, ETag, ListRequest, ListResult, MetadataStore, ObjectPut,
-    PutCondition, Quota, RateLimit, SseAlgorithm, Version,
+    BucketMeta, BucketOpts, BucketUsage, ETag, ListRequest, ListResult, LocationOracle,
+    MetadataStore, ObjectLocations, ObjectPut, PutCondition, Quota, RateLimit, SseAlgorithm, Version,
 };
 
 use crate::error::{S3Error, S3Result};
@@ -80,6 +80,9 @@ pub struct S3Service {
     /// Object crypto for server-side encryption (`None` if no master key is
     /// configured — encrypted buckets then can't be created or read).
     crypto: Option<Arc<Crypto>>,
+    /// Data-locality oracle (`None` in single-node deployments, where there is
+    /// nothing to schedule across). Answers "which nodes hold object X".
+    oracle: Option<Arc<dyn LocationOracle>>,
     /// Active multipart uploads, keyed by upload id.
     uploads: Arc<Mutex<HashMap<String, MultipartUpload>>>,
     /// Monotonic source of upload ids (unique within this process).
@@ -137,9 +140,17 @@ impl S3Service {
             creds: Arc::new(creds),
             rate_limiter: Arc::new(RateLimiter::new()),
             crypto: None,
+            oracle: None,
             uploads: Arc::new(Mutex::new(HashMap::new())),
             upload_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Attach a data-locality oracle so `GET object?location` reports the nodes
+    /// holding each object (for co-located compute scheduling).
+    pub fn with_oracle(mut self, oracle: Arc<dyn LocationOracle>) -> Self {
+        self.oracle = Some(oracle);
+        self
     }
 
     /// Attach object crypto, enabling server-side encryption for buckets that
@@ -210,6 +221,32 @@ impl S3Service {
                 .ok_or_else(|| S3Error::no_such_bucket(&bucket))?;
             let usage = meta.bucket_usage(&bucket)?;
             Ok((b.quota, b.rate_limit, usage))
+        })
+        .await
+    }
+
+    /// Resolve where an object's bytes physically live (the nodes + topology), for
+    /// data-locality scheduling. `Ok(None)` means this deployment has no locality
+    /// oracle (single-node); errors propagate `NoSuchBucket`/`NoSuchKey`.
+    pub async fn object_locations(
+        &self,
+        bucket: String,
+        key: String,
+    ) -> S3Result<Option<ObjectLocations>> {
+        let Some(oracle) = self.oracle.clone() else {
+            return Ok(None);
+        };
+        let meta = self.meta.clone();
+        block(move || {
+            let obj = meta
+                .get_object(&bucket, &key)?
+                .ok_or_else(|| S3Error::no_such_key(&key))?;
+            // None here means the placement group is momentarily unresolvable (no
+            // live nodes) — surface it as a transient internal error.
+            oracle
+                .locate(obj.object_id, obj.size)
+                .map(Some)
+                .ok_or_else(|| S3Error::internal("object placement is currently unresolvable"))
         })
         .await
     }

@@ -39,6 +39,19 @@ spec:
               value: "$(POD_NAME)"
             - name: SOMA_ADVERTISE_ENDPOINT
               value: "http://$(POD_NAME).{{ include "soma.storageHeadless" . }}.{{ .Release.Namespace }}.svc:{{ .Values.ports.storage }}"
+            # Physical host — the unit at which co-located compute can short-circuit
+            # to local storage (data-locality reads). The node name is the host key.
+            - name: SOMA_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if .Values.storage.zone }}
+            # Failure domain (AZ/rack). Node labels (topology.kubernetes.io/zone)
+            # aren't exposable via the downward API, so set it per nodepool here, or
+            # populate it with an init container that reads the node's zone label.
+            - name: SOMA_ZONE
+              value: {{ .Values.storage.zone | quote }}
+            {{- end }}
           ports:
             - name: storage
               containerPort: {{ .Values.ports.storage }}

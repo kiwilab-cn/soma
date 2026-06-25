@@ -23,6 +23,7 @@ mod bridge;
 mod controller;
 mod ec;
 mod erasure;
+mod locality;
 mod meta;
 mod placement;
 mod replicated;
@@ -32,6 +33,7 @@ mod wire;
 
 pub use controller::{Durability, RebalanceController, ReconcileReport};
 pub use erasure::ErasureCodedBackend;
+pub use locality::PlacementOracle;
 pub use meta::{serve_meta, MetaClient};
 pub use placement::{compute_pg_table, Placement, DEFAULT_PG_COUNT};
 pub use replicated::ReplicatedBackend;

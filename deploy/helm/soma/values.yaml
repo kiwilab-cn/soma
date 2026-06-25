@@ -110,6 +110,11 @@ meta:
 
 storage:
   replicaCount: 3
+  # Failure domain (AZ/rack) reported for data-locality scheduling. The host is
+  # auto-detected from the node name; zone can't be read from node labels via the
+  # downward API, so set it here per nodepool (or wire an init container). Empty =
+  # unknown (locality still works at host granularity).
+  zone: ""
   persistence:
     size: 100Gi
     storageClass: ""

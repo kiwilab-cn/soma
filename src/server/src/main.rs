@@ -16,9 +16,9 @@ use soma_backend::{
 };
 use soma_cluster::{
     serve_meta, serve_storage, Durability, ErasureCodedBackend, MetaClient, Placement,
-    RebalanceController, ReplicatedBackend, DEFAULT_PG_COUNT,
+    PlacementOracle, RebalanceController, ReplicatedBackend, DEFAULT_PG_COUNT,
 };
-use soma_meta::{MetadataStore, RedbMetaStore};
+use soma_meta::{DataLayout, MetadataStore, NodeTopology, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
 use admin::AdminState;
@@ -132,6 +132,7 @@ async fn run_membership(
     meta_endpoint: String,
     node_id: String,
     endpoint: String,
+    topology: NodeTopology,
     interval_secs: u64,
 ) {
     let client = match MetaClient::connect(meta_endpoint).await {
@@ -145,16 +146,17 @@ async fn run_membership(
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
     loop {
         ticker.tick().await;
-        let (c, nid, ep, now, need_register) = (
+        let (c, nid, ep, topo, now, need_register) = (
             client.clone(),
             node_id.clone(),
             endpoint.clone(),
+            topology.clone(),
             now_secs(),
             !registered,
         );
         let res = tokio::task::spawn_blocking(move || {
             if need_register {
-                c.register_node(&nid, &ep, now)
+                c.register_node(&nid, &ep, topo, now)
             } else {
                 c.heartbeat(&nid, now)
             }
@@ -226,6 +228,18 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
         });
     }
 
+    // The data-locality oracle shares the gateway's live placement view (cheap
+    // Arc clone) so `GET object?location` reports where each object's bytes live.
+    let layout = if cfg.erasure.enabled {
+        DataLayout::Erasure {
+            data_shards: cfg.erasure.data_shards,
+            parity_shards: cfg.erasure.parity_shards,
+        }
+    } else {
+        DataLayout::Replicated { width }
+    };
+    let oracle = Arc::new(PlacementOracle::new(placement.clone(), layout));
+
     let storage: Arc<dyn StorageBackend> = if cfg.erasure.enabled {
         Arc::new(ErasureCodedBackend::from_placement(
             placement,
@@ -242,7 +256,7 @@ async fn run_gateway(cfg: Config) -> Result<(), BoxError> {
     let meta: Arc<dyn MetadataStore> = meta_client;
     let admin_meta = meta.clone(); // for the drain endpoint
     let backend = maybe_cache(&cfg, storage);
-    let service = build_service(meta, backend, &cfg)?;
+    let service = build_service(meta, backend, &cfg)?.with_oracle(oracle);
     if cfg.erasure.enabled {
         tracing::info!(
             meta = %cfg.meta_endpoint,
@@ -383,11 +397,16 @@ async fn run_storage(cfg: Config) -> Result<(), BoxError> {
         } else {
             cfg.advertise_endpoint.clone()
         };
-        tracing::info!(node_id = %node_id, advertise = %advertise, meta = %cfg.meta_endpoint, "storage joining cluster membership");
+        let topology = NodeTopology {
+            zone: cfg.zone.clone(),
+            host: cfg.host.clone(),
+        };
+        tracing::info!(node_id = %node_id, advertise = %advertise, zone = %topology.zone, host = %topology.host, meta = %cfg.meta_endpoint, "storage joining cluster membership");
         tokio::spawn(run_membership(
             cfg.meta_endpoint.clone(),
             node_id,
             advertise,
+            topology,
             cfg.storage.heartbeat_interval_secs,
         ));
     }
