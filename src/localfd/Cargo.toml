@@ -1,0 +1,24 @@
+[package]
+name = "soma-localfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+soma-core.workspace = true
+soma-backend.workspace = true
+serde.workspace = true
+postcard.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+crc32c.workspace = true

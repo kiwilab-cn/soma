@@ -75,6 +75,12 @@ pub struct Config {
     /// short-circuit to local storage. Typically `kubernetes.io/hostname` via
     /// `SOMA_HOST`. Empty = unknown.
     pub host: String,
+    /// Storage node only: path to a unix-domain socket for **local short-circuit
+    /// reads** (co-located compute reads bytes via a passed file descriptor,
+    /// bypassing the gateway). Put it on a node-local `hostPath` shared with the
+    /// compute pod. Empty (default) disables it — non-co-located deployments are
+    /// unaffected. See `docs/LOCALITY_DESIGN.md`.
+    pub local_socket_path: String,
     /// Number of replicas per object.
     pub replication_factor: usize,
     /// Replicas that must durably ack a write to succeed.
@@ -224,6 +230,7 @@ impl Default for Config {
             advertise_endpoint: String::new(),
             zone: String::new(),
             host: String::new(),
+            local_socket_path: String::new(),
             replication_factor: 3,
             write_quorum: 2,
             placement_refresh_secs: 10,

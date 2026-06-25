@@ -12,12 +12,14 @@ use std::sync::Arc;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use soma_backend::{
-    BackendConfig, CachingBackend, Crypto, LocalFsBackend, StaticKeyProvider, StorageBackend,
+    BackendConfig, CachingBackend, Crypto, LocalFsBackend, LocalReader, StaticKeyProvider,
+    StorageBackend,
 };
 use soma_cluster::{
     serve_meta, serve_storage, Durability, ErasureCodedBackend, MetaClient, Placement,
     PlacementOracle, RebalanceController, ReplicatedBackend, DEFAULT_PG_COUNT,
 };
+use soma_localfd::serve_local_reads;
 use soma_meta::{DataLayout, MetadataStore, NodeTopology, RedbMetaStore};
 use soma_s3::{router, Credentials, S3Service};
 
@@ -410,6 +412,26 @@ async fn run_storage(cfg: Config) -> Result<(), BoxError> {
             cfg.storage.heartbeat_interval_secs,
         ));
     }
+
+    // Local short-circuit read socket (data-locality): co-located compute reads an
+    // object's bytes via a passed file descriptor, bypassing the gateway. Off
+    // unless configured; best-effort (a bind failure never crashes the node). Held
+    // for the node's lifetime so the accept loop keeps running.
+    let _local_server = if cfg.local_socket_path.is_empty() {
+        None
+    } else {
+        let reader: Arc<dyn LocalReader> = backend.clone();
+        match serve_local_reads(&cfg.local_socket_path, reader) {
+            Ok(srv) => {
+                tracing::info!(socket = %cfg.local_socket_path, "serving local short-circuit reads");
+                Some(srv)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, socket = %cfg.local_socket_path, "could not bind local-read socket");
+                None
+            }
+        }
+    };
 
     let addr: SocketAddr = cfg.listen.parse()?;
     let serving: Arc<dyn StorageBackend> = backend;

@@ -29,7 +29,40 @@ pub use encrypt::{Crypto, KeyProvider, StaticKeyProvider};
 pub use error::{Error, Result};
 pub use local::{BackendConfig, CompactReport, LocalFsBackend, ScrubReport};
 
+use std::os::fd::OwnedFd;
+
 use soma_core::ObjectId;
+
+/// A located needle handed out as an open file descriptor, for zero-copy
+/// short-circuit local reads by co-located compute (see `docs/LOCALITY_DESIGN.md`).
+///
+/// The holder reads the payload directly from `fd` at
+/// `[payload_offset, payload_offset + len)` and **must verify it against `crc`** —
+/// the bitrot guard moves to the reader because the producer never touches the
+/// payload bytes (that is the point of the zero-copy path).
+#[derive(Debug)]
+pub struct LocalNeedle {
+    /// An owned descriptor for the volume file holding the needle. Because soma
+    /// packs many needles per volume, this descriptor grants read access to the
+    /// whole volume file — only hand it to compute inside soma's trust domain.
+    pub fd: OwnedFd,
+    /// Byte offset of the payload within the file the descriptor refers to.
+    pub payload_offset: u64,
+    /// Payload length in bytes.
+    pub len: u32,
+    /// CRC32C the reader must check the payload against (bitrot guard).
+    pub crc: u32,
+}
+
+/// A backend that can hand out an object's bytes as a file descriptor, so
+/// co-located compute reads them locally without copying through the gateway.
+/// Only node-local backends implement this; remote/replicated backends cannot
+/// (the bytes are not on this host).
+pub trait LocalReader: Send + Sync {
+    /// Resolve `object_id` to an open descriptor plus the framing of its payload.
+    /// Reads only the fixed needle header (to recover the CRC); never the payload.
+    fn locate_fd(&self, object_id: ObjectId) -> Result<LocalNeedle>;
+}
 
 /// A byte range within an object, used for S3 `Range` reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
