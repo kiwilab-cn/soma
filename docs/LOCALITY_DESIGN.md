@@ -31,12 +31,14 @@ mapping, (2) **topology** so a scheduler can tell "local" from "remote", and (3)
 | **P3 — client reader** | `soma-client`: short-circuits to the local socket when co-located, falls back to a signed gateway GET otherwise (transparent). | **done** |
 | **P4 — deployment** | Helm wiring (host socket dir, co-location affinity) + operator docs. | planned |
 | **P5 — zero-copy** | `mmap` the passed fd for GB-scale scans (the protocol already carries the framing; the reader chooses `pread` or `mmap`). | planned |
+| **P6 — multi-tenant isolation** | per-bucket volume partitioning + per-tenant sockets, so short-circuit reads are safe in a shared multi-tenant deployment (§6). | planned |
 
 The transport for the local path is **fd-passing** (the reader then `pread`s or
 `mmap`s the descriptor) — chosen for the scan/ingest workload. The fd is for the
 whole **volume** file (raw-fd, not a per-object copy): true zero-copy and shared
-page cache, valid for soma's trust model (§5); a per-object `memfd` mode is the
-isolation fallback if untrusted/multi-tenant compute is ever co-located.
+page cache. In a single-tenant / dedicated deployment that is safe as-is; for the
+**shared multi-tenant** model (tenant = bucket), §6 specifies how per-bucket volume
+partitioning + per-tenant sockets keep raw-fd safe without giving up zero-copy.
 
 ## 2a. The local data API (P2)
 
@@ -181,9 +183,10 @@ Two caveats on the fd path:
   gVisor) give each pod its own kernel, so a passed host fd does not cross the
   boundary — those deployments fall back to the gateway read path.
 - Passing the **raw volume fd** grants the reader access to the whole volume file
-  (which holds many objects' needles). That is fine for a trusted, same-tenant
-  compute engine; for stronger isolation, P2 can copy the needle into a per-object
-  `memfd` and pass that instead, trading one copy for isolation.
+  (which holds many objects' needles). That is fine for a single-tenant / dedicated
+  deployment. For shared multi-tenant SaaS, §6 keeps raw-fd safe with per-bucket
+  volume partitioning + per-tenant sockets (preferred — preserves zero-copy); a
+  per-object `memfd` copy is the fallback where partitioning is not possible.
 
 ### Alternative: DaemonSet + hostPath
 
@@ -193,7 +196,55 @@ plain node affinity. It changes the identity model (node id per node rather than
 StatefulSet ordinal), so the current design keeps **StatefulSet + local PV**; the
 DaemonSet model is recorded as a viable alternative.
 
-## 6. Scope boundary
+## 6. Multi-tenant isolation (P6 — planned)
+
+The target deployment is a **shared multi-tenant SaaS**: one soma cluster serves
+many tenants, with **tenant = bucket**, plus a shared `global` bucket that every
+tenant may **read** (but not write). This makes the raw-fd exposure a real concern:
+soma packs objects into volumes in write order, so a single volume file mixes many
+buckets' (tenants') needles. A per-tenant reader handed the **whole** volume's
+descriptor could `pread` another tenant's bytes — and the local socket (P2) has no
+authorization today, so any process that reaches it can request any object id.
+
+This section is the design to make short-circuit reads safe under that model. It is
+**not yet implemented**; until it is, short-circuit reads are for single-tenant /
+dedicated deployments only (a shared deployment must keep the socket off and read
+through the gateway, except possibly for the `global` bucket).
+
+### Design: partition volumes by bucket, scope sockets per tenant
+
+The tenant boundary (a bucket) maps directly onto the storage layout:
+
+1. **Partition volumes by bucket.** A volume only ever holds **one bucket's**
+   objects; the shared `global` bucket gets its own volumes. So one volume file =
+   one trust domain. (Today objects from all buckets share the active volume.)
+2. **Tag each volume with its owning bucket.** Storage nodes are bucket-blind today
+   (they key on `object_id` only); partitioning makes `volume → bucket` known
+   node-locally, which is what lets the node enforce the boundary at the socket.
+3. **One local socket per tenant.** A tenant's compute mounts only its **own**
+   tenant's socket — a `hostPath` subdirectory whose permissions exclude other
+   tenants. soma serves, on that socket, descriptors **only** for that tenant's
+   volumes plus the shared `global` volumes, and refuses any other object id. Two
+   independent barriers hold: the OS (a tenant cannot reach another tenant's socket)
+   and soma (the socket will not hand out a foreign volume's descriptor).
+4. **`global` is read-shared**, so exposing a `global` volume's descriptor on any
+   tenant's socket leaks nothing — every tenant is already entitled to read it.
+
+This keeps the **raw-fd zero-copy** that the scan workload needs: the descriptor a
+reader receives is for a volume that holds only data it is entitled to. A per-object
+`memfd` copy stays as the fallback for environments where per-bucket partitioning is
+impractical, trading one copy for isolation.
+
+### Out of scope here: write authorization
+
+Short-circuiting is **read-only**, so this design covers cross-tenant *reads*.
+Enforcing "a tenant may write only its own bucket (and read `global`)" on the write
+path is **per-bucket write authorization** (bucket policy / IAM) at the gateway —
+soma's auth today only checks that the access key is valid, with no per-bucket
+policy. That is a separate prerequisite for the SaaS model, tracked independently of
+the locality work.
+
+## 7. Scope boundary
 
 Soma provides the **oracle** and (later) the **short-circuit data path**. It does
 **not** schedule compute — placing scan tasks onto nodes is the compute engine's
