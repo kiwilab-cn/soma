@@ -16,7 +16,9 @@
   So multipart helps you *upload* a large object in chunks, but completing it still
   materializes the full object once. The practical ceiling is therefore
   **memory-bound** — many concurrent multi-GB objects will spike memory regardless of
-  the PUT cap. (A future improvement is streaming multipart assembly.)
+  the PUT cap. (A future improvement — keeping the multipart chunk map instead of
+  reassembling, plus streaming upload/download and append — is designed in
+  [`STREAMING_APPEND.md`](./STREAMING_APPEND.md).)
 - **Volume packing.** Objects are packed into append-only volume files of
   `storage.volume_max` (default 4 GiB). An object **larger than `volume_max`** still
   works — it gets its **own** volume as a single oversized needle — but a multi-GB
