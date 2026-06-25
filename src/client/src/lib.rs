@@ -14,10 +14,67 @@ mod sigv4;
 
 pub use gateway::GatewayRemote;
 
+use std::ops::Deref;
 use std::os::unix::fs::FileExt;
 
+use memmap2::Mmap;
 use parking_lot::Mutex;
 use soma_localfd::LocalClient;
+
+/// Default size at/above which a local read uses `mmap` (zero-copy) instead of a
+/// `pread` copy. Below it the mmap setup/teardown costs more than the copy.
+const DEFAULT_MMAP_THRESHOLD: usize = 64 * 1024;
+
+/// An object's bytes. Backed by an `mmap` of the storage node's volume (zero-copy,
+/// shared page cache) on the local large-object path, or by an owned buffer for
+/// small local reads and the gateway fallback. Derefs to the payload `&[u8]`.
+pub struct ObjectBytes(Repr);
+
+enum Repr {
+    Owned(Vec<u8>),
+    Mapped { map: Mmap, start: usize, len: usize },
+}
+
+impl ObjectBytes {
+    fn owned(v: Vec<u8>) -> Self {
+        Self(Repr::Owned(v))
+    }
+    fn mapped(map: Mmap, start: usize, len: usize) -> Self {
+        Self(Repr::Mapped { map, start, len })
+    }
+    /// The payload as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        self
+    }
+    /// Payload length in bytes.
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+    /// Whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    /// Copy the payload into an owned buffer.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl Deref for ObjectBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.0 {
+            Repr::Owned(v) => v.as_slice(),
+            Repr::Mapped { map, start, len } => &map[*start..*start + *len],
+        }
+    }
+}
+
+impl AsRef<[u8]> for ObjectBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
 
 /// Errors from a soma-client read.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +142,12 @@ pub struct ClientConfig {
     /// Path to the co-located node's local-read socket (a shared `hostPath`).
     /// Empty disables short-circuiting.
     pub local_socket_path: String,
+    /// Local reads at/above this size use `mmap` (zero-copy); smaller reads copy via
+    /// `pread`. Defaults to 64 KiB.
+    pub mmap_threshold: usize,
+    /// Verify the CRC of locally-read payloads (bitrot guard). Defaults to `true`;
+    /// set `false` to skip the verification pass on the hottest scan paths.
+    pub verify_local_crc: bool,
 }
 
 impl Default for ClientConfig {
@@ -96,6 +159,8 @@ impl Default for ClientConfig {
             region: "us-east-1".to_string(),
             my_host: String::new(),
             local_socket_path: String::new(),
+            mmap_threshold: DEFAULT_MMAP_THRESHOLD,
+            verify_local_crc: true,
         }
     }
 }
@@ -105,6 +170,8 @@ pub struct SomaClient {
     remote: Box<dyn Remote>,
     my_host: String,
     local_socket_path: String,
+    mmap_threshold: usize,
+    verify_local_crc: bool,
     /// A reused local-socket connection (lazily opened, dropped on error). Reads
     /// are serialized through it; open more clients for concurrent local reads.
     local: Mutex<Option<LocalClient>>,
@@ -119,10 +186,18 @@ impl SomaClient {
             cfg.secret_key,
             cfg.region,
         ));
-        Self::with_remote(remote, cfg.my_host, cfg.local_socket_path)
+        Self {
+            remote,
+            my_host: cfg.my_host,
+            local_socket_path: cfg.local_socket_path,
+            mmap_threshold: cfg.mmap_threshold,
+            verify_local_crc: cfg.verify_local_crc,
+            local: Mutex::new(None),
+        }
     }
 
-    /// Build over a custom [`Remote`] (used by tests and alternative front-ends).
+    /// Build over a custom [`Remote`] (used by tests and alternative front-ends),
+    /// with default local-read tuning.
     pub fn with_remote(
         remote: Box<dyn Remote>,
         my_host: String,
@@ -132,13 +207,16 @@ impl SomaClient {
             remote,
             my_host,
             local_socket_path,
+            mmap_threshold: DEFAULT_MMAP_THRESHOLD,
+            verify_local_crc: true,
             local: Mutex::new(None),
         }
     }
 
     /// Read an object's full bytes, short-circuiting to local storage when this
-    /// process is co-located with a holder, else via the gateway.
-    pub fn get(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
+    /// process is co-located with a holder, else via the gateway. The result derefs
+    /// to `&[u8]` and is zero-copy on the local large-object path.
+    pub fn get(&self, bucket: &str, key: &str) -> Result<ObjectBytes> {
         if self.local_enabled() {
             match self.remote.locate(bucket, key) {
                 Ok(Some(loc)) if loc.hosts.iter().any(|h| h == &self.my_host) => {
@@ -155,7 +233,7 @@ impl SomaClient {
                 Err(e) => tracing::debug!(error = %e, "locate failed; falling back to gateway"),
             }
         }
-        self.remote.get(bucket, key)
+        self.remote.get(bucket, key).map(ObjectBytes::owned)
     }
 
     /// Whether short-circuiting is possible at all (host + socket configured).
@@ -163,8 +241,10 @@ impl SomaClient {
         !self.my_host.is_empty() && !self.local_socket_path.is_empty()
     }
 
-    /// Read an object's payload locally via a passed descriptor, verifying its CRC.
-    fn read_local(&self, object_id: u64) -> Result<Vec<u8>> {
+    /// Read an object's payload locally via a passed descriptor. Large payloads are
+    /// `mmap`ed (zero-copy); small ones are `pread` into a buffer. CRC-verified
+    /// unless disabled.
+    fn read_local(&self, object_id: u64) -> Result<ObjectBytes> {
         let read = {
             let mut guard = self.local.lock();
             let mut client = match guard.take() {
@@ -182,13 +262,39 @@ impl SomaClient {
         };
 
         // The fd references the same kernel open file as the storage node's volume;
-        // read the payload straight from it — no bytes crossed the socket.
+        // the bytes never crossed the socket.
         let file = std::fs::File::from(read.fd);
-        let mut buf = vec![0u8; read.len as usize];
-        file.read_exact_at(&mut buf, read.payload_offset)?;
-        if crc32c::crc32c(&buf) != read.crc {
+        let len = read.len as usize;
+
+        if len < self.mmap_threshold {
+            // Small object: a single pread copy beats mmap setup/teardown.
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, read.payload_offset)?;
+            if self.verify_local_crc && crc32c::crc32c(&buf) != read.crc {
+                return Err(Error::Corrupt);
+            }
+            return Ok(ObjectBytes::owned(buf));
+        }
+
+        // Large object: mmap the payload region (zero-copy, shared page cache). mmap
+        // offsets must be page-aligned but a needle payload is not, so map from the
+        // page boundary below it and index in.
+        let page = page_size::get() as u64;
+        let aligned = read.payload_offset & !(page - 1);
+        let inner = (read.payload_offset - aligned) as usize;
+        let map_len = inner + len;
+        // Safety: the descriptor refers to an immutable, already-written needle; soma
+        // does not truncate a volume during serving, and compaction copies to a new
+        // file (this fd pins the old inode), so the mapping stays valid for its life.
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(aligned)
+                .len(map_len)
+                .map(&file)?
+        };
+        if self.verify_local_crc && crc32c::crc32c(&map[inner..inner + len]) != read.crc {
             return Err(Error::Corrupt);
         }
-        Ok(buf)
+        Ok(ObjectBytes::mapped(map, inner, len))
     }
 }

@@ -30,7 +30,7 @@ mapping, (2) **topology** so a scheduler can tell "local" from "remote", and (3)
 | **P2 — local data API** | storage node serves reads over a host-local unix socket, passing the volume **file descriptor** (`SCM_RIGHTS`). | **done** |
 | **P3 — client reader** | `soma-client`: short-circuits to the local socket when co-located, falls back to a signed gateway GET otherwise (transparent). | **done** |
 | **P4 — deployment** | Helm wiring (storage `localRead` hostPath socket + init container) and a co-location example for the compute side. | **done** |
-| **P5 — zero-copy** | `mmap` the passed fd for GB-scale scans (the protocol already carries the framing; the reader chooses `pread` or `mmap`). | planned |
+| **P5 — zero-copy** | `soma-client` `mmap`s the passed fd for large objects (zero-copy, shared page cache); small reads stay `pread`. | **done** |
 | **P6 — multi-tenant isolation** | per-bucket volume partitioning + per-tenant sockets, so short-circuit reads are safe in a shared multi-tenant deployment (§6). | planned |
 
 The transport for the local path is **fd-passing** (the reader then `pread`s or
@@ -74,6 +74,17 @@ connection is reused across reads (reconnected on error). The gateway calls are 
 self-contained blocking HTTP + SigV4 signer that mirrors the gateway's verifier
 (no AWS SDK dependency). Short-circuiting is disabled by leaving the host or socket
 path empty, making `SomaClient` a plain S3 reader.
+
+`get` returns an `ObjectBytes` that derefs to `&[u8]`. On the local path it is
+**zero-copy for large objects** (P5): the client `mmap`s the passed descriptor's
+payload region (sharing the storage node's page cache) when the object is at/above a
+threshold (64 KiB default), and `pread`s a small buffer below it — `mmap` setup costs
+more than the copy for small reads. The payload is CRC-verified (a guard that can be
+disabled per `ClientConfig` for the hottest scans). The gateway-fallback path is an
+owned buffer. mmap offsets must be page-aligned, so the client maps from the page
+boundary below the (unaligned) needle payload and indexes in; the mapping is safe for
+its lifetime because soma never truncates a live volume and compaction copies to a
+new file (the held descriptor pins the old inode).
 
 ## 3. The locations oracle (P1)
 
