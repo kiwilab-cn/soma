@@ -88,7 +88,74 @@ is therefore a **replicated-data** property: keep hot/scan-heavy data replicated
 reserve erasure coding for cold data. The oracle reports the EC layout faithfully so
 a scheduler can make that call.
 
-## 5. Scope boundary
+## 5. Kubernetes volume & scheduling requirements
+
+Locality only pays off if "the node the storage pod runs on" is genuinely where the
+bytes are, and stays put. That constrains how the storage volume is provisioned and
+how compute is scheduled.
+
+### The data volume must be node-local — but it is still a PVC
+
+Use a **local** volume (the `local` PV type, or a local-path provisioner) for the
+storage StatefulSet's data, **not** network block storage (EBS / PD / Ceph-RBD).
+This is *not* "don't use a PVC" — a `local` PV is a normal PVC/PV, just with
+`nodeAffinity`. Network block storage breaks locality two ways:
+
+1. **Bytes still cross the network.** Even with compute co-located, the storage pod
+   reads the block device over the storage network — you save the gateway hop but
+   never get a true local-disk read, which is the whole point for scans.
+2. **The host drifts.** A network PV lets the storage pod reschedule onto another
+   node and re-attach, so the `host` the oracle reported goes stale and any compute
+   placed by it is now misplaced.
+
+A `local` PV's `nodeAffinity` **pins** the storage pod to the node holding its disk —
+which is exactly what makes the locality chain stable:
+
+```
+compute pod --podAffinity(hostname)--> storage pod --localPV.nodeAffinity--> node --> local disk
+```
+
+The usual objection to local volumes — "if the node dies, the pod can't migrate and
+the data is stranded" — does not apply here, because **durability lives at the soma
+layer** (replication / erasure coding across nodes), not at the volume layer. So the
+pairing is deliberate: node-local volumes for speed, soma replication for durability.
+
+Provisioner options: TopoLVM or the sig-storage local-static-provisioner or OpenEBS
+LocalPV for production (scheduler-aware, capacity-tracked); the Rancher
+local-path-provisioner for simple setups. The chart's
+`storage.persistence.storageClass` selects it.
+
+### Compute needs the socket, not the data volume
+
+For the short-circuit read (P2/P3) the compute pod does **not** mount the data
+volume. The storage node passes the open volume file's descriptor over a unix socket
+(`SCM_RIGHTS`); the received fd references the same kernel *open file description*,
+independent of mount namespaces and paths, so the compute process can `mmap`/`read`
+it directly (sharing the page cache — genuinely zero-copy). What compute *does* need
+is to reach the **socket**, so the socket directory is shared between the two pods
+via a node-local **`hostPath`** (an `emptyDir` is per-pod and cannot be shared across
+pods). Plus a `podAffinity` (topologyKey `kubernetes.io/hostname`, selecting the
+storage pods) to co-schedule compute onto a node holding a replica.
+
+Two caveats on the fd path:
+
+- It requires a **shared-kernel runtime** (runc). VM-isolated runtimes (Kata,
+  gVisor) give each pod its own kernel, so a passed host fd does not cross the
+  boundary — those deployments fall back to the gateway read path.
+- Passing the **raw volume fd** grants the reader access to the whole volume file
+  (which holds many objects' needles). That is fine for a trusted, same-tenant
+  compute engine; for stronger isolation, P2 can copy the needle into a per-object
+  `memfd` and pass that instead, trading one copy for isolation.
+
+### Alternative: DaemonSet + hostPath
+
+Running storage as a **DaemonSet over a `hostPath` data dir** (one storage pod per
+node, owning that node's disk) is a simpler pure-node-local model — compute then uses
+plain node affinity. It changes the identity model (node id per node rather than per
+StatefulSet ordinal), so the current design keeps **StatefulSet + local PV**; the
+DaemonSet model is recorded as a viable alternative.
+
+## 6. Scope boundary
 
 Soma provides the **oracle** and (later) the **short-circuit data path**. It does
 **not** schedule compute — placing scan tasks onto nodes is the compute engine's
