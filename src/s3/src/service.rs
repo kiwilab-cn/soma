@@ -105,7 +105,14 @@ pub struct S3Service {
     uploads: Arc<Mutex<HashMap<String, MultipartUpload>>>,
     /// Monotonic source of upload ids (unique within this process).
     upload_seq: Arc<AtomicU64>,
+    /// Max bytes buffered for a single-part request body. Objects larger than this
+    /// must use multipart upload. S3's single-PUT ceiling is 5 GiB; lower it to bound
+    /// per-request memory.
+    max_body: usize,
 }
+
+/// Default single-part request body cap (S3's single-PUT limit).
+pub const DEFAULT_MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
 
 /// Result of a successful `PutObject`.
 pub struct PutObjectOk {
@@ -161,7 +168,19 @@ impl S3Service {
             oracle: None,
             uploads: Arc::new(Mutex::new(HashMap::new())),
             upload_seq: Arc::new(AtomicU64::new(0)),
+            max_body: DEFAULT_MAX_BODY,
         }
+    }
+
+    /// Set the max single-part request body size (objects above it need multipart).
+    pub fn with_max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body.max(1);
+        self
+    }
+
+    /// The configured single-part request body cap.
+    pub fn max_body(&self) -> usize {
+        self.max_body
     }
 
     /// Attach a data-locality oracle so `GET object?location` reports the nodes

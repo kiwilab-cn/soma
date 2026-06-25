@@ -72,3 +72,25 @@ fn deleted_object_is_not_found() {
     let mut client = LocalClient::connect(server.path()).unwrap();
     assert!(matches!(client.read_fd(7), Err(Error::NotFound)));
 }
+
+#[test]
+fn oversized_needle_in_its_own_volume() {
+    let dir = TempDir::new().unwrap();
+    // A tiny volume_max so a larger object becomes an oversized needle that gets its
+    // own volume (the "an empty volume always accepts at least one needle" path).
+    let backend = Arc::new(
+        LocalFsBackend::open(dir.path(), BackendConfig { volume_max: 256 * 1024 }).unwrap(),
+    );
+    let big = vec![0x5Au8; 1024 * 1024]; // 1 MiB > 256 KiB volume_max
+    backend.put(1, &big).unwrap();
+
+    let reader: Arc<dyn LocalReader> = backend;
+    let server = serve_local_reads(dir.path().join("s.sock"), reader).unwrap();
+    let mut client = LocalClient::connect(server.path()).unwrap();
+
+    let r = client.read_fd(1).unwrap();
+    assert_eq!(r.len as usize, big.len());
+    let got = pread_payload(&r);
+    assert_eq!(got, big);
+    assert_eq!(crc32c::crc32c(&got), r.crc);
+}

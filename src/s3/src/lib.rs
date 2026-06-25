@@ -32,10 +32,6 @@ use percent_encoding::percent_decode_str;
 
 use soma_meta::{ETag, ListRequest, PutCondition};
 
-/// Maximum request body Soma will buffer for a single-part `PutObject` (5 GiB,
-/// the S3 single-PUT limit).
-const MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
-
 /// Build the S3 HTTP router over the given service.
 pub fn router(service: S3Service) -> Router {
     Router::new().fallback(handle).with_state(service)
@@ -355,7 +351,7 @@ async fn put_object(
 
     let cond = put_condition(headers)?;
     let request_sse = requested_sse(headers)?;
-    let bytes = axum::body::to_bytes(body, MAX_BODY)
+    let bytes = axum::body::to_bytes(body, svc.max_body())
         .await
         .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
 
@@ -454,7 +450,7 @@ async fn upload_part(
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n >= 1)
         .ok_or_else(|| S3Error::invalid_argument("invalid partNumber"))?;
-    let bytes = axum::body::to_bytes(body, MAX_BODY)
+    let bytes = axum::body::to_bytes(body, svc.max_body())
         .await
         .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
 
@@ -473,7 +469,7 @@ async fn complete_multipart(
     upload_id: &str,
     body: Body,
 ) -> S3Result<Response> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY)
+    let bytes = axum::body::to_bytes(body, svc.max_body())
         .await
         .map_err(|e| S3Error::invalid_argument(format!("reading body: {e}")))?;
     let text = std::str::from_utf8(&bytes)
