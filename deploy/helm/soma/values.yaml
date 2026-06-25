@@ -117,6 +117,15 @@ storage:
   zone: ""
   persistence:
     size: 100Gi
+    # For data-locality (short-circuit) reads, point this at a NODE-LOCAL storage
+    # class — a `local` PV / local-path provisioner (e.g. TopoLVM, the sig-storage
+    # local-static-provisioner, OpenEBS LocalPV, or Rancher local-path), NOT network
+    # block storage (EBS/PD/Ceph-RBD). A local PV is still a PVC, but its nodeAffinity
+    # pins the pod to the node holding its disk, so the bytes are truly local and the
+    # reported `host` is stable. Durability is handled by soma's own replication/EC
+    # across nodes, so pinning to a node is the intended trade-off (local speed +
+    # cluster-level durability). Empty = the cluster default class (often network
+    # storage, which forfeits true locality). See docs/LOCALITY_DESIGN.md §5.
     storageClass: ""
     accessModes:
       - ReadWriteOnce
