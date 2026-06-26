@@ -102,6 +102,22 @@ pub struct ObjectPut {
     pub encrypted: bool,
 }
 
+/// One entry in a batched object commit — the same arguments as
+/// [`crate::MetadataStore::put_object`], carrying its own bucket/key/condition so
+/// a batch can span buckets and keys. See
+/// [`crate::MetadataStore::put_object_batch`].
+#[derive(Debug, Clone)]
+pub struct ObjectPutItem {
+    /// Target bucket.
+    pub bucket: String,
+    /// Target object key.
+    pub key: String,
+    /// The version to commit.
+    pub put: ObjectPut,
+    /// Conditional-write precondition, evaluated independently for this item.
+    pub cond: PutCondition,
+}
+
 /// A per-bucket resource quota. Zero in a dimension means unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {

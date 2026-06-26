@@ -19,7 +19,7 @@ pub use redb_store::RedbMetaStore;
 pub use types::{
     BucketMeta, BucketOpts, BucketUsage, DataLayout, ETag, ListRequest, ListResult, NodeInfo,
     NodeLocation, NodeState, NodeTopology, ObjectEntry, ObjectLocations, ObjectMeta, ObjectPut,
-    PgPlacement, PutCondition, Quota, RateLimit, ShardRole, SseAlgorithm, Version,
+    ObjectPutItem, PgPlacement, PutCondition, Quota, RateLimit, ShardRole, SseAlgorithm, Version,
 };
 
 use soma_core::ObjectId;
@@ -72,6 +72,23 @@ pub trait MetadataStore: Send + Sync {
         put: ObjectPut,
         cond: PutCondition,
     ) -> Result<Version>;
+
+    /// Commit a batch of object versions in **one durable transaction**, each
+    /// subject to its own condition. Per-item results are returned positionally
+    /// (result `i` is for `items[i]`); one item's CAS/quota/bucket failure does
+    /// **not** abort the others. Same-key items in a batch chain correctly
+    /// (read-your-writes within the transaction).
+    ///
+    /// The point is to amortize the commit fsync across the batch — group commit
+    /// (see `docs/STORAGE_MODEL.md` §2.4). The default implementation just loops
+    /// [`put_object`](Self::put_object), which is correct but not batched;
+    /// transactional stores override it.
+    fn put_object_batch(&self, items: Vec<ObjectPutItem>) -> Vec<Result<Version>> {
+        items
+            .into_iter()
+            .map(|it| self.put_object(&it.bucket, &it.key, it.put, it.cond))
+            .collect()
+    }
 
     /// Fetch an object's current metadata, if it exists.
     fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>>;

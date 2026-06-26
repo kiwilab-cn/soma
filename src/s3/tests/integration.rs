@@ -2015,3 +2015,65 @@ async fn per_bucket_authz_enforced() {
 
     stop(handle).await;
 }
+
+/// Fire many concurrent commits at a metadata node and confirm the group-commit
+/// batcher coalesces them without losing or corrupting any: every PUT succeeds
+/// and every object is independently readable afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meta_commit_batcher_concurrent() {
+    use soma_cluster::{serve_meta, MetaClient};
+    use soma_meta::{ObjectPut, PutCondition, ETag};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let meta_port = free_port();
+
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    let ms = meta_store.clone();
+    tokio::spawn(async move {
+        let _ = serve_meta(format!("127.0.0.1:{meta_port}").parse().unwrap(), ms).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+
+    // 200 distinct keys committed concurrently through the (sync, blocking)
+    // MetaClient — they arrive at the node together and fan into batched txns.
+    const N: u64 = 200;
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let meta = meta.clone();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            meta.put_object(
+                BUCKET,
+                &format!("k{i}"),
+                ObjectPut {
+                    object_id: i + 1,
+                    size: 8,
+                    etag: ETag(format!("e{i}")),
+                    created_at: 0,
+                    encrypted: false,
+                },
+                PutCondition::None,
+            )
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+
+    // Every commit is durable and correct.
+    for i in 0..N {
+        let got = meta.get_object(BUCKET, &format!("k{i}")).unwrap().unwrap();
+        assert_eq!(got.object_id, i + 1, "k{i}");
+        assert_eq!(got.etag, ETag(format!("e{i}")));
+    }
+}

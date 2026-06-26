@@ -18,8 +18,8 @@ use soma_core::ObjectId;
 use crate::error::{Error, Result};
 use crate::types::{
     BucketMeta, BucketOpts, BucketUsage, ListRequest, ListResult, NodeInfo, NodeState,
-    NodeTopology, ObjectEntry, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit,
-    SseAlgorithm, Version,
+    NodeTopology, ObjectEntry, ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement, PutCondition,
+    Quota, RateLimit, SseAlgorithm, Version,
 };
 use crate::MetadataStore;
 
@@ -325,70 +325,66 @@ impl MetadataStore for RedbMetaStore {
         put: ObjectPut,
         cond: PutCondition,
     ) -> Result<Version> {
-        let w = self.db.begin_write()?;
-        let new_version;
-        {
-            let bucket_meta: BucketMeta = {
-                let buckets = w.open_table(BUCKETS)?;
-                let raw = match buckets.get(bucket)? {
-                    Some(g) => g.value().to_vec(),
-                    None => return Err(Error::NoSuchBucket(bucket.to_string())),
-                };
-                postcard::from_bytes(&raw)?
-            };
-            let mut objects = w.open_table(OBJECTS)?;
-            let ck = composite_key(bucket, key);
-            let current: Option<ObjectMeta> = match objects.get(ck.as_slice())? {
-                Some(g) => Some(postcard::from_bytes(g.value())?),
-                None => None,
-            };
-            check_condition(&cond, current.as_ref())?;
-
-            // Per-bucket quota accounting, atomic with the object write. An
-            // overwrite refunds the prior version first, so usage tracks the live
-            // (current) object set. The limit comes from the bucket's own quota.
-            let quota = bucket_meta.quota;
-            if quota.max_bytes > 0 || quota.max_objects > 0 {
-                let mut usage = w.open_table(USAGE)?;
-                let mut u = read_usage(&usage, bucket)?;
-                if let Some(c) = current.as_ref() {
-                    u.bytes = u.bytes.saturating_sub(c.size);
-                    u.objects = u.objects.saturating_sub(1);
-                }
-                u.bytes += put.size;
-                u.objects += 1;
-                if (quota.max_bytes > 0 && u.bytes > quota.max_bytes)
-                    || (quota.max_objects > 0 && u.objects > quota.max_objects)
-                {
-                    // Returning here drops the write transaction — nothing commits.
-                    return Err(Error::QuotaExceeded(format!(
-                        "bucket {} would use {} bytes / {} objects (limits {} / {})",
-                        bucket, u.bytes, u.objects, quota.max_bytes, quota.max_objects
-                    )));
-                }
-                write_usage(&mut usage, bucket, u)?;
-            }
-
-            // The overwritten version's bytes are now orphaned on storage nodes;
-            // record its id for the GC to reclaim (the new put always has a fresh
-            // id, so this never marks the object being written).
-            if let Some(c) = current.as_ref().filter(|c| c.object_id != put.object_id) {
-                w.open_table(GARBAGE)?.insert(c.object_id, 0u64)?;
-            }
-
-            new_version = Version(current.as_ref().map_or(1, |c| c.version.0 + 1));
-            let meta = ObjectMeta {
-                object_id: put.object_id,
-                size: put.size,
-                etag: put.etag,
-                version: new_version,
-                created_at: put.created_at,
-                encrypted: put.encrypted,
-            };
-            objects.insert(ck.as_slice(), postcard::to_allocvec(&meta)?.as_slice())?;
+        // A batch of one — single source of truth lives in `put_object_batch`.
+        let item = ObjectPutItem {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            put,
+            cond,
+        };
+        match self.put_object_batch(vec![item]).into_iter().next() {
+            Some(r) => r,
+            None => Err(Error::Remote("empty batch result".to_string())),
         }
-        w.commit()?;
-        Ok(new_version)
+    }
+
+    fn put_object_batch(&self, items: Vec<ObjectPutItem>) -> Vec<Result<Version>> {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        // One write transaction for the whole batch: redb commits (and fsyncs)
+        // once, so the per-object commit cost is amortized across `items`. Each
+        // item is still evaluated independently — a CAS/quota/bucket failure
+        // records an error for that item only and never aborts its neighbours.
+        let w = match self.db.begin_write() {
+            Ok(w) => w,
+            Err(e) => return fail_all(n, &Error::from(e)),
+        };
+        let mut results = Vec::with_capacity(n);
+        {
+            let mut objects = match w.open_table(OBJECTS) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
+            };
+            let buckets = match w.open_table(BUCKETS) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
+            };
+            let mut usage = match w.open_table(USAGE) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
+            };
+            let mut garbage = match w.open_table(GARBAGE) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
+            };
+            for item in items {
+                results.push(apply_put(
+                    &buckets,
+                    &mut objects,
+                    &mut usage,
+                    &mut garbage,
+                    item,
+                ));
+            }
+        }
+        // A commit failure means nothing in the batch reached disk: every item's
+        // tentative success is void, so they all surface the commit error.
+        match w.commit() {
+            Ok(()) => results,
+            Err(e) => fail_all(n, &Error::from(e)),
+        }
     }
 
     fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
@@ -641,6 +637,85 @@ impl MetadataStore for RedbMetaStore {
         w.commit()?;
         Ok(id)
     }
+}
+
+/// Apply one object commit against the already-open tables of a write
+/// transaction, returning its new version. Mirrors the single-put logic; the
+/// caller batches many of these into one transaction (one commit/fsync). Reads
+/// see prior items' writes in the same transaction, so same-key items chain.
+fn apply_put(
+    buckets: &redb::Table<&'static str, &'static [u8]>,
+    objects: &mut redb::Table<&'static [u8], &'static [u8]>,
+    usage: &mut redb::Table<&'static str, &'static [u8]>,
+    garbage: &mut redb::Table<u64, u64>,
+    item: ObjectPutItem,
+) -> Result<Version> {
+    let ObjectPutItem {
+        bucket,
+        key,
+        put,
+        cond,
+    } = item;
+
+    let bucket_meta: BucketMeta = match buckets.get(bucket.as_str())? {
+        Some(g) => postcard::from_bytes(g.value())?,
+        None => return Err(Error::NoSuchBucket(bucket)),
+    };
+
+    let ck = composite_key(&bucket, &key);
+    let current: Option<ObjectMeta> = match objects.get(ck.as_slice())? {
+        Some(g) => Some(postcard::from_bytes(g.value())?),
+        None => None,
+    };
+    check_condition(&cond, current.as_ref())?;
+
+    // Per-bucket quota accounting, atomic with the object write. An overwrite
+    // refunds the prior version first, so usage tracks the live object set.
+    let quota = bucket_meta.quota;
+    if quota.max_bytes > 0 || quota.max_objects > 0 {
+        let mut u = read_usage(&*usage, &bucket)?;
+        if let Some(c) = current.as_ref() {
+            u.bytes = u.bytes.saturating_sub(c.size);
+            u.objects = u.objects.saturating_sub(1);
+        }
+        u.bytes += put.size;
+        u.objects += 1;
+        if (quota.max_bytes > 0 && u.bytes > quota.max_bytes)
+            || (quota.max_objects > 0 && u.objects > quota.max_objects)
+        {
+            return Err(Error::QuotaExceeded(format!(
+                "bucket {} would use {} bytes / {} objects (limits {} / {})",
+                bucket, u.bytes, u.objects, quota.max_bytes, quota.max_objects
+            )));
+        }
+        write_usage(usage, &bucket, u)?;
+    }
+
+    // The overwritten version's bytes are now orphaned on storage nodes; record
+    // its id for the GC (the new put always has a fresh id, so this never marks
+    // the object being written).
+    if let Some(c) = current.as_ref().filter(|c| c.object_id != put.object_id) {
+        garbage.insert(c.object_id, 0u64)?;
+    }
+
+    let new_version = Version(current.as_ref().map_or(1, |c| c.version.0 + 1));
+    let meta = ObjectMeta {
+        object_id: put.object_id,
+        size: put.size,
+        etag: put.etag,
+        version: new_version,
+        created_at: put.created_at,
+        encrypted: put.encrypted,
+    };
+    objects.insert(ck.as_slice(), postcard::to_allocvec(&meta)?.as_slice())?;
+    Ok(new_version)
+}
+
+/// Fan a whole-batch failure (transaction begin/commit could not complete) out
+/// to one error per item — nothing in the batch became durable.
+fn fail_all(n: usize, e: &Error) -> Vec<Result<Version>> {
+    let msg = e.to_string();
+    (0..n).map(|_| Err(Error::Remote(msg.clone()))).collect()
 }
 
 /// Evaluate a conditional-write precondition against the current object (if any).

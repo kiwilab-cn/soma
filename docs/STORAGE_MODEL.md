@@ -116,6 +116,35 @@ All three share **one** append path and **one** on-disk format — they differ o
 in *when* `fsync` happens. Switching modes never changes how bytes are laid out
 or read, so a volume written under one mode is readable under any other.
 
+### 2.3 Group-commit on the metadata plane
+
+The byte fsync is only half the per-object write cost. The other half is the
+**metadata commit** — the `key → object_id` transaction that is the object's
+commit point (§3). The meta store (redb) is a single-writer B-tree, so each
+commit is its own transaction and its own fsync; under bursty small-object PUTs
+that commit fsync becomes the bottleneck, exactly as the byte fsync was.
+
+The fix is the same idea applied one plane over. The meta node runs a **commit
+batcher** (`serve_meta`): concurrent `put_object` commits are funnelled to a
+single worker that drains everything queued and applies the whole set in **one**
+redb write transaction via `MetadataStore::put_object_batch` — one B-tree commit,
+one fsync, for the entire batch. Because the drain happens *after* the previous
+transaction's commit returns, each batch is naturally just the requests that
+piled up during that commit: large batches under load, a batch of one when idle,
+so no latency is traded away by a timer.
+
+Each item in a batch keeps its **own** CAS/quota/bucket evaluation and its own
+result — one item's precondition failure records an error for that item alone and
+never aborts its neighbours. Same-key items chain correctly (reads in the
+transaction see prior items' writes), so the batched path is semantically
+identical to committing them one at a time, just durably cheaper. This batching
+is internal to the meta node — the `PutObject` RPC is unchanged, so it
+transparently coalesces commits arriving from *all* gateways, not just one.
+
+(Object-id allocation, `next_object_id`, is still a per-call transaction — folding
+it into a hi-lo allocator is a separate follow-up. Delete commits are not yet
+batched either.)
+
 ---
 
 ## 3. Consistency: commit = durable **and** visible
@@ -159,10 +188,10 @@ afford async local writes where a single-node database engine cannot.
   database engine) builds that **on top of** soma's object API; it is not soma's
   job. (See `soma-vision` — soma is general AI infra, not any one engine's
   storage layer.)
-- **Not a metadata batcher (yet).** This document's group-commit batches *byte*
-  fsyncs on the storage node. Coalescing the *metadata* commits on the gateway
-  (cheapening the per-object `key → object_id` transaction under bursty PUT load)
-  is a separate, latency-sensitive optimization tracked for a follow-up.
+- **Metadata commits are batched too.** §2.1 is the *storage*-side group-commit;
+  §2.3 applies the same coalescing to the *metadata* commit, so a burst of small
+  PUTs pays one B-tree commit/fsync instead of one per object. Still outstanding:
+  hi-lo object-id allocation and batched delete commits.
 
 ---
 
