@@ -159,6 +159,10 @@ pub struct StorageConfig {
     pub compact_interval_secs: u64,
     /// Only compact a volume when at least this fraction of it is reclaimable.
     pub compact_min_reclaim_ratio: f64,
+    /// Write durability: `"group_commit"` (default — batched fsync, durable + fast),
+    /// `"per_write"` (fsync every write, safest/slowest), or `"async"` (no fsync;
+    /// rely on the OS + replication, fastest/least durable).
+    pub durability: String,
 }
 
 /// Erasure-coding tuning. Opt-in: when `enabled`, the gateway stripes each object
@@ -259,6 +263,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             volume_max: "4GiB".to_string(),
+            durability: "group_commit".to_string(),
             scrub_interval_secs: 3600,
             heartbeat_interval_secs: 10,
             compact_interval_secs: 3600,

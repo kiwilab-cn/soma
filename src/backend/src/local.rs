@@ -5,13 +5,13 @@
 //! serialized by a single lock in M0 (correctness over concurrency); later
 //! milestones relax this.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use soma_core::{
     encode_needle, padded_needle_len, scan, verify_data, NeedleHeader, NeedleLoc, ObjectId,
     ObjectLocation, VolumeId, FLAG_TOMBSTONE, HEADER_LEN,
@@ -20,19 +20,57 @@ use soma_core::{
 use crate::error::{Error, Result};
 use crate::{idxfile, ByteRange, LocalNeedle, LocalReader, StorageBackend};
 
+/// How durable a write must be before it is acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// `fsync` each write before returning — safest, slowest (one fsync per object).
+    PerWrite,
+    /// Batch `fsync`s across concurrent writes (group commit): a write returns only
+    /// once a shared fsync has made it durable. Durable *and* fast under load — the
+    /// default. (Like SeaweedFS with fsync, but amortized.)
+    #[default]
+    GroupCommit,
+    /// Do not `fsync`; rely on the OS page cache flush + cross-node replication for
+    /// durability. Fastest, least durable — a correlated power loss can lose recent
+    /// un-flushed writes (mitigated by replicas). (SeaweedFS's default posture.)
+    Async,
+}
+
 /// Backend configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct BackendConfig {
     /// Rotate to a new volume once the active one would exceed this many bytes.
     pub volume_max: u64,
+    /// Write durability policy.
+    pub durability: Durability,
 }
 
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
             volume_max: 4 * 1024 * 1024 * 1024, // 4 GiB
+            durability: Durability::GroupCommit,
         }
     }
+}
+
+/// Group-commit coordinator: batches `fsync`s across concurrent writers. A writer
+/// records its write sequence and waits until a shared fsync has advanced
+/// `done_through` past it. The first waiter becomes the leader and performs the
+/// fsync (covering everyone written so far); the rest follow.
+struct GroupCommit {
+    state: Mutex<GcState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct GcState {
+    /// Writes with sequence ≤ this are durable.
+    done_through: u64,
+    /// Whether a leader is currently performing the fsync.
+    leader: bool,
+    /// Last fsync error, surfaced to waiters (sticky until the next success).
+    err: Option<String>,
 }
 
 /// One open volume: its file, append cursor, and hot index.
@@ -125,6 +163,10 @@ struct Inner {
     objects: HashMap<ObjectId, ObjectLocation>,
     active: u32,
     next_id: u32,
+    /// Monotonic write counter; the durability watermark for group commit.
+    write_seq: u64,
+    /// Volume ids with bytes written since the last fsync (group-commit only).
+    dirty: BTreeSet<u32>,
 }
 
 impl Inner {
@@ -137,7 +179,8 @@ impl Inner {
         needle_bytes: &[u8],
         size: u32,
         flags: u8,
-    ) -> Result<()> {
+        durability: Durability,
+    ) -> Result<u64> {
         let needle_len = needle_bytes.len() as u64;
 
         // Rotate when the active volume is non-empty and would overflow. (An
@@ -161,7 +204,11 @@ impl Inner {
             .ok_or(Error::VolumeNotFound(active))?;
         let offset = v.write_offset;
         v.file.write_all_at(needle_bytes, offset)?;
-        v.file.sync_data()?;
+        // Durability is decided by the caller after the lock is released: PerWrite
+        // fsyncs inline here; GroupCommit/Async defer it.
+        if durability == Durability::PerWrite {
+            v.file.sync_data()?;
+        }
         v.write_offset += needle_len;
 
         let loc = NeedleLoc {
@@ -172,7 +219,11 @@ impl Inner {
         v.index.insert(object_id, loc);
         self.objects
             .insert(object_id, ObjectLocation::new(VolumeId(active), loc));
-        Ok(())
+        if durability == Durability::GroupCommit {
+            self.dirty.insert(active);
+        }
+        self.write_seq += 1;
+        Ok(self.write_seq)
     }
 
     /// Start a new active volume.
@@ -189,6 +240,8 @@ impl Inner {
 /// Single-node, local-filesystem storage backend.
 pub struct LocalFsBackend {
     inner: Mutex<Inner>,
+    durability: Durability,
+    gc: GroupCommit,
 }
 
 impl LocalFsBackend {
@@ -238,6 +291,11 @@ impl LocalFsBackend {
         }
 
         Ok(Self {
+            durability: config.durability,
+            gc: GroupCommit {
+                state: Mutex::new(GcState::default()),
+                cv: Condvar::new(),
+            },
             inner: Mutex::new(Inner {
                 dir,
                 volume_max: config.volume_max,
@@ -245,8 +303,72 @@ impl LocalFsBackend {
                 objects,
                 active,
                 next_id,
+                write_seq: 0,
+                dirty: BTreeSet::new(),
             }),
         })
+    }
+
+    /// Make every write up to `seq` durable (group-commit). The first caller to find
+    /// no leader performs one shared fsync covering all writes so far; others wait.
+    fn group_commit(&self, seq: u64) -> Result<()> {
+        loop {
+            let mut st = self.gc.state.lock();
+            if st.done_through >= seq {
+                return Ok(());
+            }
+            if let Some(e) = st.err.clone() {
+                st.err = None; // let one waiter observe it, then retry
+                return Err(Error::Io(std::io::Error::other(e)));
+            }
+            if st.leader {
+                self.gc.cv.wait(&mut st); // a leader is syncing; wait and re-check
+                continue;
+            }
+            st.leader = true;
+            drop(st);
+
+            let result = self.fsync_dirty();
+            let mut st = self.gc.state.lock();
+            st.leader = false;
+            match result {
+                Ok(covered) => {
+                    st.done_through = st.done_through.max(covered);
+                    st.err = None;
+                }
+                Err(e) => st.err = Some(e.to_string()),
+            }
+            self.gc.cv.notify_all();
+        }
+    }
+
+    /// fsync every dirty volume (holding the data lock so no write races the sync),
+    /// returning the write sequence now made durable. On error the un-synced volumes
+    /// stay marked dirty so a retry covers them.
+    fn fsync_dirty(&self) -> Result<u64> {
+        let mut inner = self.inner.lock();
+        let dirty: Vec<u32> = std::mem::take(&mut inner.dirty).into_iter().collect();
+        let seq = inner.write_seq;
+        for (i, id) in dirty.iter().enumerate() {
+            if let Some(v) = inner.volumes.get(id) {
+                if let Err(e) = v.file.sync_data() {
+                    for leftover in &dirty[i..] {
+                        inner.dirty.insert(*leftover);
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(seq)
+    }
+
+    /// Apply the configured durability for a write that reached sequence `seq`.
+    fn finish_durability(&self, seq: u64) -> Result<()> {
+        match self.durability {
+            // PerWrite already fsynced inline; Async defers to the OS + replication.
+            Durability::PerWrite | Durability::Async => Ok(()),
+            Durability::GroupCommit => self.group_commit(seq),
+        }
     }
 
     /// Verify every needle's payload CRC across all volumes (bitrot detection).
@@ -431,7 +553,11 @@ impl StorageBackend for LocalFsBackend {
     fn put(&self, object_id: ObjectId, data: &[u8]) -> Result<()> {
         let needle = encode_needle(object_id, 0, data)?;
         let size = data.len() as u32;
-        self.inner.lock().append(object_id, &needle, size, 0)
+        let seq = self
+            .inner
+            .lock()
+            .append(object_id, &needle, size, 0, self.durability)?;
+        self.finish_durability(seq)
     }
 
     fn get(&self, object_id: ObjectId, range: Option<ByteRange>) -> Result<Vec<u8>> {
@@ -480,23 +606,37 @@ impl StorageBackend for LocalFsBackend {
     }
 
     fn delete(&self, object_id: ObjectId) -> Result<()> {
-        let mut inner = self.inner.lock();
-        // Idempotent: nothing live to delete → no redundant tombstone. This keeps
-        // orphan GC (which may delete an id from every node) from littering nodes
-        // that never held the object with tombstones.
-        match inner.objects.get(&object_id) {
-            Some(loc) if !loc.is_tombstone() => {}
-            _ => return Ok(()),
-        }
-        let needle = encode_needle(object_id, FLAG_TOMBSTONE, &[])?;
-        inner.append(object_id, &needle, 0, FLAG_TOMBSTONE)
+        // The liveness check + tombstone append are atomic under the lock (so two
+        // deletes can't both append a tombstone); durability happens after.
+        let seq = {
+            let mut inner = self.inner.lock();
+            // Idempotent: nothing live to delete → no redundant tombstone. This keeps
+            // orphan GC (which may delete an id from every node) from littering nodes
+            // that never held the object with tombstones.
+            match inner.objects.get(&object_id) {
+                Some(loc) if !loc.is_tombstone() => {}
+                _ => return Ok(()),
+            }
+            let needle = encode_needle(object_id, FLAG_TOMBSTONE, &[])?;
+            inner.append(object_id, &needle, 0, FLAG_TOMBSTONE, self.durability)?
+        };
+        self.finish_durability(seq)
     }
 
     fn sync(&self) -> Result<()> {
-        let inner = self.inner.lock();
-        for v in inner.volumes.values() {
-            v.file.sync_all()?;
-        }
+        let covered = {
+            let mut inner = self.inner.lock();
+            for v in inner.volumes.values() {
+                v.file.sync_all()?;
+            }
+            inner.dirty.clear();
+            inner.write_seq
+        };
+        // Everything is now durable; advance the group-commit watermark so waiters
+        // proceed without a redundant fsync.
+        let mut st = self.gc.state.lock();
+        st.done_through = st.done_through.max(covered);
+        self.gc.cv.notify_all();
         Ok(())
     }
 

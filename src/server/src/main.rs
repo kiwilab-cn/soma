@@ -12,8 +12,8 @@ use std::sync::Arc;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use soma_backend::{
-    BackendConfig, CachingBackend, Crypto, LocalFsBackend, LocalReader, StaticKeyProvider,
-    StorageBackend,
+    BackendConfig, CachingBackend, Crypto, Durability as WriteDurability, LocalFsBackend,
+    LocalReader, StaticKeyProvider, StorageBackend,
 };
 use soma_cluster::{
     serve_meta, serve_storage, Durability, ErasureCodedBackend, MetaClient, Placement,
@@ -60,12 +60,28 @@ fn open_meta(cfg: &Config) -> Result<Arc<dyn MetadataStore>, BoxError> {
 /// Open the local storage backend (no cache — caching lives on the gateway).
 fn open_backend(cfg: &Config) -> Result<Arc<dyn StorageBackend>, BoxError> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    Ok(Arc::new(LocalFsBackend::open(
-        &cfg.data_dir,
-        BackendConfig {
-            volume_max: cfg.volume_max_bytes(),
-        },
-    )?))
+    Ok(Arc::new(LocalFsBackend::open(&cfg.data_dir, backend_config(cfg))?))
+}
+
+/// Resolve the storage backend config (volume size + write durability).
+fn backend_config(cfg: &Config) -> BackendConfig {
+    let durability = match cfg.storage.durability.as_str() {
+        "per_write" => WriteDurability::PerWrite,
+        "async" => WriteDurability::Async,
+        "group_commit" => WriteDurability::GroupCommit,
+        other => {
+            tracing::warn!(
+                durability = %other,
+                "unrecognized storage.durability; falling back to group_commit \
+                 (expected per_write|group_commit|async)"
+            );
+            WriteDurability::GroupCommit
+        }
+    };
+    BackendConfig {
+        volume_max: cfg.volume_max_bytes(),
+        durability,
+    }
 }
 
 fn build_credentials(cfg: &Config) -> Credentials {
@@ -333,12 +349,7 @@ async fn run_meta(cfg: Config) -> Result<(), BoxError> {
 /// Storage node: serves `StorageBackend` over gRPC, with a background scrubber.
 async fn run_storage(cfg: Config) -> Result<(), BoxError> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let backend = Arc::new(LocalFsBackend::open(
-        &cfg.data_dir,
-        BackendConfig {
-            volume_max: cfg.volume_max_bytes(),
-        },
-    )?);
+    let backend = Arc::new(LocalFsBackend::open(&cfg.data_dir, backend_config(&cfg))?);
 
     // Background compaction: reclaim dead-needle space from sealed volumes.
     let compact_secs = cfg.storage.compact_interval_secs;

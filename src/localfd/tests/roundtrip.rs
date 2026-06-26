@@ -79,7 +79,7 @@ fn oversized_needle_in_its_own_volume() {
     // A tiny volume_max so a larger object becomes an oversized needle that gets its
     // own volume (the "an empty volume always accepts at least one needle" path).
     let backend = Arc::new(
-        LocalFsBackend::open(dir.path(), BackendConfig { volume_max: 256 * 1024 }).unwrap(),
+        LocalFsBackend::open(dir.path(), BackendConfig { volume_max: 256 * 1024, ..Default::default() }).unwrap(),
     );
     let big = vec![0x5Au8; 1024 * 1024]; // 1 MiB > 256 KiB volume_max
     backend.put(1, &big).unwrap();
