@@ -3,10 +3,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soma_meta::{
-    BucketOpts, BucketUsage, ETag, ListRequest, MetadataStore, ObjectPut, PutCondition, Quota,
-    RedbMetaStore, Version,
+    BucketOpts, BucketUsage, ETag, ListRequest, MetadataStore, ObjectPut, ObjectPutItem,
+    PutCondition, Quota, RedbMetaStore, Version,
 };
 use tempfile::TempDir;
+
+fn item(bucket: &str, key: &str, put: ObjectPut, cond: PutCondition) -> ObjectPutItem {
+    ObjectPutItem {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        put,
+        cond,
+    }
+}
 
 fn store(dir: &TempDir) -> RedbMetaStore {
     RedbMetaStore::open(dir.path().join("meta.redb")).unwrap()
@@ -765,4 +774,67 @@ fn bucket_default_encryption_set_get_clear() {
         m.set_bucket_encryption("nope", Some(SseAlgorithm::Aes256)),
         Err(soma_meta::Error::NoSuchBucket(_))
     ));
+}
+
+#[test]
+fn put_object_batch_mixed_outcomes_and_durable() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b1", BucketOpts::default()).unwrap();
+
+    // One transaction, independent per-item outcomes:
+    //  0: fresh key "a"                         -> Ok(v1)
+    //  1: key "a" again, If-None-Match          -> Err (item 0 is visible in-txn)
+    //  2: key "b" in a missing bucket           -> Err(NoSuchBucket)
+    //  3: fresh key "c"                         -> Ok(v1)
+    let results = m.put_object_batch(vec![
+        item("b1", "a", put(1, 0, 10, "a1"), PutCondition::None),
+        item("b1", "a", put(2, 0, 10, "a2"), PutCondition::IfNoneMatch),
+        item("nope", "b", put(3, 0, 10, "b1"), PutCondition::None),
+        item("b1", "c", put(4, 0, 10, "c1"), PutCondition::None),
+    ]);
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(*results[0].as_ref().unwrap(), Version(1));
+    assert!(results[1].is_err(), "intra-batch If-None-Match must see item 0");
+    assert!(results[2].is_err(), "missing bucket must fail just its item");
+    assert_eq!(*results[3].as_ref().unwrap(), Version(1));
+
+    // A neighbour's failure must not have rolled back the successes — and they
+    // survive a reopen (the batch's single commit was durable).
+    drop(m);
+    let m = store(&dir);
+    assert_eq!(m.get_object("b1", "a").unwrap().unwrap().object_id, 1);
+    assert_eq!(m.get_object("b1", "c").unwrap().unwrap().object_id, 4);
+    assert!(m.get_object("b1", "b").unwrap().is_none());
+}
+
+#[test]
+fn put_object_batch_quota_accrues_within_batch() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b1", BucketOpts::default()).unwrap();
+    m.set_bucket_quota(
+        "b1",
+        Quota {
+            max_bytes: 0,
+            max_objects: 2,
+        },
+    )
+    .unwrap();
+
+    // Three fresh objects, limit of 2: usage accumulates across the batch, so the
+    // third is rejected while the first two commit.
+    let results = m.put_object_batch(vec![
+        item("b1", "k1", put(1, 0, 5, "e1"), PutCondition::None),
+        item("b1", "k2", put(2, 0, 5, "e2"), PutCondition::None),
+        item("b1", "k3", put(3, 0, 5, "e3"), PutCondition::None),
+    ]);
+    assert!(results[0].is_ok());
+    assert!(results[1].is_ok());
+    assert!(results[2].is_err(), "third object exceeds the 2-object quota");
+
+    let usage = m.bucket_usage("b1").unwrap();
+    assert_eq!(usage, BucketUsage { bytes: 10, objects: 2 });
+    assert!(m.get_object("b1", "k3").unwrap().is_none());
 }

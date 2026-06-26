@@ -7,11 +7,13 @@ use std::sync::Arc;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
+use tokio::sync::{mpsc, oneshot};
+
 use soma_core::ObjectId;
 use soma_meta::{
     BucketMeta, BucketOpts, BucketUsage, Error, ListRequest, ListResult, MetadataStore, NodeInfo,
-    NodeState, NodeTopology, ObjectMeta, ObjectPut, PgPlacement, PutCondition, Quota, RateLimit,
-    Result, Version,
+    NodeState, NodeTopology, ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement, PutCondition, Quota,
+    RateLimit, Result, Version,
 };
 
 use crate::bridge::Bridge;
@@ -20,12 +22,19 @@ use crate::wire::{MetaReply, MetaRequest, WireError};
 
 const MAX_MSG: usize = 64 * 1024 * 1024;
 
+/// Upper bound on object commits coalesced into a single metadata transaction.
+/// Bounds the work (and memory) of one commit; under steady load the batch is
+/// usually whatever arrived while the previous commit was in flight, well under
+/// this cap.
+const MAX_COMMIT_BATCH: usize = 512;
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 struct MetaService {
     store: Arc<dyn MetadataStore>,
+    commits: CommitBatcher,
 }
 
 #[tonic::async_trait]
@@ -37,12 +46,114 @@ impl pb::meta_server::Meta for MetaService {
         let payload = request.into_inner().payload;
         let req: MetaRequest =
             postcard::from_bytes(&payload).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let store = self.store.clone();
-        let result = tokio::task::spawn_blocking(move || dispatch(store.as_ref(), req))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Object commits flow through the batcher so concurrent PUTs coalesce
+        // into one durable transaction (group commit). Everything else dispatches
+        // straight to the store on a blocking thread.
+        let result: std::result::Result<MetaReply, WireError> = match req {
+            MetaRequest::PutObject {
+                bucket,
+                key,
+                put,
+                cond,
+            } => self
+                .commits
+                .commit(ObjectPutItem {
+                    bucket,
+                    key,
+                    put,
+                    cond,
+                })
+                .await
+                .map(MetaReply::Version)
+                .map_err(|e| WireError {
+                    kind: e.kind().to_string(),
+                    message: e.to_string(),
+                }),
+            other => {
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || dispatch(store.as_ref(), other))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            }
+        };
         let bytes = postcard::to_allocvec(&result).map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(pb::Frame { payload: bytes }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit batcher (group commit for object metadata)
+// ---------------------------------------------------------------------------
+
+/// One queued object commit plus the channel its result returns on.
+struct CommitJob {
+    item: ObjectPutItem,
+    resp: oneshot::Sender<Result<Version>>,
+}
+
+/// Coalesces concurrent object commits into single durable transactions.
+///
+/// A dedicated worker pulls the next job, then greedily drains everything else
+/// already queued (up to [`MAX_COMMIT_BATCH`]) and applies the lot in one
+/// [`MetadataStore::put_object_batch`]. Because the drain happens *after* the
+/// previous batch's commit returns, the batch is naturally exactly the set of
+/// requests that piled up during that fsync — large batches under load, a batch
+/// of one when idle. No timer, so latency is never traded away artificially.
+struct CommitBatcher {
+    tx: mpsc::UnboundedSender<CommitJob>,
+}
+
+impl CommitBatcher {
+    fn spawn(store: Arc<dyn MetadataStore>) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<CommitJob>();
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut jobs = vec![first];
+                while jobs.len() < MAX_COMMIT_BATCH {
+                    match rx.try_recv() {
+                        Ok(job) => jobs.push(job),
+                        Err(_) => break,
+                    }
+                }
+                let mut items = Vec::with_capacity(jobs.len());
+                let mut resps = Vec::with_capacity(jobs.len());
+                for job in jobs {
+                    items.push(job.item);
+                    resps.push(job.resp);
+                }
+                let store = store.clone();
+                let outcome =
+                    tokio::task::spawn_blocking(move || store.put_object_batch(items)).await;
+                match outcome {
+                    Ok(results) => {
+                        for (resp, res) in resps.into_iter().zip(results) {
+                            let _ = resp.send(res);
+                        }
+                    }
+                    Err(e) => {
+                        // The blocking task panicked/cancelled: nothing committed.
+                        let msg = format!("commit batch task failed: {e}");
+                        for resp in resps {
+                            let _ = resp.send(Err(Error::Remote(msg.clone())));
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    async fn commit(&self, item: ObjectPutItem) -> Result<Version> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(CommitJob {
+                item,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::Remote("commit batcher stopped".to_string()))?;
+        resp_rx
+            .await
+            .map_err(|_| Error::Remote("commit batcher dropped response".to_string()))?
     }
 }
 
@@ -128,7 +239,8 @@ pub async fn serve_meta(
     addr: SocketAddr,
     store: Arc<dyn MetadataStore>,
 ) -> std::result::Result<(), tonic::transport::Error> {
-    let svc = pb::meta_server::MetaServer::new(MetaService { store })
+    let commits = CommitBatcher::spawn(store.clone());
+    let svc = pb::meta_server::MetaServer::new(MetaService { store, commits })
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
     Server::builder().add_service(svc).serve(addr).await
