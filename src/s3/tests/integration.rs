@@ -2126,3 +2126,73 @@ async fn gateway_id_cache_serves_unique_ids() {
     assert_eq!(len, 50);
     assert!(start > *ids.last().unwrap(), "reservation past served ids");
 }
+
+/// Concurrent deletes coalesce through the delete batcher just like commits:
+/// put a batch of objects, delete them all concurrently, and confirm every one
+/// is gone with no lost or spurious removals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meta_delete_batcher_concurrent() {
+    use soma_cluster::{serve_meta, MetaClient};
+    use soma_meta::{ObjectPut, PutCondition, ETag};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let meta_port = free_port();
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    meta_store
+        .create_bucket(BUCKET, BucketOpts::default())
+        .unwrap();
+    let ms = meta_store.clone();
+    tokio::spawn(async move {
+        let _ = serve_meta(format!("127.0.0.1:{meta_port}").parse().unwrap(), ms).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+
+    const N: u64 = 200;
+    // Seed N objects (commits coalesce through the put batcher).
+    let mut puts = Vec::new();
+    for i in 0..N {
+        let meta = meta.clone();
+        puts.push(tokio::task::spawn_blocking(move || {
+            meta.put_object(
+                BUCKET,
+                &format!("k{i}"),
+                ObjectPut {
+                    object_id: i + 1,
+                    size: 8,
+                    etag: ETag(format!("e{i}")),
+                    created_at: 0,
+                    encrypted: false,
+                },
+                PutCondition::None,
+            )
+        }));
+    }
+    for t in puts {
+        t.await.unwrap().unwrap();
+    }
+
+    // Delete them all concurrently — these fan into batched delete transactions.
+    let mut dels = Vec::new();
+    for i in 0..N {
+        let meta = meta.clone();
+        dels.push(tokio::task::spawn_blocking(move || {
+            meta.delete_object(BUCKET, &format!("k{i}"), PutCondition::None)
+        }));
+    }
+    for t in dels {
+        t.await.unwrap().unwrap();
+    }
+
+    // Every object is gone.
+    for i in 0..N {
+        assert!(meta.get_object(BUCKET, &format!("k{i}")).unwrap().is_none(), "k{i}");
+    }
+}

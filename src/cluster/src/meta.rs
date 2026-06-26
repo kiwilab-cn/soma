@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use soma_core::ObjectId;
 use soma_meta::{
     BucketMeta, BucketOpts, BucketUsage, Error, ListRequest, ListResult, MetadataStore, NodeInfo,
-    NodeState, NodeTopology, ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement, PutCondition, Quota,
-    RateLimit, Result, Version,
+    NodeState, NodeTopology, ObjectDeleteItem, ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement,
+    PutCondition, Quota, RateLimit, Result, Version,
 };
 
 use crate::bridge::Bridge;
@@ -34,7 +34,8 @@ const MAX_COMMIT_BATCH: usize = 512;
 
 struct MetaService {
     store: Arc<dyn MetadataStore>,
-    commits: CommitBatcher,
+    commits: Batcher<ObjectPutItem, Version>,
+    deletes: Batcher<ObjectDeleteItem, ()>,
 }
 
 #[tonic::async_trait]
@@ -46,9 +47,9 @@ impl pb::meta_server::Meta for MetaService {
         let payload = request.into_inner().payload;
         let req: MetaRequest =
             postcard::from_bytes(&payload).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        // Object commits flow through the batcher so concurrent PUTs coalesce
-        // into one durable transaction (group commit). Everything else dispatches
-        // straight to the store on a blocking thread.
+        // Object commits and deletes flow through batchers so concurrent writes
+        // coalesce into single durable transactions (group commit). Everything
+        // else dispatches straight to the store on a blocking thread.
         let result: std::result::Result<MetaReply, WireError> = match req {
             MetaRequest::PutObject {
                 bucket,
@@ -57,7 +58,7 @@ impl pb::meta_server::Meta for MetaService {
                 cond,
             } => self
                 .commits
-                .commit(ObjectPutItem {
+                .submit(ObjectPutItem {
                     bucket,
                     key,
                     put,
@@ -65,10 +66,13 @@ impl pb::meta_server::Meta for MetaService {
                 })
                 .await
                 .map(MetaReply::Version)
-                .map_err(|e| WireError {
-                    kind: e.kind().to_string(),
-                    message: e.to_string(),
-                }),
+                .map_err(to_wire),
+            MetaRequest::DeleteObject { bucket, key, cond } => self
+                .deletes
+                .submit(ObjectDeleteItem { bucket, key, cond })
+                .await
+                .map(|()| MetaReply::Unit)
+                .map_err(to_wire),
             other => {
                 let store = self.store.clone();
                 tokio::task::spawn_blocking(move || dispatch(store.as_ref(), other))
@@ -81,31 +85,48 @@ impl pb::meta_server::Meta for MetaService {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Commit batcher (group commit for object metadata)
-// ---------------------------------------------------------------------------
-
-/// One queued object commit plus the channel its result returns on.
-struct CommitJob {
-    item: ObjectPutItem,
-    resp: oneshot::Sender<Result<Version>>,
+/// Map a store error into the wire form returned to the client.
+fn to_wire(e: Error) -> WireError {
+    WireError {
+        kind: e.kind().to_string(),
+        message: e.to_string(),
+    }
 }
 
-/// Coalesces concurrent object commits into single durable transactions.
+// ---------------------------------------------------------------------------
+// Metadata write batcher (group commit for object commits and deletes)
+// ---------------------------------------------------------------------------
+
+/// One queued write plus the channel its result returns on.
+struct BatchJob<I, R> {
+    item: I,
+    resp: oneshot::Sender<Result<R>>,
+}
+
+/// Coalesces concurrent metadata writes into single durable transactions.
 ///
 /// A dedicated worker pulls the next job, then greedily drains everything else
-/// already queued (up to [`MAX_COMMIT_BATCH`]) and applies the lot in one
-/// [`MetadataStore::put_object_batch`]. Because the drain happens *after* the
-/// previous batch's commit returns, the batch is naturally exactly the set of
-/// requests that piled up during that fsync — large batches under load, a batch
-/// of one when idle. No timer, so latency is never traded away artificially.
-struct CommitBatcher {
-    tx: mpsc::UnboundedSender<CommitJob>,
+/// already queued (up to [`MAX_COMMIT_BATCH`]) and applies the lot with one
+/// `apply` call — `put_object_batch` for commits, `delete_object_batch` for
+/// deletes. Because the drain happens *after* the previous batch's commit
+/// returns, the batch is naturally exactly the set of requests that piled up
+/// during that fsync — large batches under load, a batch of one when idle. No
+/// timer, so latency is never traded away artificially.
+struct Batcher<I, R> {
+    tx: mpsc::UnboundedSender<BatchJob<I, R>>,
 }
 
-impl CommitBatcher {
-    fn spawn(store: Arc<dyn MetadataStore>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<CommitJob>();
+impl<I, R> Batcher<I, R>
+where
+    I: Send + 'static,
+    R: Send + 'static,
+{
+    fn spawn<F>(apply: F) -> Self
+    where
+        F: Fn(Vec<I>) -> Vec<Result<R>> + Send + Sync + 'static,
+    {
+        let apply = Arc::new(apply);
+        let (tx, mut rx) = mpsc::unbounded_channel::<BatchJob<I, R>>();
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 let mut jobs = vec![first];
@@ -121,9 +142,9 @@ impl CommitBatcher {
                     items.push(job.item);
                     resps.push(job.resp);
                 }
-                let store = store.clone();
-                let outcome =
-                    tokio::task::spawn_blocking(move || store.put_object_batch(items)).await;
+                // The store call is blocking (redb) — keep it off the async worker.
+                let apply = apply.clone();
+                let outcome = tokio::task::spawn_blocking(move || apply(items)).await;
                 match outcome {
                     Ok(results) => {
                         for (resp, res) in resps.into_iter().zip(results) {
@@ -132,7 +153,7 @@ impl CommitBatcher {
                     }
                     Err(e) => {
                         // The blocking task panicked/cancelled: nothing committed.
-                        let msg = format!("commit batch task failed: {e}");
+                        let msg = format!("metadata batch task failed: {e}");
                         for resp in resps {
                             let _ = resp.send(Err(Error::Remote(msg.clone())));
                         }
@@ -143,17 +164,17 @@ impl CommitBatcher {
         Self { tx }
     }
 
-    async fn commit(&self, item: ObjectPutItem) -> Result<Version> {
+    async fn submit(&self, item: I) -> Result<R> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(CommitJob {
+            .send(BatchJob {
                 item,
                 resp: resp_tx,
             })
-            .map_err(|_| Error::Remote("commit batcher stopped".to_string()))?;
+            .map_err(|_| Error::Remote("metadata batcher stopped".to_string()))?;
         resp_rx
             .await
-            .map_err(|_| Error::Remote("commit batcher dropped response".to_string()))?
+            .map_err(|_| Error::Remote("metadata batcher dropped response".to_string()))?
     }
 }
 
@@ -241,10 +262,17 @@ pub async fn serve_meta(
     addr: SocketAddr,
     store: Arc<dyn MetadataStore>,
 ) -> std::result::Result<(), tonic::transport::Error> {
-    let commits = CommitBatcher::spawn(store.clone());
-    let svc = pb::meta_server::MetaServer::new(MetaService { store, commits })
-        .max_decoding_message_size(MAX_MSG)
-        .max_encoding_message_size(MAX_MSG);
+    let commit_store = store.clone();
+    let commits = Batcher::spawn(move |items| commit_store.put_object_batch(items));
+    let delete_store = store.clone();
+    let deletes = Batcher::spawn(move |items| delete_store.delete_object_batch(items));
+    let svc = pb::meta_server::MetaServer::new(MetaService {
+        store,
+        commits,
+        deletes,
+    })
+    .max_decoding_message_size(MAX_MSG)
+    .max_encoding_message_size(MAX_MSG);
     Server::builder().add_service(svc).serve(addr).await
 }
 

@@ -18,8 +18,9 @@ pub use error::{Error, Result};
 pub use redb_store::RedbMetaStore;
 pub use types::{
     BucketMeta, BucketOpts, BucketUsage, DataLayout, ETag, ListRequest, ListResult, NodeInfo,
-    NodeLocation, NodeState, NodeTopology, ObjectEntry, ObjectLocations, ObjectMeta, ObjectPut,
-    ObjectPutItem, PgPlacement, PutCondition, Quota, RateLimit, ShardRole, SseAlgorithm, Version,
+    NodeLocation, NodeState, NodeTopology, ObjectDeleteItem, ObjectEntry, ObjectLocations,
+    ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement, PutCondition, Quota, RateLimit, ShardRole,
+    SseAlgorithm, Version,
 };
 
 use soma_core::ObjectId;
@@ -96,6 +97,18 @@ pub trait MetadataStore: Send + Sync {
     /// Delete an object, subject to `cond`. Idempotent: deleting an absent object
     /// succeeds unless a condition forbids it. Refunds the bucket's usage.
     fn delete_object(&self, bucket: &str, key: &str, cond: PutCondition) -> Result<()>;
+
+    /// Delete a batch of objects in **one durable transaction**, each subject to
+    /// its own condition, with positional per-item results (the delete analogue of
+    /// [`put_object_batch`](Self::put_object_batch)). One item's failure does not
+    /// abort the others. Amortizes the commit fsync across the batch; the default
+    /// implementation loops [`delete_object`](Self::delete_object).
+    fn delete_object_batch(&self, items: Vec<ObjectDeleteItem>) -> Vec<Result<()>> {
+        items
+            .into_iter()
+            .map(|it| self.delete_object(&it.bucket, &it.key, it.cond))
+            .collect()
+    }
 
     /// The tracked live usage for a bucket (zero if unknown).
     fn bucket_usage(&self, bucket: &str) -> Result<BucketUsage>;
