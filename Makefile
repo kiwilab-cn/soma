@@ -11,6 +11,7 @@
 # Run `make help` to list every target.
 
 COMPOSE    ?= docker compose -f deploy/compose/docker-compose.yml
+EC_COMPOSE ?= docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.erasure.yml
 S3_URL     ?= http://127.0.0.1:9000
 ADMIN_URL  ?= http://127.0.0.1:9001
 IMAGE      ?= soma:dev
@@ -20,7 +21,8 @@ IMAGE      ?= soma:dev
 .PHONY: help \
         build test lint fmt fmt-check check run \
         image up down restart rebuild logs ps sh clean \
-        ready health metrics smoke
+        ready health metrics smoke \
+        ec-up ec-down ec-clean ec-ps ec-logs ec-degraded
 
 help: ## Show this help
 	@printf "Soma targets:\n\n"
@@ -110,3 +112,48 @@ smoke: ## S3 create/put/get/delete roundtrip against the running cluster (needs 
 		s3.delete_object(Bucket="smoke", Key="k")
 		print("smoke: create/put/get/delete OK")
 	PY
+
+# ── erasure-coded cluster (6 storage, Reed-Solomon 4+2) ────────────────────
+
+ec-up: ## Start a 6-node erasure-coded (k=4 m=2) cluster
+	$(EC_COMPOSE) up -d --build
+	@printf "\nErasure cluster starting — gateway waits for all 6 storage nodes.\n"
+	@printf "Check readiness: make ready    Degraded-read demo: make ec-degraded\n"
+
+ec-down: ## Stop the erasure cluster (KEEPS data volumes)
+	$(EC_COMPOSE) down
+
+ec-clean: ## Stop the erasure cluster and DELETE its data volumes
+	$(EC_COMPOSE) down -v --remove-orphans
+
+ec-ps: ## Show erasure-cluster container status
+	$(EC_COMPOSE) ps
+
+ec-logs: ## Tail erasure-cluster logs
+	$(EC_COMPOSE) logs -f --tail=200
+
+ec-degraded: ## Write an object, kill 2 storage nodes, read it back reconstructed, restore
+	@python3 - <<-'PY'
+		import boto3
+		from botocore.config import Config
+		s3 = boto3.client("s3", endpoint_url="$(S3_URL)",
+		    aws_access_key_id="soma", aws_secret_access_key="soma-secret",
+		    region_name="us-east-1",
+		    config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"))
+		s3.create_bucket(Bucket="ec")
+		s3.put_object(Bucket="ec", Key="obj", Body=b"erasure-coded payload " * 1000)
+		print("wrote object across all 6 shards")
+	PY
+	$(EC_COMPOSE) stop storage-4 storage-5
+	@python3 - <<-'PY'
+		import boto3
+		from botocore.config import Config
+		s3 = boto3.client("s3", endpoint_url="$(S3_URL)",
+		    aws_access_key_id="soma", aws_secret_access_key="soma-secret",
+		    region_name="us-east-1",
+		    config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"))
+		got = s3.get_object(Bucket="ec", Key="obj")["Body"].read()
+		assert got == b"erasure-coded payload " * 1000, "reconstruct mismatch"
+		print("read OK with 2 of 6 nodes down — reconstructed from 4 survivors")
+	PY
+	$(EC_COMPOSE) start storage-4 storage-5

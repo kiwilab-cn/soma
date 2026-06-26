@@ -1,0 +1,85 @@
+# Erasure-coding overlay for the local cluster.
+#
+# Layered on top of docker-compose.yml, this turns the cluster from 3-way
+# replication into Reed-Solomon k=4 + m=2 erasure coding: every object is split
+# into 4 data + 2 parity shards spread across 6 distinct storage nodes, so it
+# survives the loss of any 2 nodes at 1.5x storage (vs 3x for replication).
+#
+#   docker compose \
+#     -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/docker-compose.erasure.yml up --build
+#
+# or simply `make ec-up`.
+#
+# Erasure coding needs at least k+m = 6 storage nodes: the gateway refuses to
+# serve until that many register (it places one shard per distinct node). The
+# base file provides storage-0..2; this overlay adds storage-3..5 and switches
+# the gateway (encoder) and meta (rebalance/reconstruction) to erasure mode.
+
+name: soma
+
+x-soma: &soma
+  image: soma:dev
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
+x-storage-env: &storage-env
+  SOMA_ROLE: storage
+  SOMA_LISTEN: 0.0.0.0:9200
+  SOMA_META_ENDPOINT: http://meta:9100
+  SOMA_DATA_DIR: /var/lib/soma
+  SOMA_STORAGE__HEARTBEAT_INTERVAL_SECS: "3"
+
+# Erasure settings — must match on the gateway (encodes) and meta (the rebalance
+# controller reconstructs shards). Storage nodes need nothing: they store opaque
+# shard bytes and never know they hold a shard.
+x-erasure: &erasure
+  SOMA_ERASURE__ENABLED: "true"
+  SOMA_ERASURE__DATA_SHARDS: "4"
+  SOMA_ERASURE__PARITY_SHARDS: "2"
+
+services:
+  meta:
+    environment:
+      <<: *erasure
+
+  gateway:
+    environment:
+      <<: *erasure
+
+  storage-3:
+    <<: *soma
+    depends_on: [meta]
+    environment:
+      <<: *storage-env
+      SOMA_NODE_ID: storage-3
+      SOMA_ADVERTISE_ENDPOINT: http://storage-3:9200
+    volumes:
+      - storage-3-data:/var/lib/soma
+
+  storage-4:
+    <<: *soma
+    depends_on: [meta]
+    environment:
+      <<: *storage-env
+      SOMA_NODE_ID: storage-4
+      SOMA_ADVERTISE_ENDPOINT: http://storage-4:9200
+    volumes:
+      - storage-4-data:/var/lib/soma
+
+  storage-5:
+    <<: *soma
+    depends_on: [meta]
+    environment:
+      <<: *storage-env
+      SOMA_NODE_ID: storage-5
+      SOMA_ADVERTISE_ENDPOINT: http://storage-5:9200
+    volumes:
+      - storage-5-data:/var/lib/soma
+
+volumes:
+  storage-3-data:
+  storage-4-data:
+  storage-5-data:

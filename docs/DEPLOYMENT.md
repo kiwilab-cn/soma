@@ -61,6 +61,31 @@ Tear down (add `-v` to also wipe the data volumes):
 docker compose -f deploy/compose/docker-compose.yml down
 ```
 
+### Erasure coding (instead of replication)
+
+By default the cluster 3-way **replicates** (3× storage, survives 2 node losses).
+To run it **erasure-coded** instead — Reed-Solomon `k=4 + m=2`, **1.5×** storage,
+still survives 2 node losses — layer the erasure overlay, which grows the cluster
+to the required **6** storage nodes (one shard per distinct node) and switches the
+gateway and meta to erasure mode:
+
+```sh
+make ec-up         # 6 storage + gateway/meta in erasure mode (k=4 m=2)
+make ready
+make ec-degraded   # write an object, kill 2 of 6 nodes, read it back reconstructed
+make ec-down       # or ec-clean to wipe volumes
+```
+
+Erasure coding is **opt-in and a deploy-time choice** (it is not a live migration
+from a populated replicated cluster). It needs **at least `data_shards +
+parity_shards` storage nodes** — the gateway refuses to serve until that many
+register. The same `erasure.enabled` / `data_shards` / `parity_shards` settings
+must be set on **both** the gateway (which encodes) and the meta node (whose
+rebalance controller reconstructs shards); storage nodes need nothing — they hold
+opaque shard bytes. Tune `write_quorum` (`0` → `data_shards + 1`) to trade write
+availability against the durability margin. The same knobs exist in the Helm
+chart under `erasure.*` (see §5).
+
 ## 2. Local cluster without Docker
 
 The same five processes, straight from a release build — handy when you don't
