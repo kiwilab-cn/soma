@@ -2077,3 +2077,52 @@ async fn meta_commit_batcher_concurrent() {
         assert_eq!(got.etag, ETag(format!("e{i}")));
     }
 }
+
+/// The gateway's MetaClient caches reserved id blocks: allocating many ids hands
+/// out a unique, strictly increasing stream while only refilling occasionally
+/// over the wire. Verifies correctness across several block refills.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_id_cache_serves_unique_ids() {
+    use soma_cluster::{serve_meta, MetaClient};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let meta_port = free_port();
+    let meta_store: Arc<dyn MetadataStore> =
+        Arc::new(RedbMetaStore::open(dir.path().join("meta.redb")).unwrap());
+    let ms = meta_store.clone();
+    tokio::spawn(async move {
+        let _ = serve_meta(format!("127.0.0.1:{meta_port}").parse().unwrap(), ms).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let meta: Arc<dyn MetadataStore> = Arc::new(
+        MetaClient::connect(format!("http://127.0.0.1:{meta_port}"))
+            .await
+            .unwrap(),
+    );
+
+    // 600 ids spans multiple client blocks (256 each). All distinct, increasing.
+    let m = meta.clone();
+    let ids = tokio::task::spawn_blocking(move || {
+        (0..600).map(|_| m.next_object_id().unwrap()).collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
+    for w in ids.windows(2) {
+        assert!(w[1] > w[0], "ids strictly increasing");
+    }
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        600,
+        "all ids unique"
+    );
+
+    // A direct block reservation over the wire returns a contiguous run.
+    let m = meta.clone();
+    let (start, len) = tokio::task::spawn_blocking(move || m.reserve_object_ids(50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(len, 50);
+    assert!(start > *ids.last().unwrap(), "reservation past served ids");
+}

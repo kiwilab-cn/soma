@@ -85,6 +85,24 @@ impl RedbMetaStore {
         })
     }
 
+    /// Reserve `count` contiguous object ids by advancing the persisted high-water
+    /// in one transaction; returns the first id of `[start, start + count)`. The
+    /// backing primitive for both the in-process hi-lo allocator and remote block
+    /// reservations — all reservations advance the same monotonic counter, so the
+    /// ranges they hand out never overlap.
+    fn reserve_ids(&self, count: u64) -> Result<u64> {
+        let w = self.db.begin_write()?;
+        let start;
+        {
+            let mut t = w.open_table(SEQ)?;
+            let current = t.get(OBJECT_ID_SEQ)?.map_or(0, |g| g.value());
+            start = current + 1;
+            t.insert(OBJECT_ID_SEQ, current + count)?;
+        }
+        w.commit()?;
+        Ok(start)
+    }
+
     // --- rebalance controller support (M3b) --------------------------------
     //
     // These are inherent (not on the `MetadataStore` trait): only the controller,
@@ -656,23 +674,19 @@ impl MetadataStore for RedbMetaStore {
             .lock()
             .map_err(|_| Error::Remote("id allocator lock poisoned".to_string()))?;
         if alloc.next >= alloc.end {
-            // Block drained: reserve the next `ID_BLOCK` ids in one transaction by
-            // advancing the persisted high-water, then serve them from memory.
-            let w = self.db.begin_write()?;
-            let high;
-            {
-                let mut t = w.open_table(SEQ)?;
-                let current = t.get(OBJECT_ID_SEQ)?.map_or(0, |g| g.value());
-                high = current + ID_BLOCK;
-                t.insert(OBJECT_ID_SEQ, high)?;
-            }
-            w.commit()?;
-            alloc.next = high - ID_BLOCK + 1;
-            alloc.end = high + 1;
+            // Block drained: reserve the next `ID_BLOCK` ids, then serve from memory.
+            let start = self.reserve_ids(ID_BLOCK)?;
+            alloc.next = start;
+            alloc.end = start + ID_BLOCK;
         }
         let id = alloc.next;
         alloc.next += 1;
         Ok(id)
+    }
+
+    fn reserve_object_ids(&self, count: u64) -> Result<(ObjectId, u64)> {
+        let count = count.max(1);
+        Ok((self.reserve_ids(count)?, count))
     }
 }
 

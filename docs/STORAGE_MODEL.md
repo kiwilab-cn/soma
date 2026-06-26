@@ -147,7 +147,15 @@ transaction reserves a block of `ID_BLOCK` ids (by advancing the persisted
 high-water), then ids serve from memory until the block drains — one fsync per
 block instead of per id. A restart resumes from the high-water, abandoning the
 tail of a partially-used block; the resulting gaps are harmless because ids only
-need to be unique and increasing, not contiguous. (Delete commits are not yet
+need to be unique and increasing, not contiguous.
+
+The gateway pushes this one hop further to also kill the per-id **round trip**:
+`MetaClient` reserves a block (`reserve_object_ids`, `CLIENT_ID_BLOCK` ids in one
+RPC) and hands them out locally, so a steady PUT stream contacts the meta node
+for ids only once per block. Reservations all advance the same monotonic counter
+on the node, so blocks handed to different gateways — and the node's own in-
+process allocator — never overlap. Net: a small-object PUT touches the meta node
+roughly once (the batched commit), not three times. (Delete commits are not yet
 batched.)
 
 ---

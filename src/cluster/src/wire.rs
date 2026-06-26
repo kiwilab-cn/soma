@@ -57,7 +57,9 @@ pub(crate) enum MetaRequest {
         bucket: String,
         req: ListRequest,
     },
-    NextObjectId,
+    ReserveObjectIds {
+        count: u64,
+    },
     BucketUsage {
         bucket: String,
     },
@@ -95,7 +97,7 @@ pub(crate) enum MetaReply {
     Version(Version),
     Object(Option<ObjectMeta>),
     List(ListResult),
-    ObjectId(u64),
+    ObjectIdRange { start: u64, len: u64 },
     Usage(BucketUsage),
     Members(Vec<NodeInfo>),
     Seeded(bool),

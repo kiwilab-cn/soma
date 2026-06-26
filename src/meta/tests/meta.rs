@@ -877,3 +877,24 @@ fn put_object_batch_quota_accrues_within_batch() {
     assert_eq!(usage, BucketUsage { bytes: 10, objects: 2 });
     assert!(m.get_object("b1", "k3").unwrap().is_none());
 }
+
+#[test]
+fn reserve_object_ids_blocks_are_disjoint() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+
+    let (s1, l1) = m.reserve_object_ids(10).unwrap();
+    assert_eq!(l1, 10);
+    let (s2, l2) = m.reserve_object_ids(5).unwrap();
+    assert_eq!(l2, 5);
+    assert!(s2 >= s1 + l1, "reserved blocks must not overlap");
+
+    // The in-process allocator shares the same counter — a direct next_object_id
+    // never collides with a reserved block.
+    let single = m.next_object_id().unwrap();
+    assert!(single >= s2 + l2, "single id must not fall inside a reserved block");
+
+    // count is clamped to at least 1.
+    let (_, l3) = m.reserve_object_ids(0).unwrap();
+    assert_eq!(l3, 1);
+}

@@ -145,6 +145,17 @@ pub trait MetadataStore: Send + Sync {
 
     /// Allocate the next monotonic object id.
     fn next_object_id(&self) -> Result<ObjectId>;
+
+    /// Reserve a contiguous run of up to `count` fresh object ids in one round
+    /// trip, returning the first id and how many were actually reserved
+    /// (`[start, start + len)`, with `1 <= len <= count`). Lets a caller amortize
+    /// allocation — grab a block, then hand ids out locally without a per-id
+    /// transaction or round trip. The default reserves a single id; stores that
+    /// can reserve a range cheaply override it.
+    fn reserve_object_ids(&self, count: u64) -> Result<(ObjectId, u64)> {
+        let _ = count;
+        Ok((self.next_object_id()?, 1))
+    }
 }
 
 /// Resolves an object id to the nodes that physically hold its bytes, with the

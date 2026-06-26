@@ -2,7 +2,7 @@
 //! implementing `MetadataStore` against it.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
@@ -202,7 +202,9 @@ fn dispatch(
         MetaRequest::ListObjects { bucket, req } => {
             store.list_objects(&bucket, &req).map(MetaReply::List)
         }
-        MetaRequest::NextObjectId => store.next_object_id().map(MetaReply::ObjectId),
+        MetaRequest::ReserveObjectIds { count } => store
+            .reserve_object_ids(count)
+            .map(|(start, len)| MetaReply::ObjectIdRange { start, len }),
         MetaRequest::BucketUsage { bucket } => store.bucket_usage(&bucket).map(MetaReply::Usage),
         MetaRequest::MarkGarbage { object_ids } => {
             store.mark_garbage(&object_ids).map(|()| MetaReply::Unit)
@@ -250,10 +252,28 @@ pub async fn serve_meta(
 // Client
 // ---------------------------------------------------------------------------
 
+/// How many object ids a gateway reserves per round trip, then hands out locally.
+/// Larger = fewer reservation RPCs under load; a gateway restart abandons the
+/// unused tail (gaps are harmless — ids only need to be unique and increasing).
+const CLIENT_ID_BLOCK: u64 = 256;
+
+/// A gateway-local cursor over a reserved, durable id block: ids in
+/// `[next, end)` were handed to this client by the meta node and serve without a
+/// round trip.
+#[derive(Default)]
+struct IdRange {
+    next: u64,
+    end: u64,
+}
+
 /// A `MetadataStore` implemented by RPC to a remote metadata node.
 pub struct MetaClient {
     channel: Channel,
     bridge: Bridge,
+    /// Gateway-side hi-lo cache: object ids are reserved a block at a time and
+    /// served locally, so a steady stream of PUTs costs one reservation RPC per
+    /// [`CLIENT_ID_BLOCK`] objects instead of one per object.
+    id_cache: Mutex<IdRange>,
 }
 
 impl MetaClient {
@@ -266,6 +286,7 @@ impl MetaClient {
         Ok(Self {
             channel,
             bridge: Bridge::new(),
+            id_cache: Mutex::new(IdRange::default()),
         })
     }
 
@@ -432,8 +453,25 @@ impl MetadataStore for MetaClient {
     }
 
     fn next_object_id(&self) -> Result<ObjectId> {
-        match self.call(MetaRequest::NextObjectId)? {
-            MetaReply::ObjectId(id) => Ok(id),
+        let mut cache = self
+            .id_cache
+            .lock()
+            .map_err(|_| Error::Remote("id cache lock poisoned".to_string()))?;
+        if cache.next >= cache.end {
+            // Block drained: reserve a fresh one in a single round trip, then serve
+            // the rest locally. (The node may return fewer than requested.)
+            let (start, len) = self.reserve_object_ids(CLIENT_ID_BLOCK)?;
+            cache.next = start;
+            cache.end = start + len;
+        }
+        let id = cache.next;
+        cache.next += 1;
+        Ok(id)
+    }
+
+    fn reserve_object_ids(&self, count: u64) -> Result<(ObjectId, u64)> {
+        match self.call(MetaRequest::ReserveObjectIds { count })? {
+            MetaReply::ObjectIdRange { start, len } => Ok((start, len)),
             _ => Err(unexpected()),
         }
     }
