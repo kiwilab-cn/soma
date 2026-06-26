@@ -155,8 +155,13 @@ RPC) and hands them out locally, so a steady PUT stream contacts the meta node
 for ids only once per block. Reservations all advance the same monotonic counter
 on the node, so blocks handed to different gateways — and the node's own in-
 process allocator — never overlap. Net: a small-object PUT touches the meta node
-roughly once (the batched commit), not three times. (Delete commits are not yet
-batched.)
+roughly once (the batched commit), not three times.
+
+Deletes ride the same machinery: the meta node runs a second batcher that
+coalesces concurrent `delete_object` commits into one `delete_object_batch`
+transaction, with the same per-item independence (one item's failed precondition
+never aborts the batch). Both batchers share one generic coordinator — commits
+and deletes differ only in the per-batch store call they invoke.
 
 ---
 

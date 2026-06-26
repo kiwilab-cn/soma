@@ -19,8 +19,8 @@ use soma_core::ObjectId;
 use crate::error::{Error, Result};
 use crate::types::{
     BucketMeta, BucketOpts, BucketUsage, ListRequest, ListResult, NodeInfo, NodeState,
-    NodeTopology, ObjectEntry, ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement, PutCondition,
-    Quota, RateLimit, SseAlgorithm, Version,
+    NodeTopology, ObjectDeleteItem, ObjectEntry, ObjectMeta, ObjectPut, ObjectPutItem, PgPlacement,
+    PutCondition, Quota, RateLimit, SseAlgorithm, Version,
 };
 use crate::MetadataStore;
 
@@ -441,29 +441,51 @@ impl MetadataStore for RedbMetaStore {
     }
 
     fn delete_object(&self, bucket: &str, key: &str, cond: PutCondition) -> Result<()> {
-        let w = self.db.begin_write()?;
+        // A batch of one — single source of truth lives in `delete_object_batch`.
+        let item = ObjectDeleteItem {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            cond,
+        };
+        match self.delete_object_batch(vec![item]).into_iter().next() {
+            Some(r) => r,
+            None => Err(Error::Remote("empty batch result".to_string())),
+        }
+    }
+
+    fn delete_object_batch(&self, items: Vec<ObjectDeleteItem>) -> Vec<Result<()>> {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        // One transaction for the whole batch — same group-commit rationale as
+        // `put_object_batch`. Each item keeps its own condition check and result.
+        let w = match self.db.begin_write() {
+            Ok(w) => w,
+            Err(e) => return fail_all(n, &Error::from(e)),
+        };
+        let mut results = Vec::with_capacity(n);
         {
-            let mut objects = w.open_table(OBJECTS)?;
-            let ck = composite_key(bucket, key);
-            let current: Option<ObjectMeta> = match objects.get(ck.as_slice())? {
-                Some(g) => Some(postcard::from_bytes(g.value())?),
-                None => None,
+            let mut objects = match w.open_table(OBJECTS) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
             };
-            check_condition(&cond, current.as_ref())?;
-            if let Some(c) = current {
-                // Refund the bucket's usage before removing the object.
-                let mut usage = w.open_table(USAGE)?;
-                let mut u = read_usage(&usage, bucket)?;
-                u.bytes = u.bytes.saturating_sub(c.size);
-                u.objects = u.objects.saturating_sub(1);
-                write_usage(&mut usage, bucket, u)?;
-                // The deleted object's bytes are now orphaned — hand its id to GC.
-                w.open_table(GARBAGE)?.insert(c.object_id, 0u64)?;
-                objects.remove(ck.as_slice())?;
+            let mut usage = match w.open_table(USAGE) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
+            };
+            let mut garbage = match w.open_table(GARBAGE) {
+                Ok(t) => t,
+                Err(e) => return fail_all(n, &Error::from(e)),
+            };
+            for item in items {
+                results.push(apply_delete(&mut objects, &mut usage, &mut garbage, item));
             }
         }
-        w.commit()?;
-        Ok(())
+        match w.commit() {
+            Ok(()) => results,
+            Err(e) => fail_all(n, &Error::from(e)),
+        }
     }
 
     fn bucket_usage(&self, bucket: &str) -> Result<BucketUsage> {
@@ -762,9 +784,38 @@ fn apply_put(
     Ok(new_version)
 }
 
+/// Apply one object delete against the already-open tables of a write
+/// transaction. Idempotent (deleting an absent object succeeds unless a
+/// condition forbids it); refunds the bucket's usage and orphans the bytes to
+/// the GC. The caller batches many of these into one transaction.
+fn apply_delete(
+    objects: &mut redb::Table<&'static [u8], &'static [u8]>,
+    usage: &mut redb::Table<&'static str, &'static [u8]>,
+    garbage: &mut redb::Table<u64, u64>,
+    item: ObjectDeleteItem,
+) -> Result<()> {
+    let ObjectDeleteItem { bucket, key, cond } = item;
+    let ck = composite_key(&bucket, &key);
+    let current: Option<ObjectMeta> = match objects.get(ck.as_slice())? {
+        Some(g) => Some(postcard::from_bytes(g.value())?),
+        None => None,
+    };
+    check_condition(&cond, current.as_ref())?;
+    if let Some(c) = current {
+        let mut u = read_usage(&*usage, &bucket)?;
+        u.bytes = u.bytes.saturating_sub(c.size);
+        u.objects = u.objects.saturating_sub(1);
+        write_usage(usage, &bucket, u)?;
+        // The deleted object's bytes are now orphaned — hand its id to GC.
+        garbage.insert(c.object_id, 0u64)?;
+        objects.remove(ck.as_slice())?;
+    }
+    Ok(())
+}
+
 /// Fan a whole-batch failure (transaction begin/commit could not complete) out
 /// to one error per item — nothing in the batch became durable.
-fn fail_all(n: usize, e: &Error) -> Vec<Result<Version>> {
+fn fail_all<T>(n: usize, e: &Error) -> Vec<Result<T>> {
     let msg = e.to_string();
     (0..n).map(|_| Err(Error::Remote(msg.clone()))).collect()
 }

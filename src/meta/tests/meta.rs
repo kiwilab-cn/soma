@@ -3,8 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soma_meta::{
-    BucketOpts, BucketUsage, ETag, ListRequest, MetadataStore, ObjectPut, ObjectPutItem,
-    PutCondition, Quota, RedbMetaStore, Version,
+    BucketOpts, BucketUsage, ETag, ListRequest, MetadataStore, ObjectDeleteItem, ObjectPut,
+    ObjectPutItem, PutCondition, Quota, RedbMetaStore, Version,
 };
 use tempfile::TempDir;
 
@@ -13,6 +13,14 @@ fn item(bucket: &str, key: &str, put: ObjectPut, cond: PutCondition) -> ObjectPu
         bucket: bucket.to_string(),
         key: key.to_string(),
         put,
+        cond,
+    }
+}
+
+fn del(bucket: &str, key: &str, cond: PutCondition) -> ObjectDeleteItem {
+    ObjectDeleteItem {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
         cond,
     }
 }
@@ -897,4 +905,50 @@ fn reserve_object_ids_blocks_are_disjoint() {
     // count is clamped to at least 1.
     let (_, l3) = m.reserve_object_ids(0).unwrap();
     assert_eq!(l3, 1);
+}
+
+#[test]
+fn delete_object_batch_mixed_outcomes_and_durable() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    m.create_bucket("b1", BucketOpts::default()).unwrap();
+    // Quota on so usage is tracked, to verify the refund.
+    m.set_bucket_quota(
+        "b1",
+        Quota {
+            max_bytes: 10_000,
+            max_objects: 0,
+        },
+    )
+    .unwrap();
+    m.put_object("b1", "a", put(1, 0, 10, "a1"), PutCondition::None)
+        .unwrap();
+    m.put_object("b1", "b", put(2, 0, 20, "b1"), PutCondition::None)
+        .unwrap();
+    m.put_object("b1", "c", put(3, 0, 30, "c1"), PutCondition::None)
+        .unwrap();
+
+    // One transaction, independent outcomes:
+    //  0: delete "a"                          -> Ok (removed)
+    //  1: delete "b" with wrong If-Match      -> Err (kept)
+    //  2: delete a missing key                -> Ok (idempotent no-op)
+    let results = m.delete_object_batch(vec![
+        del("b1", "a", PutCondition::None),
+        del("b1", "b", PutCondition::IfMatch(ETag("wrong".into()))),
+        del("b1", "missing", PutCondition::None),
+    ]);
+    assert_eq!(results.len(), 3);
+    assert!(results[0].is_ok());
+    assert!(results[1].is_err(), "wrong If-Match must fail just its item");
+    assert!(results[2].is_ok(), "deleting an absent key is a no-op success");
+
+    // Successes durable across reopen; the failed delete left its object intact.
+    drop(m);
+    let m = store(&dir);
+    assert!(m.get_object("b1", "a").unwrap().is_none());
+    assert!(m.get_object("b1", "b").unwrap().is_some());
+    assert!(m.get_object("b1", "c").unwrap().is_some());
+    // Usage refunded only for the actually-deleted object "a" (10 bytes).
+    let usage = m.bucket_usage("b1").unwrap();
+    assert_eq!(usage, BucketUsage { bytes: 50, objects: 2 });
 }

@@ -118,6 +118,19 @@ pub struct ObjectPutItem {
     pub cond: PutCondition,
 }
 
+/// One entry in a batched object delete — the same arguments as
+/// [`crate::MetadataStore::delete_object`]. See
+/// [`crate::MetadataStore::delete_object_batch`].
+#[derive(Debug, Clone)]
+pub struct ObjectDeleteItem {
+    /// Target bucket.
+    pub bucket: String,
+    /// Target object key.
+    pub key: String,
+    /// Conditional-delete precondition, evaluated independently for this item.
+    pub cond: PutCondition,
+}
+
 /// A per-bucket resource quota. Zero in a dimension means unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
