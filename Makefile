@@ -5,7 +5,8 @@
 # endpoint is at http://127.0.0.1:9000 once `make ready` flips green;
 # admin (health/metrics) is at http://127.0.0.1:9001.
 #
-# `make run` is the no-Docker quick path: a single standalone process.
+# `make run` starts a single standalone node in Docker (all roles in one
+# process) — the quickest S3 endpoint at http://127.0.0.1:9000.
 #
 # Run `make help` to list every target.
 
@@ -45,8 +46,9 @@ fmt-check: ## Check formatting without writing
 
 check: fmt-check lint test ## CI gate: fmt + clippy + tests
 
-run: ## Run a single standalone process (no Docker; S3 on :9000)
-	cargo run --release --bin soma-server
+run: image ## Run a single standalone node in Docker (S3 on :9000, admin :9001)
+	docker run --rm -it -p 9000:9000 -p 9001:9001 \
+		-v soma-standalone:/var/lib/soma --name soma-standalone $(IMAGE)
 
 # ── local cluster (Docker Compose) ─────────────────────────────────────────
 
