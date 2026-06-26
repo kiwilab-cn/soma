@@ -1,0 +1,96 @@
+# A complete local Soma cluster for development and integration testing:
+# one metadata node, three storage nodes, and a stateless gateway — the same
+# three-role topology the Helm chart deploys, from the single `soma-server`
+# image. The gateway is the S3 endpoint clients (and consumers like a database
+# engine) connect to.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up --build
+#
+# Then point an S3 client at http://localhost:9000 (region us-east-1,
+# path-style, key `soma` / `soma-secret`). See docs/DEPLOYMENT.md.
+#
+# The gateway waits for all three storage nodes to register with the metadata
+# node before it serves, so startup order sorts itself out — no healthchecks
+# needed. Object data is 3-way replicated with a write quorum of 2, so the
+# cluster keeps serving writes through a single storage-node outage.
+
+name: soma
+
+# Shared image + build for every role (one binary, role chosen via SOMA_ROLE).
+x-soma: &soma
+  image: soma:dev
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
+# Common storage-node settings (each still needs its own id/advertise/volume).
+x-storage-env: &storage-env
+  SOMA_ROLE: storage
+  SOMA_LISTEN: 0.0.0.0:9200
+  SOMA_META_ENDPOINT: http://meta:9100
+  SOMA_DATA_DIR: /var/lib/soma
+  # Register/heartbeat briskly so a fresh cluster converges in seconds.
+  SOMA_STORAGE__HEARTBEAT_INTERVAL_SECS: "3"
+
+services:
+  meta:
+    <<: *soma
+    environment:
+      SOMA_ROLE: meta
+      SOMA_LISTEN: 0.0.0.0:9100
+      SOMA_DATA_DIR: /var/lib/soma
+    volumes:
+      - meta-data:/var/lib/soma
+
+  storage-0:
+    <<: *soma
+    depends_on: [meta]
+    environment:
+      <<: *storage-env
+      SOMA_NODE_ID: storage-0
+      SOMA_ADVERTISE_ENDPOINT: http://storage-0:9200
+    volumes:
+      - storage-0-data:/var/lib/soma
+
+  storage-1:
+    <<: *soma
+    depends_on: [meta]
+    environment:
+      <<: *storage-env
+      SOMA_NODE_ID: storage-1
+      SOMA_ADVERTISE_ENDPOINT: http://storage-1:9200
+    volumes:
+      - storage-1-data:/var/lib/soma
+
+  storage-2:
+    <<: *soma
+    depends_on: [meta]
+    environment:
+      <<: *storage-env
+      SOMA_NODE_ID: storage-2
+      SOMA_ADVERTISE_ENDPOINT: http://storage-2:9200
+    volumes:
+      - storage-2-data:/var/lib/soma
+
+  gateway:
+    <<: *soma
+    depends_on: [meta, storage-0, storage-1, storage-2]
+    ports:
+      - "9000:9000" # S3 endpoint
+      - "9001:9001" # admin: /healthz /readyz /metrics
+    environment:
+      SOMA_ROLE: gateway
+      SOMA_LISTEN: 0.0.0.0:9000
+      SOMA_ADMIN_LISTEN: 0.0.0.0:9001
+      SOMA_META_ENDPOINT: http://meta:9100
+      SOMA_REPLICATION_FACTOR: "3"
+      SOMA_WRITE_QUORUM: "2"
+      SOMA_ACCESS_KEY: soma
+      SOMA_SECRET_KEY: soma-secret
+
+volumes:
+  meta-data:
+  storage-0-data:
+  storage-1-data:
+  storage-2-data:

@@ -76,6 +76,15 @@ let store = object_store::aws::AmazonS3Builder::new()
 
 ## Deploy
 
+A complete local cluster (one meta, three storage, one gateway) in one command:
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml up --build
+# S3 at http://localhost:9000, admin at http://localhost:9001
+```
+
+On Kubernetes, via the Helm chart:
+
 ```sh
 docker build -t soma:0.1.0 .                     # one image, all roles
 helm install soma deploy/helm/soma \
@@ -83,6 +92,10 @@ helm install soma deploy/helm/soma \
   --set storage.replicaCount=3 \
   --set credentials.accessKey=... --set credentials.secretKey=...
 ```
+
+See **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)** for the full guide — local
+(Compose or bare processes), Kubernetes, the S3 smoke test, how a consumer
+connects, and the configuration reference.
 
 The chart deploys the distributed three-role topology: a stateless **gateway**
 `Deployment` (S3 + admin), a **metadata** `StatefulSet` (1 replica, PV), and a
