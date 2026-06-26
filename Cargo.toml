@@ -99,3 +99,13 @@ futures = "0.3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Dev/test builds: keep full debuginfo for our own crates (where we actually step
+# through code), but strip it from third-party dependencies — we never debug into
+# them, and their DWARF is the bulk of `target/`. Dependencies are built with the
+# dev profile even under `cargo test`, so this one override shrinks both `cargo
+# build` and `cargo test` artifacts (often by a third or more) with no effect on
+# our own debugging or on release builds. `line-tables-only` keeps dependency
+# frames readable in panic backtraces while dropping the heavy variable info.
+[profile.dev.package."*"]
+debug = "line-tables-only"
