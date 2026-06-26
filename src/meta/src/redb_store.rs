@@ -11,6 +11,7 @@
 
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Mutex;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use soma_core::ObjectId;
@@ -36,9 +37,27 @@ const GARBAGE: TableDefinition<u64, u64> = TableDefinition::new("garbage");
 /// Counter name for the monotonic object-id sequence.
 const OBJECT_ID_SEQ: &str = "object_id";
 
+/// Object ids are handed out in blocks of this size: one durable transaction
+/// reserves a block, then ids serve from memory until it drains. Trades up to
+/// `ID_BLOCK - 1` skipped ids per restart (gaps are harmless — ids only need to
+/// be unique and increasing) for one fsync per block instead of one per id.
+const ID_BLOCK: u64 = 1024;
+
+/// In-memory hi-lo cursor over a reserved, already-durable id block: ids in
+/// `[next, end)` are persisted (the `seq` high-water on disk is `end - 1`) and
+/// can be served without touching disk.
+#[derive(Default)]
+struct IdRange {
+    next: u64,
+    end: u64,
+}
+
 /// Embedded metadata store.
 pub struct RedbMetaStore {
     db: Database,
+    /// Hi-lo object-id allocator (see [`ID_BLOCK`]). Serialized independently of
+    /// redb's write lock; refilled with a single transaction when drained.
+    id_alloc: Mutex<IdRange>,
 }
 
 impl RedbMetaStore {
@@ -57,7 +76,13 @@ impl RedbMetaStore {
             w.open_table(GARBAGE)?;
         }
         w.commit()?;
-        Ok(Self { db })
+        // Start with a drained range so the first allocation reserves a block,
+        // resuming from the persisted high-water (skipping any ids abandoned by a
+        // previous run's partially-consumed block).
+        Ok(Self {
+            db,
+            id_alloc: Mutex::new(IdRange::default()),
+        })
     }
 
     // --- rebalance controller support (M3b) --------------------------------
@@ -626,15 +651,27 @@ impl MetadataStore for RedbMetaStore {
     }
 
     fn next_object_id(&self) -> Result<ObjectId> {
-        let w = self.db.begin_write()?;
-        let id;
-        {
-            let mut t = w.open_table(SEQ)?;
-            let current = t.get(OBJECT_ID_SEQ)?.map_or(0, |g| g.value());
-            id = current + 1;
-            t.insert(OBJECT_ID_SEQ, id)?;
+        let mut alloc = self
+            .id_alloc
+            .lock()
+            .map_err(|_| Error::Remote("id allocator lock poisoned".to_string()))?;
+        if alloc.next >= alloc.end {
+            // Block drained: reserve the next `ID_BLOCK` ids in one transaction by
+            // advancing the persisted high-water, then serve them from memory.
+            let w = self.db.begin_write()?;
+            let high;
+            {
+                let mut t = w.open_table(SEQ)?;
+                let current = t.get(OBJECT_ID_SEQ)?.map_or(0, |g| g.value());
+                high = current + ID_BLOCK;
+                t.insert(OBJECT_ID_SEQ, high)?;
+            }
+            w.commit()?;
+            alloc.next = high - ID_BLOCK + 1;
+            alloc.end = high + 1;
         }
-        w.commit()?;
+        let id = alloc.next;
+        alloc.next += 1;
         Ok(id)
     }
 }
