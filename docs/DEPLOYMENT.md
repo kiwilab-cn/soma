@@ -34,6 +34,16 @@ from the single image, with 3-way replication (write quorum 2):
 docker compose -f deploy/compose/docker-compose.yml up --build
 ```
 
+Or via the Makefile (`make help` lists everything):
+
+```sh
+make up      # build + start the cluster
+make ready   # wait for the gateway to report ready
+make smoke   # S3 create/put/get/delete roundtrip (needs python3 + boto3)
+make logs    # tail all roles
+make down    # stop (keeps data volumes; `make clean` also wipes them)
+```
+
 The gateway publishes:
 
 - **`http://localhost:9000`** — the S3 endpoint (point clients here)

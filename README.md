@@ -79,9 +79,11 @@ let store = object_store::aws::AmazonS3Builder::new()
 A complete local cluster (one meta, three storage, one gateway) in one command:
 
 ```sh
-docker compose -f deploy/compose/docker-compose.yml up --build
-# S3 at http://localhost:9000, admin at http://localhost:9001
+make up        # or: docker compose -f deploy/compose/docker-compose.yml up --build
+make ready     # wait for the gateway; S3 at http://localhost:9000, admin at :9001
 ```
+
+`make help` lists every dev and cluster target.
 
 On Kubernetes, via the Helm chart:
 
