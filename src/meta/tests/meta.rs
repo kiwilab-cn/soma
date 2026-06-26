@@ -238,12 +238,13 @@ fn next_object_id_is_monotonic() {
 #[test]
 fn persistence_across_reopen() {
     let dir = TempDir::new().unwrap();
+    let allocated;
     {
         let m = store(&dir);
         m.create_bucket("b", BucketOpts::default()).unwrap();
         m.put_object("b", "k", put(1, 0, 4, "etag"), PutCondition::None)
             .unwrap();
-        let _ = m.next_object_id().unwrap(); // bump the counter
+        allocated = m.next_object_id().unwrap(); // bump the counter
     }
     let m = store(&dir);
     assert!(m.get_bucket("b").unwrap().is_some());
@@ -251,8 +252,46 @@ fn persistence_across_reopen() {
         m.get_object("b", "k").unwrap().unwrap().etag,
         ETag("etag".into())
     );
-    // Counter survived (was 1 after the bump; next is 2).
-    assert_eq!(m.next_object_id().unwrap(), 2);
+    // The id high-water survived the restart: the next id strictly exceeds any
+    // previously allocated one. The hi-lo allocator may skip the tail of the
+    // pre-restart block (gaps are fine — ids only need to be unique + increasing).
+    assert!(m.next_object_id().unwrap() > allocated);
+}
+
+#[test]
+fn object_ids_unique_and_increasing_across_block_boundary() {
+    let dir = TempDir::new().unwrap();
+    let m = store(&dir);
+    // Allocate well past one hi-lo block (1024) to exercise a refill mid-run.
+    let ids: Vec<u64> = (0..2500).map(|_| m.next_object_id().unwrap()).collect();
+    // Strictly increasing and contiguous within a single process (no restart).
+    assert_eq!(ids.first(), Some(&1));
+    for w in ids.windows(2) {
+        assert_eq!(w[1], w[0] + 1, "ids contiguous within a run");
+    }
+}
+
+#[test]
+fn object_ids_are_unique_under_concurrency() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let m = Arc::new(store(&dir));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let m = m.clone();
+        handles.push(std::thread::spawn(move || {
+            (0..500).map(|_| m.next_object_id().unwrap()).collect::<Vec<_>>()
+        }));
+    }
+    let mut all = HashSet::new();
+    for h in handles {
+        for id in h.join().unwrap() {
+            assert!(all.insert(id), "duplicate id {id} handed out");
+        }
+    }
+    assert_eq!(all.len(), 8 * 500);
 }
 
 #[test]

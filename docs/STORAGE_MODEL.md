@@ -141,9 +141,14 @@ identical to committing them one at a time, just durably cheaper. This batching
 is internal to the meta node — the `PutObject` RPC is unchanged, so it
 transparently coalesces commits arriving from *all* gateways, not just one.
 
-(Object-id allocation, `next_object_id`, is still a per-call transaction — folding
-it into a hi-lo allocator is a separate follow-up. Delete commits are not yet
-batched either.)
+Object-id allocation gets the same treatment from the other direction. Rather
+than one transaction per id, `next_object_id` is a **hi-lo allocator**: one
+transaction reserves a block of `ID_BLOCK` ids (by advancing the persisted
+high-water), then ids serve from memory until the block drains — one fsync per
+block instead of per id. A restart resumes from the high-water, abandoning the
+tail of a partially-used block; the resulting gaps are harmless because ids only
+need to be unique and increasing, not contiguous. (Delete commits are not yet
+batched.)
 
 ---
 
